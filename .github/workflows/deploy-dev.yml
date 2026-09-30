@@ -1,0 +1,106 @@
+name: Build and publish dev image
+
+# 推送 dev 分支自动构建镜像；也可手动触发并指定 origin/dev 上的提交 SHA。
+# 镜像双标签：
+#   dev-<完整SHA>  不可变，用于追溯与回滚
+#   dev            漂动标签，始终指向最新成功构建（Watchtower / docker compose pull 拉它）
+# 镜像 label 记录 org.opencontainers.image.revision=<SHA>，供部署侧校验版本一致性。
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: '需要构建的 origin/dev 提交完整 SHA（留空则构建 dev 最新提交）'
+        required: false
+        type: string
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      target_sha: ${{ steps.resolve.outputs.target_sha }}
+      huobao_version: ${{ steps.resolve.outputs.huobao_version }}
+    steps:
+      - name: Check out target commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.target_sha || github.sha }}
+
+      - name: Resolve target commit and image version
+        id: resolve
+        env:
+          TARGET_SHA_INPUT: ${{ inputs.target_sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ -n "$TARGET_SHA_INPUT" ]; then
+            target_sha=$(printf '%s' "$TARGET_SHA_INPUT" | tr '[:upper:]' '[:lower:]')
+            if ! git cat-file -e "${target_sha}^{commit}" 2>/dev/null; then
+              echo "target_sha 不是仓库内有效的提交：$target_sha" >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$target_sha" refs/remotes/origin/dev; then
+              echo "target_sha 不在 origin/dev 历史中：$target_sha" >&2
+              exit 1
+            fi
+          else
+            target_sha=$GITHUB_SHA
+          fi
+
+          short_sha=${target_sha::7}
+          pkg_version=$(jq -r '.version // "0.0.0"' backend/package.json)
+          # 镜像内版本号 = package.json 版本 + dev 后缀 + 短 SHA（设置页「关于更新」显示用）
+          huobao_version="${pkg_version}-dev-${short_sha}"
+
+          echo "target_sha=$target_sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "huobao_version=$huobao_version" >> "$GITHUB_OUTPUT"
+          echo "目标提交: $target_sha  镜像版本: $huobao_version"
+
+      - name: Log in to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          tags: |
+            ${{ vars.ACR_REGISTRY }}/${{ vars.ACR_NAMESPACE }}/huobao-drama:dev-${{ steps.resolve.outputs.target_sha }}
+            ${{ vars.ACR_REGISTRY }}/${{ vars.ACR_NAMESPACE }}/huobao-drama:dev
+          labels: |
+            org.opencontainers.image.revision=${{ steps.resolve.outputs.target_sha }}
+            org.opencontainers.image.version=${{ steps.resolve.outputs.huobao_version }}
+          build-args: |
+            HUOBAO_VERSION=${{ steps.resolve.outputs.huobao_version }}
+
+      - name: Verify pushed image revision
+        run: |
+          set -euo pipefail
+          image="${{ vars.ACR_REGISTRY }}/${{ vars.ACR_NAMESPACE }}/huobao-drama:dev-${{ steps.resolve.outputs.target_sha }}"
+          docker pull "$image"
+          revision=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")
+          if [ "$revision" != "${{ steps.resolve.outputs.target_sha }}" ]; then
+            echo "镜像 revision label 与目标 SHA 不一致：$revision" >&2
+            exit 1
+          fi
+          echo "✅ 镜像已推送并通过校验：$image"
