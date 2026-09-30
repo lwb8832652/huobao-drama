@@ -224,8 +224,17 @@ const readStoryboardContext = createTool({
   },
 })
 
+// qwen3.8-flash 等模型会把布尔/数字参数序列化为字符串（"true" / "10"），
+// zod 严格类型校验直接拒绝（"expected boolean, received string"），
+// 实测曾导致整批保存连续失败 6 轮、浪费 4 分钟以上（模型靠删字段才绕过去）。
+// 对标量字段统一宽松化：仅当值是字符串形式的布尔/数字时转换为原生类型
+const looseBool = <A extends z.ZodTypeAny>(schema: A): A =>
+  z.preprocess((v) => (v === 'true' ? true : v === 'false' ? false : v), schema) as unknown as A
+const looseNum = <A extends z.ZodTypeAny>(schema: A): A =>
+  z.preprocess((v) => (typeof v === 'string' && v.trim() !== '' && !isNaN(Number(v)) ? Number(v) : v), schema) as unknown as A
+
 const storyboardFields = z.object({
-  shot_number: z.number(),
+  shot_number: looseNum(z.number()),
   title: z.string().optional(),
   shot_type: z.string().optional(),
   angle: z.string().optional(),
@@ -239,18 +248,21 @@ const storyboardFields = z.object({
   video_prompt: z.string().optional(),
   bgm_prompt: z.string().optional(),
   sound_effect: z.string().optional(),
-  duration: z.number().optional(),
-  scene_id: z.number().nullable().optional(),
+  duration: looseNum(z.number().optional()),
+  scene_id: looseNum(z.number().nullable().optional()),
   character_ids: z.array(z.number()).optional(),
   prop_ids: z.array(z.number()).optional(),
 })
 
 const saveStoryboards = createTool({
   id: 'save_storyboards',
-  description: 'Save storyboards for this episode. Call in batches of at most 8 storyboards: the first batch must set replace_existing: true (clears all old storyboards for the episode, then writes), every following batch omits replace_existing (appends). Rows are upserted by shot_number, so overlapping batches and retries never create duplicates.',
+  description: 'Save storyboards for this episode. Preferred batch size is 6-8 storyboards per call (up to 16 accepted; larger calls are rejected): the first batch must set replace_existing: true (clears all old storyboards for the episode, then writes), every following batch omits replace_existing (appends). Rows are upserted by shot_number, so overlapping batches and retries never create duplicates.',
   inputSchema: z.object({
-    replace_existing: z.boolean().optional(),
-    storyboards: z.array(storyboardFields),
+    replace_existing: looseBool(z.boolean().optional()),
+    // 软上限 16 条：建议每批 6~8，模型偶尔超限（9~16）时不再拒绝——校验失败→错误回传→重试
+    // 的循环曾被证实会烧掉 3 分钟以上（qwen3.8-flash 纠错能力弱）。超过 16 仍拒绝，
+    // 防止整集大 JSON 一次生成导致输出截断/超慢
+    storyboards: z.array(storyboardFields).max(16),
   }),
   execute: async ({ storyboards, replace_existing }, context) => {
     const ids = requireIds(context)
@@ -345,7 +357,7 @@ const updateStoryboard = createTool({
   id: 'update_storyboard',
   description: 'Update a specific storyboard shot.',
   inputSchema: z.object({
-    storyboard_id: z.number(),
+    storyboard_id: looseNum(z.number()),
     title: z.string().optional(),
     shot_type: z.string().optional(),
     angle: z.string().optional(),
@@ -359,10 +371,10 @@ const updateStoryboard = createTool({
     bgm_prompt: z.string().optional(),
     sound_effect: z.string().optional(),
     description: z.string().optional(),
-    scene_id: z.number().nullable().optional(),
+    scene_id: looseNum(z.number().nullable().optional()),
     character_ids: z.array(z.number()).optional(),
     prop_ids: z.array(z.number()).optional(),
-    duration: z.number().optional(),
+    duration: looseNum(z.number().optional()),
   }),
   execute: async ({ storyboard_id, ...fields }, context) => {
     const ids = requireIds(context)

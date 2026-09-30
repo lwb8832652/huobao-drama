@@ -9,7 +9,7 @@ import type { RequestContext } from '@mastra/core/request-context'
 import { createGoogleGenerativeAI } from '@ai-sdk/google'
 import { createOpenAI } from '@ai-sdk/openai'
 import { getTextConfig, getTextProviderBaseUrl, getConfigById } from '../services/ai.js'
-import { logTaskProgress } from '../utils/task-logger.js'
+import { logTaskProgress, logTaskError } from '../utils/task-logger.js'
 import { scriptTools } from './tools/script-tools.js'
 import { extractTools } from './tools/extract-tools.js'
 import { storyboardTools } from './tools/storyboard-tools.js'
@@ -312,6 +312,60 @@ function createMaxTokensFetch(providerName: string, inner?: typeof fetch): typeo
   }
 }
 
+/**
+ * LLM 请求观测 + 超时安全网（包在最外层，对每次模型调用生效）
+ *
+ * - 请求级日志：start / done(含 HTTP 状态与耗时)。此前 fetch 层完全黑盒，
+ *   「拆分分镜无响应」类问题无法区分是模型在长生成还是连接挂死。
+ * - 超时中断：默认 600s（AI_FETCH_TIMEOUT_MS 可调）。真挂死时中断并抛错，
+ *   agent 层把错误返回前端，而不是无限等待。
+ *   注意：流式响应在响应头到达即视为 done，慢生成由数据流速决定，不受此超时影响
+ *   （该超时仅覆盖「建立连接到收到响应头」的等待）。
+ */
+const llmFetchTimeoutMs = Number(process.env.AI_FETCH_TIMEOUT_MS || 600_000)
+
+function createLoggingFetch(inner?: typeof fetch): typeof fetch {
+  const base = inner || fetch
+  return async (input: any, init?: any) => {
+    let url = ''
+    let model = ''
+    let bodyBytes = 0
+    try {
+      url = String(typeof input === 'string' ? input : input?.url || '')
+      if (init?.body && typeof init.body === 'string') {
+        bodyBytes = init.body.length
+        model = String(JSON.parse(init.body)?.model || '')
+      }
+    } catch { /* 元信息提取失败不影响请求 */ }
+
+    const started = Date.now()
+    logTaskProgress('LLM', 'request-start', { model, bodyBytes })
+    const controller = new AbortController()
+    const timer = llmFetchTimeoutMs > 0 ? setTimeout(() => controller.abort(), llmFetchTimeoutMs) : null
+    const init2 = timer && !init?.signal ? { ...init, signal: controller.signal } : init
+    try {
+      const res = await base(input, init2)
+      logTaskProgress('LLM', 'request-done', {
+        model,
+        status: res.status,
+        elapsedMs: Date.now() - started,
+      })
+      return res
+    } catch (err: any) {
+      const aborted = err?.name === 'AbortError' || controller.signal.aborted
+      logTaskError('LLM', aborted ? 'request-timeout' : 'request-failed', {
+        model,
+        url,
+        elapsedMs: Date.now() - started,
+        error: err?.message,
+      })
+      throw err
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+}
+
 async function getModel(fileModel: string | undefined, modelOverride?: string, textConfigId?: number) {
   // 请求可指定文本配置（含其 provider/baseUrl/apiKey），否则回退到当前启用配置
   const textConfig = (textConfigId ? await getConfigById(textConfigId) : null) || await getTextConfig()
@@ -330,14 +384,15 @@ async function getModel(fileModel: string | undefined, modelOverride?: string, t
     })
   }
 
-  // 叠加请求补丁：thinking-off（非官方端点）+ 配置温度 + 输出上限（非官方 OpenAI）
+  // 叠加请求补丁：thinking-off（非官方端点）+ 配置温度 + 输出上限（非官方 OpenAI）+ 观测/超时（最外层）
   const thinkingOffFetch = createThinkingOffFetch(providerName, resolvedBaseURL)
   const tempFetch = temperature !== null
     ? createTemperatureFetch(providerName, temperature, thinkingOffFetch)
     : thinkingOffFetch
-  const fetchImpl = isOfficialOpenAIHost(resolvedBaseURL)
+  const patchedFetch = isOfficialOpenAIHost(resolvedBaseURL)
     ? tempFetch
     : createMaxTokensFetch(providerName, tempFetch)
+  const fetchImpl = createLoggingFetch(patchedFetch)
 
   if (providerName === 'gemini') {
     const googleProvider = createGoogleGenerativeAI({
