@@ -1703,6 +1703,16 @@ function chatConfigId() { return ownerConfigId(textModelOptions.value, chatModel
 const pendingCharImageIds = ref([])
 const pendingSceneImageIds = ref([])
 const pendingPropImageIds = ref([])
+// 资产提交中标记（kind:id）：单击生成/重绘后、任务记录入库前存在空窗，
+// loadGenTasks 的 pending 自愈跳过这些键，避免被同名资产的历史终态任务提前清掉
+const assetSubmittingKeys = ref([])
+function markAssetSubmitting(kind, id) {
+  const key = `${kind}:${id}`
+  if (!assetSubmittingKeys.value.includes(key)) assetSubmittingKeys.value.push(key)
+}
+function unmarkAssetSubmitting(kind, id) {
+  assetSubmittingKeys.value = assetSubmittingKeys.value.filter(k => k !== `${kind}:${id}`)
+}
 const pendingVideoIds = ref([])
 const failedVideoMessages = ref({})
 // 任务列表面板：顶栏按钮触发的右侧抽屉,按集聚合 sys_task + video_merges
@@ -2425,6 +2435,31 @@ async function loadGenTasks() {
     }
     pendingVideoIds.value = [...pending]
     failedVideoMessages.value = failed
+
+    // 资产生图 pending 自愈：按资产取最新一条 image 任务,已终态(completed/failed)
+    // 即从 pending 清出——批量看护窗口超时/页面刷新后,手动刷新或自动轮询可兜底复位
+    const latestByAsset = new Map()
+    for (const t of genTasks.value) {
+      if (t.type !== 'image') continue
+      const kind = t.character_id ? 'character' : t.prop_id ? 'prop' : t.scene_id ? 'scene' : null
+      if (!kind) continue
+      const key = `${kind}:${t[kind === 'character' ? 'character_id' : kind === 'prop' ? 'prop_id' : 'scene_id']}`
+      const prev = latestByAsset.get(key)
+      if (!prev
+        || String(t.created_at || '') > String(prev.created_at || '')
+        || (String(t.created_at || '') === String(prev.created_at || '') && t.id > prev.id)) {
+        latestByAsset.set(key, t)
+      }
+    }
+    for (const [key, t] of latestByAsset) {
+      if (!['completed', 'failed'].includes(t.status)) continue
+      const idx = key.indexOf(':')
+      const kind = key.slice(0, idx)
+      const assetId = Number(key.slice(idx + 1))
+      if (assetSubmittingKeys.value.includes(`${kind}:${assetId}`)) continue // 提交中，勿动
+      const source = kind === 'character' ? pendingCharImageIds : kind === 'prop' ? pendingPropImageIds : pendingSceneImageIds
+      source.value = source.value.filter(item => item !== assetId)
+    }
   } catch { /* 静默失败,不打断其他刷新 */ }
 }
 
@@ -3125,13 +3160,19 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-function watchAsyncResult(check, attempts = 24, delay = 2500) {
+/**
+ * 轮询业务数据直到 check() 通过；attempts 耗尽仍未通过时调用 onTimeout 兜底
+ * （生图/生视频是长任务，窗口必须覆盖慢通道——如 Nuwax 工作流实测约 2 分钟），
+ * 否则 pending 状态残留会让按钮无限转圈。
+ */
+function watchAsyncResult(check, attempts = 24, delay = 2500, onTimeout) {
   void (async () => {
     for (let i = 0; i < attempts; i++) {
       await sleep(delay)
       await refresh()
       if (check()) return
     }
+    onTimeout?.()
   })()
 }
 
@@ -3172,6 +3213,7 @@ function pollAssetGeneration(type, id, generationId) {
 }
 
 async function genCharImg(id) {
+  markAssetSubmitting('character', id)
   try {
     if (!isPendingCharImage(id)) pendingCharImageIds.value.push(id)
     const char = chars.value.find(c => c.id === id)
@@ -3188,12 +3230,15 @@ async function genCharImg(id) {
   } catch (e) {
     pendingCharImageIds.value = pendingCharImageIds.value.filter(item => item !== id)
     toastError(e)
+  } finally {
+    unmarkAssetSubmitting('character', id)
   }
 }
 function batchCharImages() {
   const ids = visualChars.value.filter(c => !(c.image_url || c.imageUrl)).map(c => c.id)
   if (!ids.length) { toast.info(t('episode.image.allCharsDone')); return }
   pendingCharImageIds.value = [...new Set([...pendingCharImageIds.value, ...ids])]
+  ids.forEach(id => markAssetSubmitting('character', id))
   characterAPI.batchImages(ids, epId.value, bareModelName(imageModel.value) || undefined, ownerConfigId(imageModelOptions.value, imageModel.value), chatModelOverride(), chatConfigId()).then(async () => {
     toast.success(t('episode.image.batchGeneratingChar'))
     await refresh()
@@ -3202,13 +3247,17 @@ function batchCharImages() {
       const done = !!(char?.image_url || char?.imageUrl)
       if (done) pendingCharImageIds.value = pendingCharImageIds.value.filter(item => item !== id)
       return done
-    }), 36)
+    }), 120, 2500, () => {
+      // 超时兜底：未完成的从 pending 清出，避免按钮无限转圈
+      pendingCharImageIds.value = pendingCharImageIds.value.filter(item => !ids.includes(item))
+    })
   }).catch(e => {
     pendingCharImageIds.value = pendingCharImageIds.value.filter(item => !ids.includes(item))
     toastError(e)
-  })
+  }).finally(() => ids.forEach(id => unmarkAssetSubmitting('character', id)))
 }
 async function genSceneImg(id) {
+  markAssetSubmitting('scene', id)
   try {
     if (!isPendingSceneImage(id)) pendingSceneImageIds.value.push(id)
     const scene = scenes.value.find(s => s.id === id)
@@ -3225,12 +3274,15 @@ async function genSceneImg(id) {
   } catch (e) {
     pendingSceneImageIds.value = pendingSceneImageIds.value.filter(item => item !== id)
     toastError(e)
+  } finally {
+    unmarkAssetSubmitting('scene', id)
   }
 }
 function isPendingPropImage(id) {
   return pendingPropImageIds.value.includes(id)
 }
 async function genPropImg(id) {
+  markAssetSubmitting('prop', id)
   try {
     if (!isPendingPropImage(id)) pendingPropImageIds.value.push(id)
     const prop = propItems.value.find(p => p.id === id)
@@ -3247,33 +3299,47 @@ async function genPropImg(id) {
   } catch (e) {
     pendingPropImageIds.value = pendingPropImageIds.value.filter(item => item !== id)
     toastError(e)
+  } finally {
+    unmarkAssetSubmitting('prop', id)
   }
 }
 function batchSceneImages() {
   const ids = scenes.value.filter(s => !(s.image_url || s.imageUrl)).map(s => s.id)
   if (!ids.length) { toast.info(t('episode.image.allScenesDone')); return }
   pendingSceneImageIds.value = [...new Set([...pendingSceneImageIds.value, ...ids])]
-  ids.forEach(id => { sceneAPI.generateImage(id, epId.value, bareModelName(imageModel.value) || undefined, ownerConfigId(imageModelOptions.value, imageModel.value), chatModelOverride(), chatConfigId()).then(() => refresh()).catch(e => toastError(e)) })
+  ids.forEach(id => {
+    markAssetSubmitting('scene', id)
+    sceneAPI.generateImage(id, epId.value, bareModelName(imageModel.value) || undefined, ownerConfigId(imageModelOptions.value, imageModel.value), chatModelOverride(), chatConfigId()).then(() => refresh()).catch(e => toastError(e)).finally(() => unmarkAssetSubmitting('scene', id))
+  })
   toast.success(t('episode.image.batchGeneratingScene'))
   watchAsyncResult(() => ids.every(id => {
     const scene = scenes.value.find(s => s.id === id)
     const done = !!(scene?.image_url || scene?.imageUrl)
     if (done) pendingSceneImageIds.value = pendingSceneImageIds.value.filter(item => item !== id)
     return done
-  }), 36)
+  }), 120, 2500, () => {
+    // 超时兜底：未完成的从 pending 清出，避免按钮无限转圈
+    pendingSceneImageIds.value = pendingSceneImageIds.value.filter(item => !ids.includes(item))
+  })
 }
 function batchPropImages() {
   const ids = propItems.value.filter(p => !(p.image_url || p.imageUrl)).map(p => p.id)
   if (!ids.length) { toast.info(t('episode.image.allPropsDone')); return }
   pendingPropImageIds.value = [...new Set([...pendingPropImageIds.value, ...ids])]
-  ids.forEach(id => { propAPI.generateImage(id, epId.value, bareModelName(imageModel.value) || undefined, ownerConfigId(imageModelOptions.value, imageModel.value), chatModelOverride(), chatConfigId()).then(() => refresh()).catch(e => toastError(e)) })
+  ids.forEach(id => {
+    markAssetSubmitting('prop', id)
+    propAPI.generateImage(id, epId.value, bareModelName(imageModel.value) || undefined, ownerConfigId(imageModelOptions.value, imageModel.value), chatModelOverride(), chatConfigId()).then(() => refresh()).catch(e => toastError(e)).finally(() => unmarkAssetSubmitting('prop', id))
+  })
   toast.success(t('episode.image.batchGeneratingProp'))
   watchAsyncResult(() => ids.every(id => {
     const prop = propItems.value.find(p => p.id === id)
     const done = !!(prop?.image_url || prop?.imageUrl)
     if (done) pendingPropImageIds.value = pendingPropImageIds.value.filter(item => item !== id)
     return done
-  }), 36)
+  }), 120, 2500, () => {
+    // 超时兜底：未完成的从 pending 清出，避免按钮无限转圈
+    pendingPropImageIds.value = pendingPropImageIds.value.filter(item => !ids.includes(item))
+  })
 }
 function getVideoUrl(s) {
   const output = productionOutputById(s?.id)
@@ -3533,7 +3599,10 @@ async function pollVideoGeneration(generationId, storyboardId) {
       const done = !!(target?.video_url || target?.videoUrl)
       if (done) pendingVideoIds.value = pendingVideoIds.value.filter(item => item !== storyboardId)
       return done
-    }, 60, 4000)
+    }, 120, 4000, () => {
+      // 超时兜底：与有 generationId 的路径保持一致，避免按钮无限转圈
+      pendingVideoIds.value = pendingVideoIds.value.filter(item => item !== storyboardId)
+    })
     return
   }
   for (let i = 0; i < 120; i++) {
