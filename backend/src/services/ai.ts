@@ -15,6 +15,11 @@ export interface AIConfig {
   model: string
   /** 采样温度，null 表示不设置（跟随服务商默认）。存于 ai_service_configs.settings JSON */
   temperature?: number | null
+  /**
+   * ai_service_configs.settings 解析后的对象。
+   * 工作流类服务（Nuwax）据此读取入参映射配置，其余厂商不使用。
+   */
+  settings?: Record<string, any>
 }
 
 /** 从 settings JSON 解析 temperature；非法值一律视为未设置 */
@@ -28,10 +33,21 @@ export function parseConfigTemperature(settingsRaw: string | null | undefined): 
   }
 }
 
+/** 解析 ai_service_configs.settings 原始 JSON；非法值一律视为空对象 */
+export function parseConfigSettings(settingsRaw: string | null | undefined): Record<string, any> {
+  if (!settingsRaw) return {}
+  try {
+    const s = JSON.parse(settingsRaw)
+    return s && typeof s === 'object' && !Array.isArray(s) ? s : {}
+  } catch {
+    return {}
+  }
+}
+
 export const officialProviders: Record<ServiceType, readonly string[]> = {
   text: ['openai', 'gemini', 'volcengine'],
-  image: ['openai', 'gemini', 'volcengine'],
-  video: ['volcengine', 'minimax', 'aliyun'],
+  image: ['openai', 'gemini', 'volcengine', 'nuwax'],
+  video: ['volcengine', 'minimax', 'aliyun', 'nuwax'],
 }
 
 export function isOfficialProvider(serviceType?: string | null, provider?: string | null): boolean {
@@ -92,6 +108,7 @@ export async function getActiveConfig(serviceType: ServiceType): Promise<AIConfi
     apiKey: active.apiKey,
     model: models[0] || '',
     temperature: parseConfigTemperature(active.settings),
+    settings: parseConfigSettings(active.settings),
   }
 }
 
@@ -145,5 +162,6 @@ export async function getConfigById(id: number): Promise<AIConfig | null> {
     apiKey: row.apiKey,
     model: models[0] || '',
     temperature: parseConfigTemperature(row.settings),
+    settings: parseConfigSettings(row.settings),
   }
 }

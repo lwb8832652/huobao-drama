@@ -78,6 +78,11 @@ export interface AIConfig {
   baseUrl: string
   apiKey: string
   model: string
+  /**
+   * ai_service_configs.settings 解析后的对象。
+   * 工作流类服务（Nuwax）据此读取入参映射配置，其余厂商不使用。
+   */
+  settings?: Record<string, any>
 }
 
 export interface ImageGenerationRecord {

@@ -4,7 +4,7 @@ import { db, getInsertId, schema } from '../db/index.js'
 import { success, notFound, created, badRequest, now } from '../utils/response.js'
 import { toSnakeCase } from '../utils/transform.js'
 import { joinProviderUrl } from '../services/adapters/url.js'
-import { isOfficialProvider, parseConfigTemperature } from '../services/ai.js'
+import { isOfficialProvider, parseConfigSettings } from '../services/ai.js'
 import { redactUrl, logTaskError, logTaskProgress, logTaskSuccess } from '../utils/task-logger.js'
 
 const app = new Hono()
@@ -17,12 +17,14 @@ function normalizeTemperature(v: any): number | null {
   return n
 }
 
-/** 把 settings JSON 中的 temperature 透出为顶层字段，便于前端直接读写 */
+/** 把 settings JSON 中的 temperature / workflow 透出为顶层字段，便于前端直接读写 */
 function withParsedFields(r: any) {
+  const settings = parseConfigSettings(r.settings)
   return {
     ...toSnakeCase(r),
     model: r.model ? JSON.parse(r.model) : [],
-    temperature: parseConfigTemperature(r.settings),
+    temperature: typeof settings.temperature === 'number' && Number.isFinite(settings.temperature) ? settings.temperature : null,
+    workflow: settings.workflow ?? null,
   }
 }
 
@@ -40,6 +42,70 @@ function geminiHeaders(apiKey?: string, withJson = false) {
   }
   if (withJson) headers['Content-Type'] = 'application/json'
   return headers
+}
+
+/**
+ * Nuwax 图片/视频服务走的是工作流：model[0] 承载工作流 ID，必须且只能是纯数字。
+ * 前端已校验，这里兜底，防止绕过界面直接调 API 写入非法 ID
+ * （adapter 的 extractWorkflowId 是最后一道防线，此处让错误在配置阶段就暴露）。
+ * @returns 错误描述；合法时返回 null
+ */
+function validateNuwaxWorkflowId(serviceType: string, provider: string, model: unknown): string | null {
+  if (!['image', 'video'].includes(serviceType) || (provider || '').toLowerCase() !== 'nuwax') return null
+  const first = Array.isArray(model) ? model[0] : model
+  const id = String(first ?? '').trim()
+  if (!id) return 'Nuwax 服务需要填写工作流 ID（纯数字）'
+  if (!/^\d+$/.test(id)) return `Nuwax 工作流 ID 必须是纯数字，当前值：${id}`
+  return null
+}
+
+/**
+ * 规范化工作流参数映射配置（Nuwax）。
+ * 只保留 promptKey / referenceKey / extraParams 三个字段，全部为空时返回 null（表示不保存）。
+ */
+function normalizeWorkflowSettings(input: any): Record<string, any> | null {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null
+
+  const promptKey = String(input.promptKey ?? '').trim()
+  const referenceKey = String(input.referenceKey ?? '').trim()
+
+  const extraParams: Record<string, string> = {}
+  const raw = input.extraParams
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) {
+      const key = String(k ?? '').trim()
+      if (key) extraParams[key] = String(v ?? '')
+    }
+  }
+
+  if (!promptKey && !referenceKey && !Object.keys(extraParams).length) return null
+  return { promptKey, referenceKey, extraParams }
+}
+
+/**
+ * 组装 settings JSON（temperature + 工作流参数映射），与已有配置合并。
+ * 只更新本次请求携带的字段，未携带的保持不变。
+ */
+function buildSettingsJson(
+  existing: string | null | undefined,
+  patch: { temperature?: number | null; workflow?: unknown },
+  opts: { hasTemperature: boolean; hasWorkflow: boolean },
+): string | null {
+  let settings: Record<string, any> = parseConfigSettings(existing)
+
+  if (opts.hasTemperature) {
+    const t = patch.temperature
+    if (t === null || t === undefined) delete settings.temperature
+    else settings.temperature = t
+  }
+
+  if (opts.hasWorkflow) {
+    const wf = normalizeWorkflowSettings(patch.workflow)
+    if (wf) settings.workflow = wf
+    else delete settings.workflow
+  }
+
+  return Object.keys(settings).length ? JSON.stringify(settings) : null
 }
 
 function buildProbe(serviceType: string, provider: string, baseUrl: string, model?: string, apiKey?: string) {
@@ -81,6 +147,18 @@ function buildProbe(serviceType: string, provider: string, baseUrl: string, mode
       url: joinProviderUrl(baseUrl, '/api/v3', path),
       headers: bearerHeaders(apiKey, true),
       body: {},
+    }
+  }
+
+  if (p === 'nuwax') {
+    // Nuwax 工作流：用不存在的 ID(-1) 探测，仅验证端点可达 + 鉴权有效。
+    // 不拿真实工作流 ID 探测，避免「测试配置」真的执行一次工作流产生费用/副作用。
+    const inputKey = (process.env.NUWAX_INPUT_KEY || 'question').trim() || 'question'
+    return {
+      method: 'POST',
+      url: joinProviderUrl(baseUrl, '/api/v1', '/workflow/-1/execute'),
+      headers: bearerHeaders(apiKey, true),
+      body: { [inputKey]: 'ping' },
     }
   }
 
@@ -137,6 +215,8 @@ app.post('/', async (c) => {
   if (!isOfficialProvider(body.service_type, body.provider)) {
     return badRequest(c, '不支持的 service_type/provider')
   }
+  const nuwaxError = validateNuwaxWorkflowId(body.service_type, body.provider, body.model)
+  if (nuwaxError) return badRequest(c, nuwaxError)
 
   let temperature: number | null = null
   if ('temperature' in body) {
@@ -156,7 +236,10 @@ app.post('/', async (c) => {
     model: JSON.stringify(body.model || []),
     priority: body.priority || 0,
     isActive: true,
-    settings: temperature !== null ? JSON.stringify({ temperature }) : null,
+    settings: buildSettingsJson(null, { temperature, workflow: body.workflow }, {
+      hasTemperature: 'temperature' in body,
+      hasWorkflow: 'workflow' in body,
+    }),
     createdAt: ts,
     updatedAt: ts,
   })
@@ -259,6 +342,11 @@ app.put('/:id', async (c) => {
   if (!isOfficialProvider(serviceType, provider)) {
     return badRequest(c, '不支持的 service_type/provider')
   }
+  // 仅当本次请求携带 model 时校验，避免历史数据/其他类型被误卡
+  if ('model' in body) {
+    const nuwaxError = validateNuwaxWorkflowId(serviceType, provider, body.model)
+    if (nuwaxError) return badRequest(c, nuwaxError)
+  }
 
   const updates: Record<string, any> = { updatedAt: now() }
 
@@ -270,19 +358,18 @@ app.put('/:id', async (c) => {
   if ('model' in body) updates.model = JSON.stringify(body.model)
   if ('priority' in body) updates.priority = body.priority
   if ('is_active' in body) updates.isActive = body.is_active
-  if ('temperature' in body) {
+  if ('temperature' in body || 'workflow' in body) {
     let temperature: number | null
     try {
       temperature = normalizeTemperature(body.temperature)
     } catch {
       return badRequest(c, 'temperature 须为 0 到 2 之间的数字')
     }
-    // 与已有 settings 合并，清空的 temperature 从 JSON 中移除
-    let settings: Record<string, any> = {}
-    try { settings = existing.settings ? JSON.parse(existing.settings) : {} } catch { settings = {} }
-    if (temperature === null) delete settings.temperature
-    else settings.temperature = temperature
-    updates.settings = Object.keys(settings).length ? JSON.stringify(settings) : null
+    // 与已有 settings 合并，清空的字段从 JSON 中移除
+    updates.settings = buildSettingsJson(existing.settings, { temperature, workflow: body.workflow }, {
+      hasTemperature: 'temperature' in body,
+      hasWorkflow: 'workflow' in body,
+    })
   }
 
   await db.update(schema.aiServiceConfigs).set(updates).where(eq(schema.aiServiceConfigs.id, id))

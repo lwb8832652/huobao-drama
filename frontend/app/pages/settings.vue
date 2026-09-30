@@ -497,7 +497,7 @@
             <span class="field-label">{{ t('settings.cfg.name') }}</span>
             <input v-model="cfgForm.name" class="input" :placeholder="t('settings.cfg.namePlaceholder')" />
           </label>
-          <label class="field"><span class="field-label">{{ t('settings.cfg.provider') }}</span>
+          <label v-if="!isNuwaxWorkflow" class="field"><span class="field-label">{{ t('settings.cfg.provider') }}</span>
             <BaseSelect v-model="cfgForm.provider" :options="providerSelectOptions" :placeholder="t('settings.cfg.providerPlaceholder')" searchable />
           </label>
           <label class="field">
@@ -508,28 +508,59 @@
           <label class="field"><span class="field-label">API Key</span><input v-model="cfgForm.api_key" class="input" type="password" placeholder="sk-..." /></label>
           <label class="field"><span class="field-label">Base URL</span><input v-model="cfgForm.base_url" class="input" placeholder="https://..." /></label>
           <div class="field">
-            <span class="field-label">{{ t('settings.cfg.models') }}</span>
-            <div v-if="cfgForm.models.length" class="model-chips">
-              <span
-                v-for="(m, i) in cfgForm.models" :key="`${m}-${i}`"
-                :class="['model-chip', { 'is-default': i === 0 }]"
-                :title="t('settings.cfg.modelChipHint')"
-                @click="pinModelTop(i)"
-              >
-                {{ m }}<em v-if="i === 0">{{ t('common.default') }}</em>
-                <button type="button" class="model-chip-x" :title="t('common.delete')" @click.stop="removeModel(i)"><X :size="11" /></button>
-              </span>
-            </div>
-            <div class="model-add-row">
-              <input
-                v-model="modelInput" class="input" :placeholder="t('settings.cfg.modelPlaceholder')"
-                @keydown.enter.prevent="addModel"
-                @paste="onModelPaste"
-              />
-              <button type="button" class="btn btn-sm" :disabled="!modelInput.trim()" @click="addModel">{{ t('common.add') }}</button>
-            </div>
-            <span class="field-hint">{{ t('settings.cfg.modelsHint') }}</span>
+            <span class="field-label">{{ isNuwaxWorkflow ? t('settings.cfg.workflowId') : t('settings.cfg.models') }}</span>
+            <template v-if="isNuwaxWorkflow">
+              <input v-model="workflowIdModel" class="input" :placeholder="t('settings.cfg.workflowIdPlaceholder')" />
+              <span class="field-hint">{{ t('settings.cfg.workflowIdHint') }}</span>
+            </template>
+            <template v-else>
+              <div v-if="cfgForm.models.length" class="model-chips">
+                <span
+                  v-for="(m, i) in cfgForm.models" :key="`${m}-${i}`"
+                  :class="['model-chip', { 'is-default': i === 0 }]"
+                  :title="t('settings.cfg.modelChipHint')"
+                  @click="pinModelTop(i)"
+                >
+                  {{ m }}<em v-if="i === 0">{{ t('common.default') }}</em>
+                  <button type="button" class="model-chip-x" :title="t('common.delete')" @click.stop="removeModel(i)"><X :size="11" /></button>
+                </span>
+              </div>
+              <div class="model-add-row">
+                <input
+                  v-model="modelInput" class="input" :placeholder="t('settings.cfg.modelPlaceholder')"
+                  @keydown.enter.prevent="addModel"
+                  @paste="onModelPaste"
+                />
+                <button type="button" class="btn btn-sm" :disabled="!modelInput.trim()" @click="addModel">{{ t('common.add') }}</button>
+              </div>
+              <span class="field-hint">{{ t('settings.cfg.modelsHint') }}</span>
+            </template>
           </div>
+          <template v-if="isNuwaxWorkflow">
+            <div class="field">
+              <span class="field-label">{{ t('settings.cfg.workflowSection') }}</span>
+              <span class="field-hint">{{ t('settings.cfg.workflowSectionSub') }}</span>
+            </div>
+            <label class="field">
+              <span class="field-label">{{ t('settings.cfg.workflowPromptKey') }}</span>
+              <input v-model="cfgForm.wfPromptKey" class="input" :placeholder="t('settings.cfg.workflowPromptKeyPlaceholder')" />
+              <span class="field-hint">{{ t('settings.cfg.workflowPromptKeyHint') }}</span>
+            </label>
+            <label class="field">
+              <span class="field-label">{{ t('settings.cfg.workflowReferenceKey') }}</span>
+              <input v-model="cfgForm.wfReferenceKey" class="input" :placeholder="t('settings.cfg.workflowReferenceKeyPlaceholder')" />
+              <span class="field-hint">{{ t('settings.cfg.workflowReferenceKeyHint') }}</span>
+            </label>
+            <label class="field">
+              <span class="field-label">{{ t('settings.cfg.workflowExtraParams') }}</span>
+              <textarea v-model="cfgForm.wfExtraParams" class="textarea" rows="3" :placeholder="t('settings.cfg.workflowExtraParamsPlaceholder')"></textarea>
+              <span class="field-hint">{{ t('settings.cfg.workflowExtraParamsHint') }}</span>
+            </label>
+            <div class="field">
+              <span class="field-label">{{ t('settings.cfg.workflowVarsTitle') }}</span>
+              <span class="field-hint mono">{{ workflowVarsText }}</span>
+            </div>
+          </template>
           <label v-if="cfgForm.service_type === 'text'" class="field">
             <span class="field-label">Temperature <span class="dim">({{ t('settings.cfg.tempHint') }})</span></span>
             <input v-model="cfgForm.temperature" class="input" type="number" step="0.1" min="0" max="2" :placeholder="t('settings.cfg.tempPlaceholder')" />
@@ -706,7 +737,7 @@ const cfgTesting = ref(false)
 const cfgTestResult = ref(null)
 const huobaoApiKey = ref('')
 const huobaoSaving = ref(false)
-const cfgForm = reactive({ name: '', provider: '', api_key: '', base_url: '', models: [], service_type: 'text', priority: 0, temperature: '' })
+const cfgForm = reactive({ name: '', provider: '', api_key: '', base_url: '', models: [], service_type: 'text', priority: 0, temperature: '', wfPromptKey: 'question', wfReferenceKey: '', wfExtraParams: '' })
 // 模型标签编辑器：首位即默认模型；输入框支持回车添加、逗号/换行批量粘贴
 const modelInput = ref('')
 function addModel() {
@@ -734,8 +765,27 @@ const serviceTypes = computed(() => [
   { type: 'image', label: t('common.serviceType.image') },
   { type: 'video', label: t('common.serviceType.video') },
 ])
-const providers = ['gemini', 'openai', 'volcengine', 'minimax', 'aliyun']
+const providers = ['gemini', 'openai', 'volcengine', 'minimax', 'aliyun', 'nuwax']
 const providerSelectOptions = computed(() => providers.map(p => ({ label: p, value: p })))
+// Nuwax 的图片/视频服务走的是「工作流」而非模型：此时服务商固定为 nuwax（隐藏该字段），
+// 模型字段改为填写工作流 ID。编辑已有 Nuwax 配置时同样自动命中。
+const isNuwaxWorkflow = computed(() => ['image', 'video'].includes(cfgForm.service_type) && cfgForm.provider === 'nuwax')
+// 工作流 ID 直接读写 cfgForm.models 首位（后端 model[0] 承载工作流 ID）
+const workflowIdModel = computed({
+  get: () => cfgForm.models[0] || '',
+  set: (v) => { cfgForm.models = String(v || '').trim() ? [String(v).trim()] : [] },
+})
+/**
+ * 可用变量清单。占位符字面量 `{{xxx}}` 不能放进 i18n —— vue-i18n 会把它解析为
+ * 「嵌套占位符」语法并抛 "Not allowed nest placeholder"（渲染时直接白屏），
+ * 因此这里由代码拼出，变量名本身也无需翻译。
+ */
+const workflowVarsText = computed(() => {
+  const names = cfgForm.service_type === 'video'
+    ? ['prompt', 'promptPlain', 'duration', 'resolution', 'aspectRatio', 'firstFrame', 'referenceImages']
+    : ['prompt', 'promptPlain', 'size', 'frameType', 'referenceImages']
+  return names.map(n => `{{${n}}}`).join('  ｜  ')
+})
 const serviceMeta = computed(() => ({
   text: { label: t('common.serviceType.text'), desc: t('settings.ai.meta.text') },
   image: { label: t('common.serviceType.image'), desc: t('settings.ai.meta.image') },
@@ -749,11 +799,15 @@ const providerPresets = {
   image: {
     gemini: { label: 'Gemini 官方', baseUrl: 'https://generativelanguage.googleapis.com', models: ['gemini-3-pro-image', 'gemini-3.1-flash-image'] },
     openai: { label: 'OpenAI 官方', baseUrl: 'https://api.openai.com', models: ['gpt-image-2'] },
+    // Nuwax 工作出图：模型字段填**工作流 ID**（纯数字），故预设不预填默认模型
+    nuwax: { label: 'Nuwax 官方', baseUrl: 'https://api.nuwax.com', models: [] },
   },
   video: {
     aliyun: { label: '阿里云百炼 Wan 3.0', baseUrl: 'https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com', models: ['wan3.0-video', 'wan3.0-video-prime'] },
     volcengine: { label: 'Seedance 2.0 官方', baseUrl: 'https://ark.cn-beijing.volces.com', models: ['doubao-seedance-2-0-mini-260615', 'doubao-seedance-2-0-fast-260128', 'doubao-seedance-2-0-260128'] },
     minimax: { label: 'MiniMax H3 官方', baseUrl: 'https://api.minimaxi.com', models: ['MiniMax-H3'] },
+    // Nuwax 工作出视频：模型字段填**工作流 ID**（纯数字），故预设不预填默认模型
+    nuwax: { label: 'Nuwax 官方', baseUrl: 'https://api.nuwax.com', models: [] },
   },
 }
 const huobaoQuickConfigs = [
@@ -769,6 +823,24 @@ const huobaoQuickConfigs = [
 function byType(t) { return cfgs.value.filter(c => c.service_type === t) }
 function countActive(t) { return byType(t).filter(c => c.is_active).length }
 function fmtModel(m) { return Array.isArray(m) ? m.join(', ') : m || '—' }
+/** 附加参数：对象 → 多行 key=value（textarea 编辑态） */
+function fmtExtraParams(obj) {
+  if (!obj || typeof obj !== 'object') return ''
+  return Object.entries(obj).map(([k, v]) => `${k}=${v}`).join('\n')
+}
+/** 附加参数：多行 key=value → 对象；忽略空行与无等号的行 */
+function parseExtraParams(str) {
+  const out = {}
+  for (const line of String(str || '').split('\n')) {
+    const text = line.trim()
+    if (!text) continue
+    const i = text.indexOf('=')
+    if (i <= 0) continue
+    const key = text.slice(0, i).trim()
+    if (key) out[key] = text.slice(i + 1).trim()
+  }
+  return out
+}
 function presetsByType(type) {
   const group = providerPresets[type] || {}
   return Object.entries(group).map(([provider, preset]) => ({ provider, ...preset }))
@@ -842,7 +914,7 @@ async function applyHuobaoQuickConfig() {
 function startAddCfg(t) {
   cfgEditId.value = null
   cfgTestResult.value = null
-  Object.assign(cfgForm, { name: '', provider: '', api_key: '', base_url: '', models: [], service_type: t, priority: 0, temperature: '' })
+  Object.assign(cfgForm, { name: '', provider: '', api_key: '', base_url: '', models: [], service_type: t, priority: 0, temperature: '', wfPromptKey: 'question', wfReferenceKey: '', wfExtraParams: '' })
   const firstPreset = presetsByType(t)[0]
   if (firstPreset) applyProviderPreset(t, firstPreset.provider)
   cfgDialog.value = true
@@ -859,6 +931,9 @@ function startEditCfg(c) {
     service_type: c.service_type,
     priority: c.priority ?? 0,
     temperature: c.temperature ?? '',
+    wfPromptKey: c.workflow?.promptKey || 'question',
+    wfReferenceKey: c.workflow?.referenceKey || '',
+    wfExtraParams: fmtExtraParams(c.workflow?.extraParams),
   })
   cfgDialog.value = true
 }
@@ -895,14 +970,26 @@ async function testExistingCfg(c) {
 }
 async function saveCfg() {
   if (!cfgForm.provider) { toast.warning(t('settings.cfg.providerRequired')); return }
+  // Nuwax 工作流：模型字段实际承载工作流 ID，必须且只能是纯数字
+  if (isNuwaxWorkflow.value) {
+    const workflowId = (cfgForm.models[0] || '').trim()
+    if (!workflowId) { toast.warning(t('settings.cfg.workflowIdRequired')); return }
+    if (!/^\d+$/.test(workflowId)) { toast.warning(t('settings.cfg.workflowIdInvalid')); return }
+  }
   const models = [...cfgForm.models]
+  // 工作流参数映射：仅 Nuwax 需要，其余服务传 undefined（不写入配置）
+  const workflow = isNuwaxWorkflow.value ? {
+    promptKey: cfgForm.wfPromptKey.trim() || 'question',
+    referenceKey: cfgForm.wfReferenceKey.trim(),
+    extraParams: parseExtraParams(cfgForm.wfExtraParams),
+  } : undefined
   const temperature = cfgForm.temperature === '' || cfgForm.temperature === null ? null : Number(cfgForm.temperature)
   if (temperature !== null && (!Number.isFinite(temperature) || temperature < 0 || temperature > 2)) {
     toast.warning(t('settings.cfg.tempInvalid')); return
   }
   try {
-    if (cfgEditId.value) await aiConfigAPI.update(cfgEditId.value, { name: cfgForm.name, provider: cfgForm.provider, api_key: cfgForm.api_key, base_url: cfgForm.base_url, model: models, priority: cfgForm.priority, temperature })
-    else await aiConfigAPI.create({ service_type: cfgForm.service_type, provider: cfgForm.provider, name: cfgForm.name || `${cfgForm.provider}-${cfgForm.service_type}`, api_key: cfgForm.api_key, base_url: cfgForm.base_url, model: models, priority: cfgForm.priority, temperature })
+    if (cfgEditId.value) await aiConfigAPI.update(cfgEditId.value, { name: cfgForm.name, provider: cfgForm.provider, api_key: cfgForm.api_key, base_url: cfgForm.base_url, model: models, priority: cfgForm.priority, temperature, workflow })
+    else await aiConfigAPI.create({ service_type: cfgForm.service_type, provider: cfgForm.provider, name: cfgForm.name || `${cfgForm.provider}-${cfgForm.service_type}`, api_key: cfgForm.api_key, base_url: cfgForm.base_url, model: models, priority: cfgForm.priority, temperature, workflow })
     cfgDialog.value = false; toast.success(t('common.saved')); loadCfgs()
   } catch (e) { toastError(e) }
 }
