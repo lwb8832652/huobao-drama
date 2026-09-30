@@ -360,6 +360,7 @@
       "scriptRewriter": "剧本改写",
       "extractor": "角色场景提取",
       "storyboardBreaker": "分镜拆解",
+      "frameSplitter": "分镜画面拆分",
       "promptGenerator": "提示词",
       "langFallback": "跟随中文",
       "followContentLang": "编辑语言跟随：{lang}（在「通用 → AI 内容语言」切换）"

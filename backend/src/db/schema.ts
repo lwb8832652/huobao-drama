@@ -4,7 +4,7 @@
  * boolean→integer boolean mode、时间戳仍为 text 存 ISO 字符串，表/列名不变。
  */
 import { sqliteTable, text, integer, primaryKey } from 'drizzle-orm/sqlite-core'
-export { animaticVersions, batchRuns, batchRunItems, continuityReviews } from './previs-schema.js'
+export { animaticVersions, batchRuns, batchRunItems, continuityReviews, framePlans } from './previs-schema.js'
 
 export const dramas = sqliteTable('dramas', {
   id: integer('id').primaryKey({ autoIncrement: true }),

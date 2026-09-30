@@ -30,6 +30,7 @@ const emit = defineEmits<{
   generate: [frameIds: string[], force?: boolean]
   video: []
   'settings-open': []
+  split: [options?: { force?: boolean }]
 }>()
 
 const uploading = ref('')
@@ -177,6 +178,8 @@ watch(settingsFrame, frame => {
         @click="emit('generate', missingFrames.map(frameKey))"><Sparkles :size="13" />生成缺失<span v-if="missingVideoFrames">{{ missingVideoFrames }}</span></button>
       <AppMenu v-model:open="toolbarMenu" placement="bottom-end">
         <template #trigger><button type="button" class="btn btn-sm frame-icon" title="更多画面操作" aria-label="更多画面操作"><MoreHorizontal :size="16" /></button></template>
+        <AppMenuItem :disabled="!editable" @click="menuAction(() => emit('split'))"><Sparkles :size="13" />AI 拆分画面</AppMenuItem>
+        <AppMenuItem v-if="frames.length" :disabled="!editable" @click="menuAction(() => emit('split', { force: true }))">重新拆分画面（覆盖现有）</AppMenuItem>
         <AppMenuItem :disabled="!editable" @click="plan">按镜头描述规划画面</AppMenuItem>
       </AppMenu>
     </div>
@@ -208,7 +211,7 @@ watch(settingsFrame, frame => {
             <small>{{ frameReferenceUrls(frame).length }} 项参考 · {{ frame.shotType || panel.shotType || '默认景别' }}</small>
           </div>
         </div>
-        <p v-if="task(frame)?.status === 'failed'" class="frame-error" :title="task(frame)?.error">{{ task(frame)?.error || '生成失败，请检查设置后重试' }}</p>
+        <p v-if="task(frame)?.status === 'failed'" class="frame-error" :title="task(frame)?.error || undefined">{{ task(frame)?.error || '生成失败，请检查设置后重试' }}</p>
         <footer class="frame-card-actions">
           <button type="button" class="btn btn-sm" :disabled="!canGenerate(frame)" :title="!frameReferenceUrls(frame).length ? '请先在生成设置中选择参考素材' : ''"
             @click="emit('generate', [frameKey(frame)], !!frame.url)"><Sparkles :size="12" />{{ frame.url ? '重新生成' : '生成' }}</button>
@@ -221,8 +224,15 @@ watch(settingsFrame, frame => {
     <div v-else class="frame-editor-empty">
       <ImagePlus :size="26" />
       <strong>还没有分镜画面</strong>
-      <p>手动添加画面，或根据镜头描述规划。</p>
-      <button type="button" class="btn btn-sm" :disabled="!editable" @click="plan"><Sparkles :size="13" />按描述规划</button>
+      <p>用 AI 按镜头描述拆分画面，或手动添加。</p>
+      <div class="frame-editor-empty-actions">
+        <button
+          type="button" class="btn btn-sm btn-primary" :disabled="!editable"
+          :title="!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '提交后台拆分任务'"
+          @click="emit('split')"
+        ><Sparkles :size="13" />AI 拆分画面</button>
+        <button type="button" class="btn btn-sm" :disabled="!editable" @click="plan">按描述规划</button>
+      </div>
     </div>
     <footer class="frame-editor-video">
       <div><Film :size="14" /><span>{{ usesStoryboardFrames ? (videoReady ? `全部 ${frames.length} 张画面已就绪` : frames.length ? `还需完成 ${missingVideoFrames} 张画面` : '先添加分镜画面') : '当前为直接生成模式' }}<small>{{ usesStoryboardFrames ? '视频按时间顺序使用全部画面' : '这些画面仅用于预演和审核，不作为当前视频输入' }}</small></span></div>
@@ -288,6 +298,11 @@ watch(settingsFrame, frame => {
 .frame-editor-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 28px 12px; border: 1px dashed var(--border-strong); border-radius: var(--radius); color: var(--text-2); }
 .frame-editor-empty strong { color: var(--text-1); font-size: 13px; }
 .frame-editor-empty p { font-size: 11px; margin: 0; }
+.frame-editor-empty-actions { display: flex; align-items: center; justify-content: center; gap: 6px; }
+.frame-editor-progress { display: flex; align-items: center; gap: 10px; padding: 16px 12px; border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border)); border-radius: var(--radius); background: var(--surface-raised); color: var(--accent-text); }
+.frame-editor-progress > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.frame-editor-progress strong { color: var(--text-0); font-size: 13px; }
+.frame-editor-progress span { color: var(--text-2); font-size: 11px; }
 .frame-editor-video { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 0 2px; border-top: 1px solid var(--border); }
 .frame-editor-video > div { display: flex; align-items: center; gap: 7px; font-size: 11px; color: var(--text-1); }
 .frame-editor-video small { display: block; margin-top: 2px; font-size: 10px; color: var(--text-3); }

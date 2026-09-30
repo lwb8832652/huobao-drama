@@ -382,6 +382,16 @@ function sourceChanged(before: Timeline, source: Timeline) {
   return { collectionChanged, changed: collectionChanged || metadataChanged }
 }
 
+function framePlanSummary(versionId: number) {
+  const rows = db.select({ status: schema.framePlans.status })
+    .from(schema.framePlans).where(eq(schema.framePlans.versionId, versionId)).all()
+  const count = (status: string) => rows.filter(row => row.status === status).length
+  return {
+    pending: count('pending'), processing: count('processing'),
+    completed: count('completed'), failed: count('failed'),
+  }
+}
+
 function versionState(
   row: typeof schema.animaticVersions.$inferSelect,
   timeline: Timeline,
@@ -396,6 +406,7 @@ function versionState(
     busy: isBusy(row.id, batches),
     batches,
     outputs: resolveVideoOutputs(row.id, timeline, batches),
+    framePlans: framePlanSummary(row.id),
   }
 }
 

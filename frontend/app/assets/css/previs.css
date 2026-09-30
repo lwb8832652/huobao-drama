@@ -246,6 +246,7 @@
 .pv-header-actions > button[aria-label="撤销"],
 .pv-header-actions > button[aria-label="重做"] { width: 28px; padding: 0; background: transparent; box-shadow: none; color: var(--text-2); }
 .pv-check-button span { min-width: 16px; padding: 0 4px; border-radius: var(--radius-pill); background: var(--overlay-track); font-size: 10px; }
+.pv-split-button span { min-width: 16px; padding: 0 4px; border-radius: var(--radius-pill); background: var(--overlay-track); font-size: 10px; }
 .pv-banner {
   display: flex; align-items: center; gap: 8px; flex-shrink: 0; margin: 8px 8px 0; padding: 7px 10px;
   border-radius: var(--radius); background: var(--info-bg); color: var(--info); font-size: 12px;

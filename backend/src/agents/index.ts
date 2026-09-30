@@ -14,6 +14,7 @@ import { scriptTools } from './tools/script-tools.js'
 import { extractTools } from './tools/extract-tools.js'
 import { storyboardTools } from './tools/storyboard-tools.js'
 import { imagePromptTools } from './tools/image-prompt-tools.js'
+import { frameSplitterTools } from './tools/frame-splitter-tools.js'
 import { loadAgentSkills, skillWorkspaces } from './skills.js'
 import { loadAgentPromptFile, loadBasePromptFile } from './prompts.js'
 import { buildLanguageDirective } from './language.js'
@@ -148,6 +149,26 @@ video_prompt 规则（硬约束）：
 - 所有提示词使用本次会话语言指令指定的目标语言输出，单段连贯描述，不要分点，不要混入无关词汇
 - 项目设定的视觉风格描述会由工具在保存图片提示词时自动注入到最终提示词的最前方，不要自行添加风格词
 - 必须实际调用保存工具，不要只在回复中给出提示词`,
+  },
+  frame_splitter: {
+    name: '分镜画面拆分',
+    instructions: `你是分镜绘制师，负责把一个镜头（分镜段落）拆成若干张按时间推进的画面，用于预演与后续视频生成。
+核心定义：一个镜头 = 时间线上的一个分镜段落；一张画面 = 该镜头在某个时刻的关键状态。
+
+工作流程：
+1. 调用 read_previs_context 读取需要拆分的镜头资料（标题、画面描述、氛围、时长、景别、角度、运镜、场景、角色、道具、项目风格）。
+2. 为每个镜头产出指定数量的画面（用户消息中会告知每个镜头要几张，2-6 张）。
+3. 只输出一个 JSON 对象，不要 Markdown，不要代码围栏，不要补充解释。
+
+画面拆分规则（硬约束）：
+- 只依据给定资料拆分，不得新增情节、人物、道具或场景。
+- 画面按时间推进：第 1 张是镜头开始状态，最后一张是结束状态，中间是动作推进的关键瞬间；相邻画面必须有明确推进关系。
+- 每张画面给一句可直接用于图片生成的画面描述（prompt）：主体 + 动作/状态 + 景别 + 构图 + 光线氛围；不要写镜头编号、时间线说明或解释文字。
+- title 为 4-10 字中文短语，概括该瞬间。
+- 若资料里有项目风格描述，画面提示词应遵循该风格；但不要自行杜撰风格词。
+
+输出结构：
+{"frames":[{"title":"...","prompt":"..."}]}`,
   },
 }
 
@@ -338,6 +359,7 @@ const AGENT_TOOLS: Record<string, Record<string, any>> = {
   script_rewriter: scriptTools,
   extractor: extractTools,
   storyboard_breaker: storyboardTools,
+  frame_splitter: frameSplitterTools,
   prompt_generator: {
     ...imagePromptTools,
     readStoryboardContext: storyboardTools.readStoryboardContext,

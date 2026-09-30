@@ -53,6 +53,21 @@ export const continuityReviews = sqliteTable('continuity_reviews', {
     table.versionId, table.fromGroupId, table.toGroupId, table.inputHash,
   ),
 ])
+export const framePlans = sqliteTable('frame_plans', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  versionId: integer('version_id').notNull(),
+  panelId: integer('panel_id').notNull(),
+  inputHash: text('input_hash').notNull(),
+  configId: integer('config_id').notNull(),
+  model: text('model').notNull(),
+  count: integer('count').notNull().default(0),
+  status: text('status').notNull().default('pending'),
+  resultJson: text('result_json').notNull().default(''),
+  error: text('error'),
+  createdAt: text('created_at').notNull(),
+}, table => [
+  uniqueIndex('idx_frame_plan_input').on(table.versionId, table.panelId, table.inputHash),
+])
 
 export function initPrevisSchema(sqlite: Database.Database) {
   sqlite.exec(`
@@ -90,7 +105,19 @@ export function initPrevisSchema(sqlite: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_previs_items_batch_status ON batch_run_items(batch_id, status);
     CREATE INDEX IF NOT EXISTS idx_previs_items_status ON batch_run_items(status);
     CREATE INDEX IF NOT EXISTS idx_continuity_review_version ON continuity_reviews(version_id);
+    CREATE TABLE IF NOT EXISTS frame_plans (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, version_id INTEGER NOT NULL, panel_id INTEGER NOT NULL,
+      input_hash TEXT NOT NULL, config_id INTEGER NOT NULL, model TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pending', result_json TEXT NOT NULL DEFAULT '', error TEXT, created_at TEXT NOT NULL,
+      UNIQUE(version_id, panel_id, input_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_frame_plan_version ON frame_plans(version_id);
+    CREATE INDEX IF NOT EXISTS idx_frame_plan_status ON frame_plans(status);
   `)
+  const planColumns = sqlite.prepare('PRAGMA table_info(frame_plans)').all() as { name: string }[]
+  for (const [name, type] of [['count', 'INTEGER NOT NULL DEFAULT 0'], ['status', "TEXT NOT NULL DEFAULT 'pending'"], ['result_json', "TEXT NOT NULL DEFAULT ''"], ['error', 'TEXT']]) {
+    if (!planColumns.some(c => c.name === name)) sqlite.exec(`ALTER TABLE frame_plans ADD COLUMN ${name} ${type}`)
+  }
   const reviewColumns = sqlite.prepare('PRAGMA table_info(continuity_reviews)').all() as { name: string }[]
   if (!reviewColumns.some(c => c.name === 'status')) {
     sqlite.exec("ALTER TABLE continuity_reviews ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")

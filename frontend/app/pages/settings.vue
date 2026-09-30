@@ -955,6 +955,7 @@ const agentDefs = computed(() => [
   { type: 'script_rewriter', label: t('settings.agents.scriptRewriter'), icon: '📝' },
   { type: 'extractor', label: t('settings.agents.extractor'), icon: '🔍' },
   { type: 'storyboard_breaker', label: t('settings.agents.storyboardBreaker'), icon: '🎬' },
+  { type: 'frame_splitter', label: t('settings.agents.frameSplitter'), icon: '🎞' },
   { type: 'prompt_generator', label: t('settings.agents.promptGenerator'), icon: '🖼' },
 ])
 

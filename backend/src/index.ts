@@ -25,6 +25,7 @@ import storage from './routes/storage.js'
 import serverUpdate from './routes/serverUpdate.js'
 import previs from './routes/previs.js'
 import { startPrevisWorker } from './services/previs-batch.js'
+import { startFramePlanWorker } from './services/previs-frames.js'
 import { requestLogger, errorHandler } from './middleware/logger.js'
 import { serveStaticRanges } from './middleware/static-range.js'
 import { db, schema } from './db/index.js'
@@ -106,3 +107,4 @@ db.update(schema.sysTask)
 
 serve({ fetch: app.fetch, port })
 void startPrevisWorker().catch(err => console.error('Previs worker startup failed:', err.message))
+void startFramePlanWorker().catch(err => console.error('Frame plan worker startup failed:', err.message))

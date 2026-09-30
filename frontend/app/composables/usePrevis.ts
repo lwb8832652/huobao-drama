@@ -22,6 +22,46 @@ export async function previsRequest<T = any>(path: string, method = 'GET', body?
   if (!response.ok) throw new Error(result.message || `请求失败 (${response.status})`)
   return result.data ?? result
 }
+export interface FramePlanDraft {
+  title: string
+  prompt: string
+  offsetMs: number
+  type: FrameType
+}
+export interface PanelFramePlan {
+  panelId: number
+  panelTitle: string
+  count: number
+  source: 'ai' | 'rule'
+  frames: FramePlanDraft[]
+}
+export interface FramePlanPayload {
+  revision: number
+  panelIds: number[]
+  count?: number
+  configId?: number
+  model?: string
+  force?: boolean
+}
+export interface FramePlanSummary {
+  pending: number
+  processing: number
+  completed: number
+  failed: number
+}
+export interface FramePlansResult {
+  items: { id: number; panelId: number; status: 'pending' | 'processing' | 'completed' | 'failed'; count: number; error: string | null; createdAt: string }[]
+  plans: PanelFramePlan[]
+  summary: FramePlanSummary
+}
+/** 提交拆分任务：立即返回，进度经轮询 state.framePlans 获取。 */
+export async function submitFramePlan(versionId: number, payload: FramePlanPayload) {
+  return previsRequest<{ queued: number }>(`/animatic-versions/${versionId}/frames/plan`, 'POST', payload)
+}
+/** 查询拆分任务状态与已完成方案。 */
+export async function fetchFramePlans(versionId: number) {
+  return previsRequest<FramePlansResult>(`/animatic-versions/${versionId}/frames/plan`)
+}
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value))
 const VIDEO_GENERATION_MODE_KEY = 'huobao:video-generation-mode'
 
@@ -44,6 +84,7 @@ export function useVideoGenerationMode() {
 export function usePrevis() {
   const version = ref<AnimaticVersion | null>(null)
   const versions = ref<{ id: number; versionNo: number; status: string }[]>([])
+  const framePlans = ref<FramePlanSummary>({ pending: 0, processing: 0, completed: 0, failed: 0 })
   const working = ref(false), dirty = ref(false), saveError = ref(''), pollError = ref('')
   const undoStack = ref<Timeline[]>([]), redoStack = ref<Timeline[]>([])
   const editable = computed(() => !!version.value && version.value.status !== 'locked' && !version.value.busy && !working.value)
@@ -89,6 +130,7 @@ export function usePrevis() {
           if (typeof state.busy === 'boolean') version.value.busy = state.busy
           if (state.outputs) version.value.outputs = state.outputs
           if (typeof state.isCurrent === 'boolean') version.value.isCurrent = state.isCurrent
+          if (state.framePlans) framePlans.value = state.framePlans
         }
       }
       pollError.value = ''
@@ -190,6 +232,6 @@ export function usePrevis() {
   onUnmounted(() => { disposed = true; clearInterval(polling); clearTimeout(autosave) })
   return {
     version, versions, timeline, editable, dirty, working, saveError, pollError, undoStack, redoStack,
-    initialize, open, create, edit, history, save, check, generate, batchAction,
+    framePlans, initialize, open, create, edit, history, save, check, generate, batchAction,
   }
 }

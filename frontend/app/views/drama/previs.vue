@@ -6,19 +6,20 @@ import { useI18n } from 'vue-i18n'
 import {
   ArrowLeft, ArrowRight, Check, Clapperboard,
   Download, FileText, Film, Images, Layers, ListTodo, Loader2, Lock, Plus,
-  Redo2, RefreshCw, Save, ShieldCheck, Sparkles, Undo2, Upload, Users, X,
+  Redo2, RefreshCw, Save, Scissors, ShieldCheck, Sparkles, Undo2, Upload, Users, X,
 } from 'lucide-vue-next'
 import LocaleSwitcher from '~/components/LocaleSwitcher.vue'
 import ThemeToggle from '~/components/ThemeToggle.vue'
 import PrevisPlayer from '~/components/previs/PrevisPlayer.vue'
 import PrevisTimeline from '~/components/previs/PrevisTimeline.vue'
 import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.vue'
+import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
 import { uploadAPI } from '~/composables/useApi'
 import {
-  checkContinuity, durationMs, formatTime, frameKey, groupPanels, mediaUrl, orderedFrames,
-  planFrames, previsRequest, timelineSegments, usePrevis, useVideoGenerationMode,
+  checkContinuity, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl, orderedFrames,
+  planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode,
   type AudioClip, type ContinuityIssue, type ContinuityReview, type FrameType, type Keyframe,
-  type Panel, type Timeline,
+  type Panel, type PanelFramePlan, type Timeline,
 } from '~/composables/usePrevis'
 import '~/assets/css/previs.css'
 
@@ -31,6 +32,7 @@ const dramaId = Number(route.params.id), episodeNumber = Number(route.params.epi
 const episodePath = `/drama/${dramaId}/episode/${episodeNumber}`
 const {
   version, timeline, editable, dirty, working, saveError, pollError, undoStack, redoStack,
+  framePlans: framePlansSummary,
   initialize, open, create, edit, history, save, check, generate, batchAction,
 } = usePrevis()
 const videoGenerationMode = useVideoGenerationMode()
@@ -45,6 +47,9 @@ const previewViews: Array<{ key: PrevisStageView; label: string }> = [
 ]
 const player = ref<InstanceType<typeof PrevisPlayer>>()
 const modal = ref(''), dialog = ref<HTMLDialogElement>()
+const framePlanOpen = ref(false), framePlanCount = ref(3)
+const framePlans = ref<PanelFramePlan[]>([])
+const framePlanActive = computed(() => framePlansSummary.value.pending + framePlansSummary.value.processing)
 const videoPanelIds = ref<number[]>([])
 const textModel = ref(''), imageModel = ref(''), videoModel = ref('')
 const episodeResolution = ref('720p')
@@ -277,6 +282,7 @@ const videoTargetPanels = computed(() => {
   return timeline.value.panels.filter(p => videoPanelIds.value.includes(p.id))
 })
 const incompleteVideoPanels = computed(() => videoTargetPanels.value.filter(p => !p.frames.length || p.frames.some(frame => !frame.url)))
+const emptyFramePanels = computed(() => timeline.value?.panels.filter(p => !p.frames.length) || [])
 function groupDuration(id: string) { return segments.value.filter(s => s.groupId === id).reduce((n, s) => n + s.panel.durationMs, 0) }
 function groupThumb(id: string) {
   return timeline.value?.panels.find(p => p.id === groups.value.find(g => g.id === id)?.panelIds[0])?.frames.find(f => f.url)?.url
@@ -410,6 +416,79 @@ async function planAndGenerate(ids?: number[]) {
     }
   })
   await generateFrames(selected)
+}
+const framePlanSubmitting = ref(false)
+/** 提交拆分任务：立即返回，进度经轮询的 framePlansSummary 展示，完成后在任务面板查看方案。 */
+async function submitFrameSplit(panelIds: number[], force = false, count?: number) {
+  if (!version.value || !panelIds.length) { toast.error('没有可拆分的镜头，请先选中一个镜头'); return }
+  if (version.value.status === 'locked') { toast.error('当前版本已锁定，请复制为新草稿后再拆分画面'); return }
+  if (!editable.value) { toast.error('正在处理其他操作或生成任务，请稍后再拆分'); return }
+  if (!await save() || !version.value) return
+  const choice = modelChoice('text')
+  framePlanSubmitting.value = true
+  try {
+    const { queued } = await submitFramePlan(version.value.id, {
+      revision: version.value.revision,
+      panelIds,
+      count,
+      configId: choice?.configId,
+      model: choice?.model,
+      force,
+    })
+    if (!queued) { toast.info('所选镜头已生成过方案，未重复提交'); return }
+    toast.success(`已提交 ${queued} 个镜头的拆分任务，正在后台拆分`)
+    inspector.value = 'tasks'
+  } finally { framePlanSubmitting.value = false }
+}
+async function splitPanel(force = false) {
+  await submitFrameSplit(panel.value ? [panel.value.id] : [], force)
+}
+async function splitEmptyPanels() {
+  const ids = emptyFramePanels.value.map(p => p.id)
+  if (!ids.length) { toast.info('所有镜头都已有分镜画面'); return }
+  await submitFrameSplit(ids)
+}
+async function openFramePlans() {
+  if (!version.value) return
+  try {
+    const result = await fetchFramePlans(version.value.id)
+    if (!result.plans.length) { toast.info('还没有完成的拆分方案'); return }
+    framePlans.value = result.plans
+    framePlanCount.value = result.plans[0]?.count || framePlanCount.value
+    framePlanOpen.value = true
+  } catch (cause: any) { toast.error(cause.message || '读取拆分方案失败') }
+}
+async function retryFailedFramePlans() {
+  if (!version.value) return
+  try {
+    const { queued } = await previsRequest(`/animatic-versions/${version.value.id}/frames/plan/retry`, 'POST', {})
+    toast.success(queued ? `已重新排队 ${queued} 个失败镜头` : '没有可重试的失败项')
+  } catch (cause: any) { toast.error(cause.message || '重试失败') }
+}
+async function recountFramePlan(count: number) {
+  // 调整数量 = 重新提交拆分任务，完成后再次打开方案。
+  framePlanCount.value = count
+  const panelIds = framePlans.value.map(plan => plan.panelId)
+  framePlanOpen.value = false
+  if (panelIds.length) await submitFrameSplit(panelIds, true, count)
+}
+function applyFramePlan(plans: PanelFramePlan[]) {
+  const total = plans.reduce((sum, plan) => sum + plan.frames.length, 0)
+  if (!total) return
+  edit(t => {
+    for (const plan of plans) {
+      const target = t.panels.find(p => p.id === plan.panelId)
+      if (!target) continue
+      target.frames = plan.frames.map(frame => ({
+        ...makeFrame(crypto.randomUUID(), Math.min(frame.offsetMs, Math.max(0, target.durationMs - 1)), frame.title),
+        type: frame.type,
+        prompt: frame.prompt,
+      }))
+      target.coverFrameId = target.frames[0]?.id
+    }
+  })
+  framePlanOpen.value = false
+  toast.success(`已写入 ${total} 张画面，可点击「生成缺失」出图`)
 }
 const uploading = ref(false)
 const audioDraft = ref<AudioClip>()
@@ -704,6 +783,16 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
               <button :disabled="!editable || !redoStack.length" title="重做 ⇧⌘Z" aria-label="重做" @click="history(true)"><Redo2 :size="16" /></button>
               <button :disabled="working || !dirty" @click="save"><Loader2 v-if="working" :size="14" class="pv-spin" /><Save v-else :size="14" />{{ dirty ? '保存' : '已保存' }}</button>
               <button class="pv-check-button" :disabled="!editable" @click="run(() => check())"><ShieldCheck :size="15" />运行检查 <span>{{ fails.length }}</span></button>
+              <button
+                class="pv-split-button"
+                :disabled="!editable || framePlanSubmitting || !emptyFramePanels.length"
+                :title="emptyFramePanels.length ? `为 ${emptyFramePanels.length} 个还没有画面的镜头拆分分镜画面` : '所有镜头都已有分镜画面'"
+                @click="run(splitEmptyPanels)"
+              >
+                <Loader2 v-if="framePlanSubmitting" :size="15" class="pv-spin" /><Scissors v-else :size="15" />
+                <template v-if="framePlanActive">拆分中 {{ framePlanActive }}</template>
+                <template v-else>拆分空镜头画面 <span v-if="emptyFramePanels.length">{{ emptyFramePanels.length }}</span></template>
+              </button>
             </template>
           </div>
         </header>
@@ -763,6 +852,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
                 :title="videoUsesStoryboardFrames ? '分镜画面 · 视频输入' : '分镜画面 · 仅用于预演'"
                 show-video-action
                 @change="updateFrames"
+                @split="options => options?.force ? (modal = 'split') : run(splitPanel)"
                 @settings-open="player?.stop()"
                 @generate="(ids, force) => run(() => generateFrames([panel!.id], ids, force))"
                 @video="videoPanelIds = [panel!.id]; modal = 'video'"
@@ -831,6 +921,15 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
             </template>
             <template v-else-if="inspector === 'tasks'">
               <div class="pv-task-intro"><p class="pv-eyebrow">V{{ String(version.versionNo).padStart(2, '0') }} / 生成记录</p><p>已提交任务继续执行，取消仅停止尚未开始的任务。</p></div>
+              <article v-if="framePlanActive || framePlansSummary.failed || framePlansSummary.completed" class="pv-batch">
+                <header><b>分镜画面拆分</b>
+                  <span><Loader2 v-if="framePlanActive" :size="11" class="pv-spin" /> {{ framePlanActive ? `${framePlanActive} 个拆分中` : framePlansSummary.failed ? `${framePlansSummary.failed} 个失败` : `已完成 ${framePlansSummary.completed} 个` }}</span>
+                </header>
+                <div class="pv-batch-actions">
+                  <button v-if="framePlansSummary.completed" :disabled="working" @click="run(openFramePlans)">查看拆分方案</button>
+                  <button v-if="framePlansSummary.failed" :disabled="working" @click="run(retryFailedFramePlans)">重试失败项</button>
+                </div>
+              </article>
               <article v-for="batch in batches" :key="batch.id" class="pv-batch"><header><b>{{ batch.type === 'image' ? '关键帧' : '视频' }} #{{ batch.id }}</b><span>{{ statusNames[batch.status] || batch.status }}</span></header><progress :value="batch.items.filter(i => i.status === 'completed').length" :max="batch.items.length" /><small>{{ batch.items.filter(i => i.status === 'completed').length }} / {{ batch.items.length }} 已完成</small><div class="pv-batch-actions"><button v-if="batch.items.some(i => i.status === 'failed')" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry'))">重试失败项</button><button v-if="batch.items.some(i => i.status === 'pending')" :disabled="working" @click="run(() => batchAction(batch.id, 'cancel'))">取消排队任务</button></div><details><summary>查看 {{ batch.items.length }} 个任务</summary><div v-for="item in batch.items" :key="item.id" class="pv-task-item"><b>{{ timeline.panels.find(p => p.id === item.panelId)?.title || groups.find(g => g.id === item.groupId)?.title }} {{ item.frameType ? frameNames[item.frameType] : '' }}</b><span>{{ statusNames[item.status] || item.status }}<small v-if="item.actualStrategy"> · {{ constraintNames[item.actualStrategy] }}</small></span><p v-if="item.error" class="pv-frame-error">{{ item.error }}</p><button v-if="item.status === 'failed'" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry', [item.id]))">重试此项</button><a v-if="item.status === 'completed' && (item.localPath || item.resultUrl)" :href="mediaUrl(item.localPath || item.resultUrl)" target="_blank" rel="noopener">查看生成结果 ↗</a></div></details></article><div v-if="!batches.length" class="pv-small-empty"><Film :size="27" /><p>还没有生成任务</p><span>生成关键帧后，进度会显示在这里。</span></div>
             </template>
           </div>
@@ -840,7 +939,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
     </template>
     <dialog ref="dialog" class="pv-dialog" @close="modal = ''" @click="($event.target === dialog) && (modal = '')">
       <form v-if="modal" @submit.prevent>
-        <header><h2>{{ ({ strategy: '模型设置', video: '生成正式视频', audio: '编辑音轨', waiver: '确认连续性提示', lock: '锁定故事版', sync: '同步最新分镜', reload: '重新载入版本' } as Record<string, string>)[modal] }}</h2><button aria-label="关闭对话框" @click="modal = ''"><X :size="18" /></button></header>
+        <header><h2>{{ ({ strategy: '模型设置', video: '生成正式视频', audio: '编辑音轨', waiver: '确认连续性提示', lock: '锁定故事版', sync: '同步最新分镜', reload: '重新载入版本', split: '重新拆分分镜画面' } as Record<string, string>)[modal] }}</h2><button aria-label="关闭对话框" @click="modal = ''"><X :size="18" /></button></header>
         <div v-if="modal === 'strategy'" class="pv-form">
           <label>图片模型<select v-model="imageModel"><option value="" disabled>选择图片模型</option><option v-for="o in modelOptions('image')" :key="o.key" :value="o.key">{{ o.label }}</option></select></label>
           <label>视频模型<select v-model="videoModel"><option value="" disabled>选择视频模型</option><option v-for="o in modelOptions('video')" :key="o.key" :value="o.key">{{ o.label }}</option></select></label>
@@ -859,9 +958,19 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
           <p v-if="videoUsesStoryboardFrames && incompleteVideoPanels.length" class="pv-frame-error">还有 {{ incompleteVideoPanels.length }} 个镜头存在未完成画面，请先生成或上传全部画面。</p>
           <footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="working || !videoModel || (videoUsesStoryboardFrames && !!incompleteVideoPanels.length)" @click="run(startVideo)"><Film :size="14" />提交生成</button></footer>
         </div>
+        <div v-else-if="modal === 'split'" class="pv-form"><p>重新拆分会按新方案重写「{{ panel?.title }}」的全部分镜画面，已生成的图片会保留在画面历史中。</p><footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="framePlanSubmitting || !editable" @click="run(async () => { modal = ''; await splitPanel(true) })">重新拆分</button></footer></div>
         <div v-else class="pv-form"><p>{{ ({ lock: '锁定后时间线和分镜画面不可修改；后续编辑需复制为新草稿。', sync: '读取视频制作中的最新分镜并建立新草稿，当前版本将保留。', reload: '载入远端最新版本。尚未保存的本地修改将被替换，建议先下载本地草稿。' } as Record<string, string>)[modal] }}</p><footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="working" @click="run(async () => { if (modal === 'lock') await check(true); else if (modal === 'sync') await create(); else if (modal === 'reload') { dirty = false; await open(version!.id) } modal = '' })">确认{{ modal === 'lock' ? '锁定' : modal === 'sync' ? '同步' : '' }}</button></footer></div>
       </form>
     </dialog>
+      <FramePlanDialog
+        v-if="framePlanOpen"
+        :plans="framePlans"
+        :count="framePlanCount"
+        :editable="editable"
+        @close="framePlanOpen = false"
+        @apply="applyFramePlan"
+        @recount="run(recountFramePlan)"
+      />
       </main>
     </div>
   </div>

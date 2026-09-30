@@ -360,6 +360,7 @@
       "scriptRewriter": "Script Rewriter",
       "extractor": "Asset Extractor",
       "storyboardBreaker": "Storyboard Breaker",
+      "frameSplitter": "Frame Splitter",
       "promptGenerator": "Prompt Generator",
       "langFallback": "Falls back to Chinese",
       "followContentLang": "Editing language: {lang} (switch in General → AI Content Language)"

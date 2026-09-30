@@ -9,6 +9,7 @@ dist/
 # IDE
 .idea/
 .vscode/
+.codebuddy/
 *.swp
 *.swo
 *.md

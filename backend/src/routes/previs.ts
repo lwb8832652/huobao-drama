@@ -7,10 +7,12 @@ import {
 } from '../services/previs.js'
 import { createBatch, updateBatch, videoCapabilities } from '../services/previs-batch.js'
 import { listContinuityReviews, reviewContinuity } from '../services/continuity-review.js'
+import { FRAME_COUNT_MAX, startFramePlan, listFramePlans, retryFramePlans } from '../services/previs-frames.js'
 
 const app = new Hono()
 const positiveId = z.number().int().positive()
 const revision = z.number().int().positive()
+const frameCount = z.number().int().min(2).max(FRAME_COUNT_MAX)
 app.onError((err, c) => {
   const status = err instanceof PrevisError ? err.status : 400
   const message = err instanceof z.ZodError ? `请求数据无效：${err.issues[0]?.message}` : err.message
@@ -42,6 +44,23 @@ app.post('/animatic-versions/:id/continuity-reviews', async c => {
     force: z.boolean().optional(),
   }).parse(await c.req.json())
   return created(c, await reviewContinuity(Number(c.req.param('id')), body))
+})
+app.post('/animatic-versions/:id/frames/plan', async c => {
+  const body = z.object({
+    revision,
+    panelIds: z.array(positiveId).min(1).max(200),
+    count: frameCount.optional(),
+    configId: positiveId.optional(),
+    model: z.string().trim().min(1).max(200).optional(),
+    force: z.boolean().optional(),
+  }).parse(await c.req.json())
+  return success(c, await startFramePlan(Number(c.req.param('id')), body))
+})
+app.get('/animatic-versions/:id/frames/plan', c =>
+  success(c, listFramePlans(Number(c.req.param('id')))))
+app.post('/animatic-versions/:id/frames/plan/retry', async c => {
+  const body = z.object({ panelIds: z.array(positiveId).max(200).optional() }).parse(await c.req.json())
+  return success(c, await retryFramePlans(Number(c.req.param('id')), body.panelIds))
 })
 for (const action of ['check', 'lock'] as const) {
   app.post(`/animatic-versions/:id/${action}`, async c => {
