@@ -9,7 +9,9 @@
 
 services:
   app:
-    image: huobao/huobao-drama:latest
+    # 默认拉取 CI 流水线推送到阿里云 ACR 的 dev 漂动标签；
+    # 生产环境建议在 .env 固定为不可变标签（如 :dev-<sha> 或版本标签）以便回滚
+    image: ${HUOBAO_IMAGE:-registry.cn-hangzhou.aliyuncs.com/wenbo_pub/huobao-drama:dev}
     build:
       context: .
       args:
