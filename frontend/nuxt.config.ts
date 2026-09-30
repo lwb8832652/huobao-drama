@@ -35,11 +35,9 @@ export default defineNuxtConfig({
       title: '火宝短剧',
       meta: [{ name: 'viewport', content: 'width=device-width, initial-scale=1' }],
       link: [
-        { rel: 'icon', type: 'image/png', sizes: '32x32', href: '/favicon.png' },
-        { rel: 'shortcut icon', type: 'image/png', href: '/favicon.png' },
-        { rel: 'apple-touch-icon', sizes: '180x180', href: '/apple-touch-icon.png' },
-        { rel: 'icon', type: 'image/png', sizes: '192x192', href: '/icon-192.png' },
-        { rel: 'icon', type: 'image/png', sizes: '512x512', href: '/icon-512.png' },
+        // v 参数用于 favicon 缓存穿透（浏览器对 favicon 缓存独立于 HTTP 缓存，换图必须 bump）
+        { rel: 'icon', type: 'image/png', sizes: '32x32', href: '/favicon.png?v=4' },
+        { rel: 'shortcut icon', type: 'image/png', href: '/favicon.png?v=4' },
       ],
     },
   },

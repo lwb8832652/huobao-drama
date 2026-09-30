@@ -840,12 +840,12 @@
                         <input
                           :value="selectedSb.duration || 10"
                           type="number"
-                          :min="isWan3Video ? 2 : 4"
-                          :max="isWan3Video ? 30 : 15"
+                          min="2"
+                          max="30"
                           class="input video-duration-input"
                           @change="onVideoDurationChange"
                         />
-                        <span class="video-param-unit">{{ isWan3Video ? t('episode.inspector.durationUnitWan') : t('episode.inspector.durationUnit') }}</span>
+                        <span class="video-param-unit">{{ t('episode.inspector.durationUnit') }}</span>
                       </span>
                     </div>
                     <div class="video-param-hint">{{ t('episode.inspector.durationHint') }}</div>
@@ -3455,12 +3455,12 @@ const mentionOptions = computed(() => {
 })
 
 // 分镜时长（视频生成参数区直接编辑并保存到分镜）：
-// 按当前视频模型限制范围收敛后写入 storyboards.duration，列表/批量/单次生成统一读取该值
+// 统一限制 2-30s，列表/批量/单次生成统一读取该值；超出厂商支持范围由后端适配器收敛
 function onVideoDurationChange(e) {
   const sb = selectedSb.value
   if (!sb) return
-  const min = isWan3Video.value ? 2 : 4
-  const max = isWan3Video.value ? 30 : 15
+  const min = 2
+  const max = 30
   let v = Math.round(Number(e.target.value))
   if (!Number.isFinite(v)) v = Number(sb.duration || 10)
   v = Math.min(max, Math.max(min, v))

@@ -162,7 +162,7 @@ video_prompt 规则（硬约束）：
 
 画面拆分规则（硬约束）：
 - 只依据给定资料拆分，不得新增情节、人物、道具或场景。
-- 画面按时间推进：第 1 张是镜头开始状态，最后一张是结束状态，中间是动作推进的关键瞬间；相邻画面必须有明确推进关系。
+- 画面按时间推进：第 1 张是镜头开始状态，最后一张是结束状态，中间是动作推进的关键瞬间。
 - 每张画面给一句可直接用于图片生成的画面描述（prompt）：主体 + 动作/状态 + 景别 + 构图 + 光线氛围；不要写镜头编号、时间线说明或解释文字。
 - title 为 4-10 字中文短语，概括该瞬间。
 - 若资料里有项目风格描述，画面提示词应遵循该风格；但不要自行杜撰风格词。
@@ -220,10 +220,16 @@ function createThinkingOffFetch(providerName: string, baseURL: string): typeof f
       if (init?.body && typeof init.body === 'string') {
         const body = JSON.parse(init.body)
         if (providerName === 'gemini' && Array.isArray(body?.contents)) {
-          // Gemini 原生格式
+          // Gemini 原生格式。Gemini 3 系列思考参数改名 thinkingLevel(low/high)，
+          // 旧参数 thinkingBudget 会被 400 拒绝("requires thinkingLevel, not thinkingBudget")；
+          // 2.x 及更早仍用 thinkingBudget: 0。模型名从 URL(/models/<model>:)或 body 嗅探
+          const url = String(typeof input === 'string' ? input : input?.url || '')
+          const isGemini3 = /gemini-3/i.test(url) || /gemini-3/i.test(String(body?.model || ''))
           body.generationConfig = {
             ...(body.generationConfig || {}),
-            thinkingConfig: { thinkingBudget: 0, includeThoughts: false },
+            thinkingConfig: isGemini3
+              ? { thinkingLevel: 'low' }
+              : { thinkingBudget: 0, includeThoughts: false },
           }
           init = { ...init, body: JSON.stringify(body) }
         } else if (Array.isArray(body?.messages)) {

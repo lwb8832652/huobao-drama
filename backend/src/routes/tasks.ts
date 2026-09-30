@@ -214,7 +214,7 @@ app.get('/:id', async (c) => {
   return success(c, row || null)
 })
 
-// GET /tasks — 按 type / storyboard_id / drama_id 过滤
+// GET /tasks — 按 type / storyboard_id / drama_id / character_id / scene_id / prop_id 过滤
 app.get('/', async (c) => {
   const type = c.req.query('type')
   const storyboardId = c.req.query('storyboard_id')

@@ -11,7 +11,6 @@ import { extractVideoPoster } from '../utils/video-poster.js'
 import { getImageAdapter, getVideoAdapter } from './adapters/registry'
 import type { AIConfig } from './adapters/types'
 import { logTaskError, logTaskPayload, logTaskProgress, logTaskStart, logTaskSuccess, logTaskWarn, redactUrl } from '../utils/task-logger.js'
-import { Agent, fetch as undiciFetch } from 'undici'
 
 type TaskType = 'image' | 'video'
 
@@ -22,20 +21,6 @@ const POLL_PROFILES: Record<TaskType, { attempts: number; intervalMs: number; ma
   image: { attempts: 120, intervalMs: 5000, maxDurationMs: 600_000 },
   video: { attempts: 300, intervalMs: 10_000, maxDurationMs: null },
 }
-
-/**
- * 生成任务专用 HTTP 客户端。
- *
- * 背景：Node 内置 fetch（undici）的 headersTimeout 默认只有 300s，视频/工作流这类
- * 同步长任务常在 300s 时被掐断（UND_ERR_HEADERS_TIMEOUT），导致 AbortSignal 上配置的
- * 600s 根本没机会生效——响应还没到就被判超时，且服务端任务其实还在跑。
- * 这里改用显式配置的 undici 客户端，把头/体超时与 600s 对齐。
- */
-const LONG_TASK_AGENT = new Agent({
-  headersTimeout: 600_000,
-  bodyTimeout: 600_000,
-  connectTimeout: 30_000,
-})
 
 interface GenerateImageParams {
   previs?: { versionId: number; itemKey: string }
@@ -191,6 +176,7 @@ async function createTask(
     ...fields,
     provider: config.provider,
     params: JSON.stringify(params),
+    // 故事版任务先排队 pending，由预演 worker 领取后提交，避免重启丢失已提交状态
     status: fields.previsItemKey ? 'pending' : 'processing',
     createdAt: ts,
     updatedAt: ts,
@@ -204,25 +190,26 @@ async function createTask(
   return id
 }
 
-/** Claim before submission. A pending task is safe to resume; an unacknowledged submission is not. */
+/** 故事版任务领取后再提交：先 claim（pending→processing）再执行，避免重启丢任务。 */
 export async function startQueuedPrevisTask(id: number) {
-  const record = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
+  const [record] = await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id))
   if (!record?.previsItemKey || record.status !== 'pending') return
   const params = parseTaskParams(record.params)
   const config = await getConfigById(params.configId)
   if (!config) { await failTask(id, '生成配置已停用，请启用后重试'); return }
-  const claim = db.update(schema.sysTask).set({ status: 'processing', updatedAt: now() })
-    .where(and(eq(schema.sysTask.id, id), eq(schema.sysTask.status, 'pending'))).run()
+  const claim = await db.update(schema.sysTask).set({ status: 'processing', updatedAt: now() })
+    .where(and(eq(schema.sysTask.id, id), eq(schema.sysTask.status, 'pending')))
   if (claim.changes) void processTask(id, config)
 }
 
+/** 服务重启后恢复故事版任务：已取得外部编号的继续轮询，未提交成功的中止为 failed。 */
 export async function recoverPrevisTasks() {
-  const tasks = db.select().from(schema.sysTask)
-    .where(and(isNotNull(schema.sysTask.previsItemKey), eq(schema.sysTask.status, 'processing'))).all()
+  const tasks = await db.select().from(schema.sysTask)
+    .where(and(isNotNull(schema.sysTask.previsItemKey), eq(schema.sysTask.status, 'processing')))
   for (const task of tasks) {
     const config = await getConfigById(parseTaskParams(task.params).configId)
     if (task.taskId && config) {
-      // Keep the acknowledged external ID; never resubmit a paid request during recovery.
+      // 保留已确认的外部任务编号，恢复时绝不重复提交付费请求
       void pollTask(task, config, task.taskId)
     } else {
       await failTask(task.id, '服务重启时尚未取得外部任务编号，提交结果待确认；请核对服务商记录后手动重试，避免重复扣费')
@@ -320,58 +307,16 @@ async function processTask(id: number, config: AIConfig) {
       body: isMultipart ? `[multipart/form-data: ${[...(body as FormData).keys()].join(', ')}]` : body,
     })
 
-    // 记录请求耗时与失败细节：视频/工作流这类同步长任务常被上游网关超时切断，
-    // 此时 HTTP 响应永远收不到，只有这段日志能留下排查线索（耗时、错误类型、目标地址）。
-    const startedAt = Date.now()
-    const elapsedSeconds = () => Math.round((Date.now() - startedAt) / 1000)
+    const resp = await fetch(url, {
+      method,
+      headers,
+      body: isMultipart ? (body as FormData) : JSON.stringify(body),
+      signal: AbortSignal.timeout(600_000),
+    })
 
-    let resp: Response
-    try {
-      resp = (await undiciFetch(url, {
-        method,
-        headers,
-        body: (isMultipart ? (body as FormData) : JSON.stringify(body)) as any,
-        signal: AbortSignal.timeout(600_000),
-        dispatcher: LONG_TASK_AGENT,
-      })) as unknown as globalThis.Response
-    } catch (err: any) {
-      const seconds = elapsedSeconds()
-      const name = err?.name || 'UnknownError'
-      const cause = err?.cause
-        ? [err.cause.code, err.cause.message].filter(Boolean).join(' ')
-        : ''
-      const isTimeout = name === 'TimeoutError' || name === 'AbortError'
-      const hint = isTimeout
-        ? '客户端等待超时（上限 600s）：请缩短任务时长或改用异步模式'
-        : '连接在收到响应前被中断：常见于上游网关超时（如 nginx proxy_read_timeout）切断；服务端任务可能仍在执行，请到服务商后台按本条时间核对'
-      logTaskError(label, 'request-failed', {
-        id,
-        provider: config.provider,
-        url: redactUrl(url),
-        seconds,
-        error: name,
-        cause,
-        hint,
-      })
-      throw new Error(
-        `请求 ${config.provider} 失败（${name}${cause ? ` / ${cause}` : ''}），耗时 ${seconds}s。${hint}`,
-      )
-    }
-
-    const elapsed = elapsedSeconds()
-    if (!resp.ok) {
-      const text = await resp.text()
-      logTaskError(label, 'response-not-ok', {
-        id,
-        provider: config.provider,
-        status: resp.status,
-        seconds: elapsed,
-        body: text.slice(0, 2000),
-      })
-      throw new Error(`API error ${resp.status}: ${text}`)
-    }
+    if (!resp.ok) throw new Error(`API error ${resp.status}: ${await resp.text()}`)
     const result = await resp.json() as any
-    logTaskPayload(label, 'response payload', { id, provider: config.provider, seconds: elapsed, result })
+    logTaskPayload(label, 'response payload', { id, provider: config.provider, result })
 
     if (type === 'image') {
       const adapter = getImageAdapter(config.provider)
@@ -537,7 +482,7 @@ async function handleImageCompleteBase64(record: SysTaskRecord, base64Data: stri
 
 // 图片完成后回写业务表：分镜(按 frameType)、角色、场景、道具
 async function writeBackImageAssets(record: SysTaskRecord, localPath: string) {
-  // Version-owned tasks bind through previs-batch, which checks latest intent before updating shared assets.
+  // 故事版任务通过 previs-batch 绑定结果，回写共享资产前会校验最新意图
   if (record.animaticVersionId) return
   const params = parseTaskParams(record.params)
   if (record.storyboardId) {

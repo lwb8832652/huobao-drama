@@ -28,6 +28,8 @@ export async function mergeEpisodeVideos(episodeId: number, dramaId: number, sto
   let storyboards = await db.select().from(schema.storyboards)
     .where(eq(schema.storyboards.episodeId, episodeId))
     .orderBy(schema.storyboards.storyboardNumber)
+
+  // 故事版版本存在时，优先使用其预演输出（含未 stale 的成片与未跟踪镜头回退源）
   const current = listVersions(episodeId)[0]
   if (current) {
     const version = getVersion(current.id)
@@ -65,7 +67,7 @@ export async function mergeEpisodeVideos(episodeId: number, dramaId: number, sto
   return mergeClips(episodeId, dramaId, clips)
 }
 
-async function mergeClips(episodeId: number, dramaId: number, clips: { label: string; url: string }[]) {
+async function mergeClips(episodeId: number, dramaId: number, clips: { label: string; url: string }[]): Promise<number> {
   if (clips.length === 0) throw new Error('所选镜头还没有可拼接的视频')
 
   // 拼接前探测 ffmpeg：二进制损坏时 fluent-ffmpeg 的同步 EFTYPE 会崩掉整个进程，
