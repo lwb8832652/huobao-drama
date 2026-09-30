@@ -9,6 +9,8 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN node -e "const fs=require('fs');const l=JSON.parse(fs.readFileSync('package-lock.json'));for(const p of Object.values(l.packages||{}))delete p.resolved;fs.writeFileSync('package-lock.json',JSON.stringify(l,null,2))" \
   && npm ci --no-audit --no-fund --registry=https://registry.npmjs.org
 COPY frontend/ ./
+# 预演模块共享的后端领域代码：usePrevis.ts 跨目录引用，需同步进前端构建（零依赖单文件）
+COPY backend/src/services/previs-domain.ts /build/backend/src/services/previs-domain.ts
 RUN npm run generate
 
 # ===== 后端构建：安装依赖（含原生模块编译） =====
