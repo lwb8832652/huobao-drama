@@ -13,7 +13,7 @@ import { mastra } from '../mastra/index.js'
 import { buildAgentRequestContext } from '../agents/context.js'
 import { db, schema } from '../db/index.js'
 import { getActiveConfigId, getConfigById } from './ai.js'
-import { normalizeTimeline, panelImageFallback, type FrameType, type Panel } from './previs-domain.js'
+import { normalizeTimeline, orderedFrames, panelImageFallback, type FrameType, type Panel } from './previs-domain.js'
 import { hashContent, PrevisError, episodeForPrevis, requireEditable, versionRow } from './previs.js'
 import { FRAME_COUNT_MIN, FRAME_COUNT_MAX } from './previs-frame-contract.js'
 import { readFramePlanningContext } from '../agents/tools/frame-splitter-tools.js'
@@ -118,13 +118,14 @@ function validOffsets(offsets: unknown[], count: number, durationMs: number): of
 }
 function draftFrames(panel: Panel, count: number, source: DraftSource[]): FramePlanDraft[] {
   const items = source.slice(0, count)
-  const existingOffsets = panel.frames.map(frame => frame.offsetMs)
+  const existingFrames = orderedFrames(panel)
+  const existingOffsets = existingFrames.map(frame => frame.offsetMs)
   const proposedOffsets = items.map(item => item.offsetMs)
   const offsets = validOffsets(existingOffsets, count, panel.durationMs) ? existingOffsets
     : validOffsets(proposedOffsets, count, panel.durationMs) ? proposedOffsets
     : items.map((_, index) => offsetAt(index, count, panel.durationMs))
   return items.map((item, index) => ({
-    id: panel.frames[index]?.id || randomUUID(),
+    id: existingFrames[index]?.id || randomUUID(),
     title: item.title.trim() || (index === 0 ? '开场画面' : index === count - 1 ? '结束画面' : `画面 ${index + 1}`),
     prompt: item.prompt.trim(),
     offsetMs: offsets[index],
@@ -178,7 +179,7 @@ export function planInputHash(panel: Panel, context?: unknown) {
     atmosphere: panel.atmosphere, durationMs: panel.durationMs,
     shotType: panel.shotType, angle: panel.angle, movement: panel.movement,
     scene: panel.scene, characterIds: panel.characterIds, propIds: panel.propIds,
-    frames: panel.frames.map(frame => ({ id: frame.id, title: frame.title, prompt: frame.prompt, offsetMs: frame.offsetMs, url: frame.url, source: frame.source,
+    frames: orderedFrames(panel).map(frame => ({ id: frame.id, title: frame.title, prompt: frame.prompt, offsetMs: frame.offsetMs, url: frame.url, source: frame.source,
       type: frame.type, shotType: frame.shotType, angle: frame.angle, composition: frame.composition, continuity: frame.continuity })),
     continuityConstraints: panel.continuityConstraints, context,
   })
@@ -191,8 +192,22 @@ function parseJsonObject(text: string): unknown {
 }
 
 type PlanRow = typeof schema.framePlans.$inferSelect
+type PlanningContext = Awaited<ReturnType<typeof readFramePlanningContext>>
 
-async function aiFrames(row: PlanRow, panel: Panel): Promise<ReturnType<typeof normalizeFramePlan>> {
+/** The model receives the complete server-read context even if it never calls a tool. */
+export function buildFramePlanningRequestContent(input: {
+  versionId: number; panelId: number; count: number; context: PlanningContext
+}) {
+  return [
+    `请规划同一分镜的静态关键画面，versionId=${input.versionId}，panelId=${input.panelId}。目标画面数：${input.count}。`,
+    '以下是服务端已读取的完整资料，优先直接使用；仅在缺少补充资料时调用 read_previs_context。',
+    '来源优先级：description 决定事件与切镜；videoPrompt 决定动作顺序与时间；imagePrompt 锚定视觉状态；资产元数据与 referenceManifest 锚定身份、服装、场景、道具；style 决定风格。',
+    '先识别开始→转折点→结束，再按时间选取指定数量的静态瞬间。多张包含起止锚点，单张选代表状态；不新增情节。每格只呈现当前姿态、位置、手部与持物、视线，不复制整段动作。',
+    JSON.stringify(input),
+  ].join('\n')
+}
+
+async function aiFrames(row: PlanRow, panel: Panel, context: PlanningContext): Promise<ReturnType<typeof normalizeFramePlan>> {
   try {
     const version = versionRow(row.versionId)
     const episode = episodeForPrevis(version.episodeId)
@@ -206,7 +221,7 @@ async function aiFrames(row: PlanRow, panel: Panel): Promise<ReturnType<typeof n
     })
     const response = await agent.generate([{
       role: 'user',
-      content: `请把镜头「${panel.title}」（panelId=${panel.id}）拆成 ${row.count} 张画面。先调用 read_previs_context 读取 versionId=${version.id} 的镜头资料。`,
+      content: buildFramePlanningRequestContent({ versionId: version.id, panelId: panel.id, count: row.count, context }),
     }], { maxSteps: 3, requestContext })
     const parsed = planResultSchema.safeParse(parseJsonObject(response.text))
     if (!parsed.success || !parsed.data.continuityConstraints || parsed.data.frames.some(frame => !frame.continuity)) return null
@@ -231,36 +246,55 @@ export async function startFramePlan(versionId: number, options: PlanFramesOptio
   const config = configId ? await getConfigById(configId) : null
   const model = options.model || config?.model || ''
   const episode = episodeForPrevis(row.episodeId)
-  const ts = new Date().toISOString()
-  let queued = 0
-  const taskIds: number[] = []
-
+  const prepared: { panelId: number; inputHash: string; count: number }[] = []
   for (const panel of targets) {
     const context = await readFramePlanningContext(versionId, [panel.id], episode.id, episode.dramaId)
+    if ('error' in context) throw new PrevisError(context.error || '镜头资料不可用')
     const inputHash = planInputHash(panel, context)
     const count = clampCount(options.count, suggestedFrameCount(panel))
-    const existing = db.select().from(schema.framePlans)
-      .where(and(
-        eq(schema.framePlans.versionId, versionId),
-        eq(schema.framePlans.panelId, panel.id),
-        eq(schema.framePlans.inputHash, inputHash),
-      )).get()
-    if (existing) taskIds.push(existing.id)
-    if (existing?.status === 'completed' && !options.force) continue
-    if (existing) {
-      db.update(schema.framePlans).set({ status: 'pending', error: null, count, configId, model, createdAt: ts })
-        .where(eq(schema.framePlans.id, existing.id)).run()
-    } else {
-      const inserted = db.insert(schema.framePlans).values({
-        versionId, panelId: panel.id, inputHash, configId, model, count,
-        status: 'pending', resultJson: '', createdAt: ts,
-      }).run()
-      taskIds.push(Number(inserted.lastInsertRowid))
-    }
-    queued++
+    prepared.push({ panelId: panel.id, inputHash, count })
   }
+  // Resolve every target first, then reuse/queue atomically after async context reads.
+  requireEditable(versionId, options.revision)
+  const result = db.transaction(tx => {
+    const ts = new Date().toISOString()
+    let queued = 0
+    const taskIds: number[] = []
+    for (const { panelId, inputHash, count } of prepared) {
+      const active = tx.select().from(schema.framePlans).where(and(
+        eq(schema.framePlans.versionId, versionId), eq(schema.framePlans.panelId, panelId),
+        inArray(schema.framePlans.status, ['pending', 'processing']),
+      )).get()
+      if (active) {
+        if (active.inputHash !== inputHash || active.count !== count || active.configId !== configId || active.model !== model)
+          throw new PrevisError('请等待当前画面规划结束，再修改资料或规划选项', 409)
+        taskIds.push(active.id)
+        continue
+      }
+      const existing = tx.select().from(schema.framePlans)
+        .where(and(
+          eq(schema.framePlans.versionId, versionId),
+          eq(schema.framePlans.panelId, panelId),
+          eq(schema.framePlans.inputHash, inputHash),
+        )).get()
+      if (existing) taskIds.push(existing.id)
+      if (existing?.status === 'completed' && !options.force && existing.count === count && existing.configId === configId && existing.model === model) continue
+      if (existing) {
+        tx.update(schema.framePlans).set({ status: 'pending', error: null, resultJson: '', count, configId, model, createdAt: ts })
+          .where(eq(schema.framePlans.id, existing.id)).run()
+      } else {
+        const inserted = tx.insert(schema.framePlans).values({
+          versionId, panelId, inputHash, configId, model, count,
+          status: 'pending', resultJson: '', createdAt: ts,
+        }).run()
+        taskIds.push(Number(inserted.lastInsertRowid))
+      }
+      queued++
+    }
+    return { queued, taskIds }
+  })
   void tickFramePlans().catch(err => console.error('Frame plan worker:', err?.message))
-  return { queued, taskIds }
+  return result
 }
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -278,19 +312,33 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
 
 const activePlans = new Map<number, Promise<void>>()
 
+async function currentPlanInput(row: PlanRow) {
+  const version = versionRow(row.versionId)
+  const episode = episodeForPrevis(version.episodeId)
+  const panel = normalizeTimeline(JSON.parse(version.timelineJson)).panels.find(item => item.id === row.panelId)
+  if (!panel) throw new Error('镜头资料已变化，请重新提交画面规划')
+  const context = await readFramePlanningContext(row.versionId, [row.panelId], episode.id, episode.dramaId)
+  if ('error' in context || planInputHash(panel, context) !== row.inputHash)
+    throw new Error('镜头资料已变化，请重新提交画面规划')
+  return { panel, context }
+}
+
 async function processOne(row: PlanRow) {
   if (activePlans.has(row.id)) return
+  const claimedAt = new Date().toISOString()
+  const claimedRow = and(eq(schema.framePlans.id, row.id), eq(schema.framePlans.inputHash, row.inputHash),
+    eq(schema.framePlans.status, 'processing'), eq(schema.framePlans.createdAt, claimedAt))
   const claim = db.update(schema.framePlans)
-    .set({ status: 'processing', createdAt: new Date().toISOString() })
-    .where(and(eq(schema.framePlans.id, row.id), eq(schema.framePlans.status, 'pending'))).run()
+    .set({ status: 'processing', createdAt: claimedAt })
+    .where(and(eq(schema.framePlans.id, row.id), eq(schema.framePlans.status, 'pending'),
+      eq(schema.framePlans.inputHash, row.inputHash), eq(schema.framePlans.count, row.count),
+      eq(schema.framePlans.configId, row.configId), eq(schema.framePlans.model, row.model))).run()
   if (!claim.changes) return
   const execution = (async () => {
     try {
-      const version = versionRow(row.versionId)
-      const timeline = normalizeTimeline(JSON.parse(version.timelineJson))
-      const panel = timeline.panels.find(item => item.id === row.panelId)
-      if (!panel) throw new Error('镜头不存在，可能已从版本中移除')
-      const ai = await aiFrames(row, panel)
+      const { panel, context } = await currentPlanInput(row)
+      const ai = await aiFrames(row, panel, context)
+      await currentPlanInput(row)
       const frames = ai?.frames || ruleFrames(panel, row.count)
       const continuityConstraints = ai?.continuityConstraints || panel.continuityConstraints
         || '规则草稿：人物身份与服装、场景空间、光源和道具外观须由用户审阅确认；动作衔接尚未通过 AI 连续性审查。'
@@ -299,10 +347,10 @@ async function processOne(row: PlanRow) {
         resultJson: JSON.stringify({ source: ai ? 'ai' : 'rule', continuityConstraints, frames }),
         error: null,
         createdAt: new Date().toISOString(),
-      }).where(eq(schema.framePlans.id, row.id)).run()
+      }).where(claimedRow).run()
     } catch (error: any) {
-      db.update(schema.framePlans).set({ status: 'failed', error: error?.message || '拆分失败' })
-        .where(eq(schema.framePlans.id, row.id)).run()
+      db.update(schema.framePlans).set({ status: 'failed', resultJson: '', error: error?.message || '拆分失败' })
+        .where(claimedRow).run()
     }
   })().finally(() => activePlans.delete(row.id))
   activePlans.set(row.id, execution)
@@ -313,7 +361,7 @@ async function processOne(row: PlanRow) {
 export async function tickFramePlans() {
   const stuck = db.select().from(schema.framePlans)
     .where(eq(schema.framePlans.status, 'processing')).all()
-    .filter(row => Date.now() - Date.parse(row.createdAt) >= FRAME_PLAN_LEASE_MS)
+    .filter(row => !activePlans.has(row.id) && Date.now() - Date.parse(row.createdAt) >= FRAME_PLAN_LEASE_MS)
   for (const row of stuck) {
     db.update(schema.framePlans).set({ status: 'pending' }).where(eq(schema.framePlans.id, row.id)).run()
   }

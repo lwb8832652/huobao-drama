@@ -28,6 +28,7 @@ import { composeGrid, mergeGridSelection, splitGrid } from './previs-grid-images
 import { freezeReferenceMedia, mediaDigest, readReferenceMedia } from './previs-reference-media.js'
 import { scheduleContactSheets } from './previs-contact-sheets.js'
 import { chooseGridSize, gridImageCapabilities } from './previs-grid-capabilities.js'
+import { resolvePanelGridReferences, type GridReferenceItem } from './previs-grid-references.js'
 
 export interface GridRequest {
   revision: number
@@ -45,6 +46,12 @@ interface FrozenMedia {
   url: string
   digest: string
 }
+export interface GridReferenceAsset extends FrozenMedia {
+  label: string
+  kind: GridReferenceItem['kind']
+  required: boolean
+  sourceUrl?: string
+}
 interface GridSnapshot {
   revision: number
   panel: Panel
@@ -61,6 +68,7 @@ interface GridSnapshot {
   resolution: string
   prompt: string
   references: FrozenMedia[]
+  referenceAssets?: GridReferenceAsset[]
   currentSources: { frameId: string; sourceUrl: string; frozen: FrozenMedia }[]
   base?: FrozenMedia
   baseCandidateId?: number
@@ -93,6 +101,7 @@ function view(row: Row) {
     rawUrl: row.rawUrl,
     previewUrl: row.previewUrl,
     baseUrl: s.base?.url || null,
+    referenceAssets: s.referenceAssets,
     width: row.width,
     height: row.height,
     error: row.error,
@@ -151,24 +160,25 @@ function promptFor(
   mode: GridMode,
   targets: string[],
   instructions: Record<string, string>,
-  references: string[],
+  references: GridReferenceItem[],
 ) {
   const frames = orderedFrames(p),
     assetStart = mode === 'generate' ? 1 : 2
   const identity = references
     .map(
-      (url, i) =>
-        `参考图片${assetStart + i}：${p.referenceLabels?.[p.referenceImages.indexOf(url)] || '人物/场景/道具资产'}。`,
+      (item, i) => `参考图片${assetStart + i}：${item.label}。`,
     )
     .join('\n')
   const invariants =
     p.continuityConstraints ||
-    '全组保持人物身份与服装、场景空间和光照方向、道具外观一致；镜头按规划，不强制每格更换景别。'
+    '沿用参考素材中的人物身份与服装、道具外观；位置、光源与持物状态依据原描述和逐格规划延续。原剧本明确的场景或镜头变化可以发生，不强制不同场景使用相同背景。'
   const geometry = `整图严格分为 ${grid.rows} 行 ${grid.columns} 列，等大无间隙画格，按从左到右、从上到下阅读。多余 ${grid.columns * grid.rows - frames.length} 格为纯中性灰背景，无物体。不要绘制文字、序号角标、水印、分隔线或边框；角标只用于界面引用，不能进入成片。`
+  const source = `原分镜描述：${p.description}\n原视频动作与时间：${p.videoPrompt}\n视觉状态锚点：${p.imagePrompt}\n分镜场景：${p.scene}；氛围：${p.atmosphere}。只呈现原资料和规划已有的参与者与物体；不新增叙事、角色、场景、镜头或风格。每格一个静态状态，明确当前姿态、位置、手部持物和视线，不在一格画完整动作序列。`
   const states = frames
-    .map(
+    .flatMap(
       (f, i) =>
-        `画格${i + 1}（第${Math.floor(i / grid.columns) + 1}行，第${(i % grid.columns) + 1}列，${(f.offsetMs || 0) / 1000}s）：${f.prompt || p.description}\n景别：${f.shotType || p.shotType}；机位：${f.angle || p.angle}；构图：${f.composition || ''}；衔接：${f.continuity || '按相邻状态自然推进，同一格只呈现一个静态关键状态。'}`,
+        mode === 'frame_edit' && !targets.includes(f.id!) ? [] :
+          [`画格${i + 1}（第${Math.floor(i / grid.columns) + 1}行，第${(i % grid.columns) + 1}列，${(f.offsetMs || 0) / 1000}s）：${f.prompt || p.description}\n景别：${f.shotType || p.shotType}；机位：${f.angle || p.angle}；构图：${f.composition || ''}；衔接：${f.continuity || '按相邻状态自然推进，同一格只呈现一个静态关键状态。'}`],
     )
     .join('\n')
   if (mode === 'frame_edit')
@@ -176,6 +186,7 @@ function promptFor(
       `参考图片1是当前需要精修的唯一原图。只输出该画格的完整单张画面，不绘制宫格。`,
       identity,
       invariants,
+      source,
       `修改：${instructions[targets[0]]}。用户明确要求的修改优先；其他身份、服装、背景布局、机位、光色、动作阶段保持原图。`,
       states.split('\n').filter(Boolean).join('\n'),
       '附加相邻图片只供动作连续性参考，不能把相邻画面重画为编辑对象。',
@@ -187,7 +198,7 @@ function promptFor(
     geometry,
     identity,
     invariants,
-    `分镜场景：${p.scene}；氛围：${p.atmosphere}；原视频动作：${p.videoPrompt}`,
+    source,
     states,
     mode === 'grid_edit'
       ? targets
@@ -199,30 +210,6 @@ function promptFor(
   ]
     .filter(Boolean)
     .join('\n')
-}
-function requiredAssets(p: Panel, dramaId: number): { url: string; label: string }[] {
-  const assets: { url: string; label: string }[] = []
-  const add = (
-    row: { imageUrl: string | null; deletedAt: string | null; dramaId: number } | undefined,
-    label: string,
-  ) => {
-    if (!row || row.deletedAt || row.dramaId !== dramaId || !row.imageUrl)
-      throw new PrevisError(`${label}缺少可用参考图片，请先生成资产`)
-    assets.push({ url: row.imageUrl, label })
-  }
-  if (p.sceneId) {
-    const row = db.select().from(schema.scenes).where(eq(schema.scenes.id, p.sceneId)).get()
-    add(row, `场景「${row?.location || p.scene}」`)
-  }
-  for (const id of p.characterIds) {
-    const row = db.select().from(schema.characters).where(eq(schema.characters.id, id)).get()
-    add(row, `人物「${row?.name || id}」`)
-  }
-  for (const id of p.propIds) {
-    const row = db.select().from(schema.props).where(eq(schema.props.id, id)).get()
-    add(row, `道具「${row?.name || id}」`)
-  }
-  return assets
 }
 function assertNoLegacyConflict(versionId: number, panelId: number) {
   if (
@@ -274,6 +261,19 @@ export async function startGridCandidates(versionId: number, request: GridReques
     drama?.aspectRatio || '16:9',
     request.resolution || caps.resolutions[0] || '1K',
   )
+  // Validate all manifests and counts before reading/freezing any source, including remote uploads.
+  const assetsByPanel = new Map(panels.map(p => {
+    const manifest = resolvePanelGridReferences(p, ep.dramaId)
+    if (manifest.items.some(item => item.required && !item.url) || (request.mode === 'generate' && !manifest.ready))
+      throw new PrevisError(manifest.error)
+    const assets = manifest.items.filter((item): item is GridReferenceItem & { url: string } => Boolean(item.url))
+    const referenceSlots = assets.length + (request.mode === 'generate' ? 0 : 1)
+    if (referenceSlots > caps.maxReferences)
+      throw new PrevisError(
+        `需要 ${referenceSlots} 张参考图片，当前模型上限 ${caps.maxReferences}；请调整资产或更换模型`,
+      )
+    return [p.id, assets] as const
+  }))
   // Freeze every unit first: an invalid later unit cannot create partial paid tasks.
   const prepared: { panelId: number; inputHash: string; s: GridSnapshot }[] = []
   for (const p of panels) {
@@ -292,35 +292,12 @@ export async function startGridCandidates(versionId: number, request: GridReques
     )
     if (request.mode !== 'generate' && Object.values(instructions).some((v) => !v))
       throw new PrevisError('请为每个选中画面填写修改指令')
-    const mandatory = requiredAssets(p, ep.dramaId)
-    const assets = [
-      ...new Set([
-        ...mandatory.map((a) => a.url),
-        ...frames.flatMap((f) => f.referenceImages ?? p.referenceImages),
-      ]),
-    ]
-    const promptPanel = {
-      ...p,
-      referenceImages: assets,
-      referenceLabels: assets.map(
-        (url) =>
-          mandatory.find((a) => a.url === url)?.label ||
-          p.referenceLabels?.[p.referenceImages.indexOf(url)] ||
-          '共同参考资产',
-      ),
-    }
-    if (
-      !assets.length &&
-      request.mode === 'generate' &&
-      (p.characterIds.length || p.propIds.length || p.sceneId)
-    )
-      throw new PrevisError('共同人物、场景或道具缺少参考图片')
-    const referenceSlots = assets.length + (request.mode === 'generate' ? 0 : 1)
-    if (referenceSlots > caps.maxReferences)
-      throw new PrevisError(
-        `需要 ${referenceSlots} 张参考图片，当前模型上限 ${caps.maxReferences}；请调整资产或更换模型`,
-      )
-    const references = await Promise.all(assets.map(freezeReferenceMedia))
+    const assets = assetsByPanel.get(p.id)!
+    const referenceAssets: GridReferenceAsset[] = await Promise.all(assets.map(async item => ({
+      ...await freezeReferenceMedia(item.url), label: item.label, kind: item.kind,
+      required: item.required, sourceUrl: item.url,
+    })))
+    const references: FrozenMedia[] = referenceAssets.map(({ url, digest }) => ({ url, digest }))
     const currentSources: GridSnapshot['currentSources'] = []
     let base: FrozenMedia | undefined,
       adoptTargets = targets
@@ -403,12 +380,13 @@ export async function startGridCandidates(versionId: number, request: GridReques
       resolution: request.resolution || caps.resolutions[0],
       prompt: [
         drama?.style,
-        promptFor(promptPanel, grid, request.mode, targets, instructions, assets),
+        promptFor(p, grid, request.mode, targets, instructions, assets),
         neighborLegend,
       ]
         .filter(Boolean)
         .join('\n'),
       references,
+      referenceAssets,
       currentSources,
       base,
       baseCandidateId: request.baseCandidateId,

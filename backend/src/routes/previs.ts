@@ -10,6 +10,7 @@ import { listContinuityReviews, reviewContinuity } from '../services/continuity-
 import { scheduleContactSheets, readContactSheets, tickContactSheets } from '../services/previs-contact-sheets.js'
 import { startFramePlan, listFramePlans, retryFramePlans } from '../services/previs-frames.js'
 import { FRAME_COUNT_MIN, FRAME_COUNT_MAX } from '../services/previs-frame-contract.js'
+import { readGridReferences } from '../services/previs-grid-references.js'
 
 import { gridCapabilities, listGridCandidates, startGridCandidates, adoptGridCandidate, discardGridCandidate, uploadGridCandidate, retryGridProcessing } from '../services/previs-grid.js'
 
@@ -24,6 +25,9 @@ app.onError((err, c) => {
 })
 app.get('/previs/capabilities', c => success(c, { enabled: process.env.PREVIS_ENABLED !== 'false', video: videoCapabilities }))
 app.get('/previs/grid-capabilities', async c => success(c, await gridCapabilities(c.req.query('config_id') ? Number(c.req.query('config_id')) : undefined, c.req.query('model'))))
+app.get('/animatic-versions/:id/grid-references', c => success(c, readGridReferences(
+  positiveId.parse(Number(c.req.param('id'))), positiveId.parse(Number(c.req.query('panel_id'))),
+)))
 app.get('/animatic-versions/:id/grid-candidates', c => success(c, { items: listGridCandidates(Number(c.req.param('id')), c.req.query('panel_id') ? Number(c.req.query('panel_id')) : undefined) }))
 app.post('/animatic-versions/:id/grid-candidates', async c => {
   const body = z.object({ revision, panelIds: z.array(positiveId).min(1).max(200), mode: z.enum(['generate','grid_edit','frame_edit']),

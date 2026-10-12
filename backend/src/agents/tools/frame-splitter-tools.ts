@@ -9,7 +9,8 @@ import { eq } from 'drizzle-orm'
 import { z } from 'zod'
 import { db, schema } from '../../db/index.js'
 import { getDramaStylePrompt } from '../../services/style-preset.js'
-import { normalizeTimeline } from '../../services/previs-domain.js'
+import { normalizeTimeline, orderedFrames } from '../../services/previs-domain.js'
+import { resolvePanelGridReferences } from '../../services/previs-grid-references.js'
 import { getDramaId, getEpisodeId } from '../context.js'
 
 type ToolContext = ToolExecutionContext | undefined
@@ -22,19 +23,22 @@ function requireIds(context: ToolContext): { episodeId: number; dramaId: number 
 }
 
 function assetsOf(table: 'characters' | 'props', ids: number[], dramaId: number) {
-  return ids.map(id => (table === 'characters'
-    ? db.select().from(schema.characters).where(eq(schema.characters.id, id)).get()
-    : db.select().from(schema.props).where(eq(schema.props.id, id)).get()))
-    .filter(item => item && item.dramaId === dramaId && !item.deletedAt)
-    .map(item => table === 'characters' ? {
-      id: item!.id, name: item!.name, description: item!.description,
+  return ids.map(id => {
+    const item = table === 'characters'
+      ? db.select().from(schema.characters).where(eq(schema.characters.id, id)).get()
+      : db.select().from(schema.props).where(eq(schema.props.id, id)).get()
+    if (!item || item.dramaId !== dramaId || item.deletedAt) return { id, imageUrl: null, ready: false }
+    return table === 'characters' ? {
+      id: item.id, name: item.name, description: item.description,
       appearance: (item as typeof schema.characters.$inferSelect).appearance,
       styling: (item as typeof schema.characters.$inferSelect).styling,
-      finalPrompt: item!.finalPrompt,
+      finalPrompt: item.finalPrompt, imageUrl: item.imageUrl, ready: Boolean(item.imageUrl?.trim()),
     } : {
-      id: item!.id, name: item!.name, description: item!.description,
-      prompt: (item as typeof schema.props.$inferSelect).prompt, finalPrompt: item!.finalPrompt,
-    })
+      id: item.id, name: item.name, description: item.description,
+      prompt: (item as typeof schema.props.$inferSelect).prompt, finalPrompt: item.finalPrompt,
+      imageUrl: item.imageUrl, ready: Boolean(item.imageUrl?.trim()),
+    }
+  })
 }
 
 /** Shared readonly context used by the agent and the plan's input fingerprint. */
@@ -44,7 +48,7 @@ export async function readFramePlanningContext(versionId: number, panelIds: numb
   if (!row) return { error: 'Animatic version not found' }
   if (row.episodeId !== episodeId) return { error: 'Animatic version does not belong to current episode' }
   const episode = db.select().from(schema.episodes).where(eq(schema.episodes.id, episodeId)).get()
-  if (!episode || episode.dramaId !== dramaId) return { error: 'Episode does not belong to current drama' }
+  if (!episode || episode.deletedAt || episode.dramaId !== dramaId) return { error: 'Episode does not belong to current drama' }
 
   const timeline = normalizeTimeline(JSON.parse(row.timelineJson))
   const style = await getDramaStylePrompt(dramaId)
@@ -55,24 +59,29 @@ export async function readFramePlanningContext(versionId: number, panelIds: numb
     const scene = panel.sceneId
       ? db.select().from(schema.scenes).where(eq(schema.scenes.id, panel.sceneId)).get()
       : null
+    const frames = orderedFrames(panel).map(frame => ({
+      id: frame.id, title: frame.title, offsetMs: frame.offsetMs, type: frame.type, url: frame.url, source: frame.source,
+      prompt: frame.prompt, shotType: frame.shotType, angle: frame.angle,
+      composition: frame.composition, continuity: frame.continuity, referenceImages: frame.referenceImages,
+    }))
     panels.push({
       panelId: panel.id, title: panel.title, description: panel.description,
-      videoPrompt: panel.videoPrompt, atmosphere: panel.atmosphere,
+      videoPrompt: panel.videoPrompt, imagePrompt: panel.imagePrompt, atmosphere: panel.atmosphere,
+      referenceImages: panel.referenceImages, referenceLabels: panel.referenceLabels,
+      referenceManifest: resolvePanelGridReferences(panel, dramaId),
       durationSeconds: Number(((panel.durationMs || 0) / 1000).toFixed(1)), durationMs: panel.durationMs,
       shotType: panel.shotType, angle: panel.angle, movement: panel.movement,
       continuityConstraints: panel.continuityConstraints,
       scene: scene && scene.dramaId === dramaId && !scene.deletedAt ? {
         id: scene.id, location: scene.location, time: scene.time,
         prompt: scene.prompt, lighting: scene.lighting, finalPrompt: scene.finalPrompt,
-      } : { name: panel.scene },
+        imageUrl: scene.imageUrl, ready: Boolean(scene.imageUrl?.trim()),
+      } : { id: panel.sceneId, name: panel.scene, imageUrl: null, ready: false },
       characters: assetsOf('characters', panel.characterIds, dramaId),
       props: assetsOf('props', panel.propIds, dramaId),
       existingFrameCount: panel.frames.length,
-      existingFrames: panel.frames.map(frame => ({
-        id: frame.id, title: frame.title, offsetMs: frame.offsetMs, type: frame.type, url: frame.url, source: frame.source,
-        prompt: frame.prompt, shotType: frame.shotType, angle: frame.angle,
-        composition: frame.composition, continuity: frame.continuity,
-      })),
+      orderedFrames: frames,
+      existingFrames: frames,
     })
   }
   return { style: style || undefined, panels }
