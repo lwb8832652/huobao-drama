@@ -517,6 +517,9 @@ function applyFramePlan(plans: PanelFramePlan[]) {
         ...makeFrame(createFrameId(), Math.min(frame.offsetMs, Math.max(0, target.durationMs - 1)), frame.title),
         type: frame.type,
         prompt: frame.prompt,
+        shotType: frame.shotType,
+        angle: frame.angle,
+        composition: frame.composition,
       }))
       target.coverFrameId = target.frames[0]?.id
     }

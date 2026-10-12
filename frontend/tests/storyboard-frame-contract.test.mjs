@@ -168,3 +168,21 @@ test('standalone AI apply rejects a batch containing an oversized shot before an
   assert.equal(open.value, true)
   assert.match(notices[0], /9/)
 })
+
+test('standalone AI apply keeps each frame draft shot type, angle and composition', () => {
+  const target = panel(), plan = draft(2), open = vue.ref(true)
+  Object.assign(plan.frames[0], { shotType: '特写', angle: '俯拍', composition: '中心构图' })
+  Object.assign(plan.frames[1], { shotType: '全景', angle: '平视', composition: '三分法' })
+  const h = standalone({
+    framePlanOpen: open, toast: { error() {}, success() {} },
+    edit: action => action({ panels: [target] }),
+  })
+  h.applyFramePlan([plan])
+  assert.equal(target.frames.length, 2)
+  for (let i = 0; i < plan.frames.length; i++) {
+    for (const field of ['shotType', 'angle', 'composition', 'prompt', 'type']) {
+      assert.equal(target.frames[i][field], plan.frames[i][field], `Frame ${i} must retain ${field}`)
+    }
+  }
+  assert.equal(open.value, false)
+})
