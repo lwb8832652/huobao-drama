@@ -8,10 +8,11 @@ import {
 import AppMenu from '~/components/AppMenu.vue'
 import AppMenuItem from '~/components/AppMenuItem.vue'
 import FrameSettingsDialog from './FrameSettingsDialog.vue'
+import StoryboardContactSheet from './StoryboardContactSheet.vue'
 import { uploadAPI } from '~/composables/useApi'
 import {
   FRAME_COUNT_MAX, frameCountChangeAllowed, createFrameId, frameKey, makeFrame, mediaUrl, orderedFrames, panelImageFallback, planFrames,
-  type BatchItem, type Keyframe, type Panel,
+  type BatchItem, type ContactSheetView, type Keyframe, type Panel,
 } from '~/composables/usePrevis'
 
 const props = withDefaults(defineProps<{
@@ -24,6 +25,9 @@ const props = withDefaults(defineProps<{
   videoGenerationMode?: 'direct' | 'storyboard_frames'
   activeFrameId?: string
   title?: string
+  contactSheet?: ContactSheetView
+  videoInputReady?: boolean
+  videoInputError?: string
   /** 拆分任务提交中或排队中：与资产批量生成一致，按钮转圈显示“拆分中…” */
   splitting?: boolean
 }>(), {
@@ -35,9 +39,11 @@ const emit = defineEmits<{
   video: []
   'settings-open': []
   split: [options?: { force?: boolean }]
+  'retry-sheet': []
 }>()
 
 const uploading = ref('')
+const editing = ref(false)
 const uploadTarget = ref<{ panelId: number; frameId: string }>()
 const fileInput = ref<HTMLInputElement>()
 const settingsTrigger = shallowRef<HTMLElement>()
@@ -50,7 +56,7 @@ const usesStoryboardFrames = computed(() => props.videoGenerationMode === 'story
 const settingsFrame = computed(() => settings.value?.newFrame
   || props.panel.frames.find(frame => frameKey(frame) === settings.value?.frameId))
 const missingVideoFrames = computed(() => frames.value.filter(frame => !frame.url).length)
-const videoReady = computed(() => !usesStoryboardFrames.value || (frames.value.length > 0 && missingVideoFrames.value === 0))
+const videoReady = computed(() => !usesStoryboardFrames.value || (props.videoInputReady ?? (frames.value.length > 0 && frames.value.length <= FRAME_COUNT_MAX && missingVideoFrames.value === 0)))
 const missingFrames = computed(() => frames.value.filter(frame => !frame.url))
 const canGenerateMissing = computed(() => props.generatable && missingFrames.value.length > 0
   && missingFrames.value.every(frame => canGenerate(frame)))
@@ -92,6 +98,12 @@ function openSettings(frame: Keyframe, event: Event) {
   settingsTrigger.value = event.currentTarget as HTMLElement
   settings.value = { panelId: props.panel.id, frameId: frameKey(frame) }
   emit('settings-open')
+}
+function selectSheetFrame(frameId: string, event: Event) {
+  const frame = props.panel.frames.find(frame => frameKey(frame) === frameId)
+  if (!frame) return
+  editing.value = true
+  openSettings(frame, event)
 }
 function add(event: Event) {
   if (!canAdd.value) return
@@ -173,6 +185,7 @@ async function upload(event: Event) {
   finally { uploading.value = '' }
 }
 watch(() => props.panel.id, () => {
+  editing.value = false
   settings.value = undefined
   menuId.value = ''
   toolbarMenu.value = false
@@ -189,6 +202,7 @@ watch(settingsFrame, frame => {
       <button type="button" class="btn btn-sm" :disabled="!canAdd" :title="`每个镜头最多 ${FRAME_COUNT_MAX} 张画面`" @click="add"><ImagePlus :size="14" />添加画面</button>
     </header>
     <div class="frame-editor-tools">
+      <button v-if="frames.length" type="button" class="btn btn-sm" :aria-pressed="editing" @click="editing = !editing">{{ editing ? '返回宫格' : '编辑画面' }}</button>
       <button type="button" class="btn btn-sm frame-fill" :disabled="!canGenerateMissing"
         :title="missingFrames.some(frame => !frameReferenceUrls(frame).length) ? '请先在生成设置中选择参考素材' : '生成所有缺失画面'"
         @click="emit('generate', missingFrames.map(frameKey))"><Sparkles :size="13" />生成缺失<span v-if="missingVideoFrames">{{ missingVideoFrames }}</span></button>
@@ -201,7 +215,9 @@ watch(settingsFrame, frame => {
     </div>
     <input ref="fileInput" class="frame-upload-input" type="file" accept="image/*" aria-label="上传分镜画面" @change="upload">
 
-    <div v-if="frames.length" class="frame-editor-grid">
+    <StoryboardContactSheet v-if="frames.length && !editing" :panel="panel" :sheet="contactSheet" :active-frame-id="activeFrameId"
+      @select="selectSheetFrame" @retry="emit('retry-sheet')" />
+    <div v-else-if="frames.length" class="frame-editor-grid">
       <article v-for="(frame, index) in frames" :key="frameKey(frame)" class="frame-card" :class="{ selected: activeFrameId === frameKey(frame) }">
         <header class="frame-card-head">
           <span class="frame-index">{{ String(index + 1).padStart(2, '0') }}</span>
@@ -251,7 +267,7 @@ watch(settingsFrame, frame => {
       </div>
     </div>
     <footer class="frame-editor-video">
-      <div><Film :size="14" /><span>{{ usesStoryboardFrames ? (videoReady ? `全部 ${frames.length} 张画面已就绪` : frames.length ? `还需完成 ${missingVideoFrames} 张画面` : '先添加分镜画面') : '当前为直接生成模式' }}<small>{{ usesStoryboardFrames ? '视频按时间顺序使用全部画面' : '这些画面仅用于预演和审核，不作为当前视频输入' }}</small></span></div>
+      <div><Film :size="14" /><span>{{ usesStoryboardFrames ? (videoReady ? `全部 ${frames.length} 张画面已就绪` : videoInputError || (frames.length ? `还需完成 ${missingVideoFrames} 张画面` : '先添加分镜画面')) : '当前为直接生成模式' }}<small>{{ usesStoryboardFrames ? '视频按时间顺序使用全部画面' : '这些画面仅用于预演和审核，不作为当前视频输入' }}</small></span></div>
       <button v-if="showVideoAction" type="button" class="btn btn-primary btn-sm" :disabled="!videoReady" @click="emit('video')"><Film :size="13" />生成视频</button>
     </footer>
     <FrameSettingsDialog

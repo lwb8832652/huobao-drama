@@ -23,6 +23,7 @@ function evaluate(source, dependencies = {}, globals = {}) {
   return module.exports
 }
 const domain = evaluate(read('../../backend/src/services/previs-domain.ts'))
+const reference = evaluate(read('../../backend/src/services/previs-video-reference-domain.ts'), { './previs-domain.js': domain })
 const contract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
 const panel = () => ({
   id: 7, title: '开门', description: '【镜头1】走到门前。【镜头2】推开门。',
@@ -44,6 +45,7 @@ function harness({ results = [complete()], saveResult = true, requestError } = {
     'vue-sonner': { toast },
     '../../../backend/src/services/previs-domain': domain,
     '../../../backend/src/services/previs-frame-contract': contract,
+    '../../../backend/src/services/previs-video-reference-domain': reference,
   }, {
     fetch: async (url, options) => {
       requests.push({ url, method: options.method, body: options.body && JSON.parse(options.body) })
@@ -77,12 +79,13 @@ test('description planning works without crypto.randomUUID on HTTP and preserves
   const api = evaluate(read('../app/composables/usePrevis.ts'), {
     vue, 'vue-sonner': { toast: {} }, '../../../backend/src/services/previs-domain': domain,
     '../../../backend/src/services/previs-frame-contract': contract,
+    '../../../backend/src/services/previs-video-reference-domain': reference,
   })
   const descriptor = parse(read('../app/components/previs/StoryboardFramesEditor.vue')).descriptor
   const component = evaluate(compileScript(descriptor, { id: 'frame-editor-test' }).content, {
     vue, 'vue-sonner': { toast: { success: message => notices.push(message) } },
     'lucide-vue-next': {}, '~/components/AppMenu.vue': {}, '~/components/AppMenuItem.vue': {},
-    './FrameSettingsDialog.vue': {}, '~/composables/useApi': { uploadAPI: {} },
+    './FrameSettingsDialog.vue': {}, './StoryboardContactSheet.vue': {}, '~/composables/useApi': { uploadAPI: {} },
     '~/composables/usePrevis': { ...domain, ...api },
   }).default
   const target = panel()
@@ -106,7 +109,7 @@ test('frame generation stays available while another frame is generating', () =>
   const component = evaluate(compileScript(descriptor, { id: 'frame-generate-test' }).content, {
     vue, 'vue-sonner': { toast: {} },
     'lucide-vue-next': {}, '~/components/AppMenu.vue': {}, '~/components/AppMenuItem.vue': {},
-    './FrameSettingsDialog.vue': {}, '~/composables/useApi': { uploadAPI: {} },
+    './FrameSettingsDialog.vue': {}, './StoryboardContactSheet.vue': {}, '~/composables/useApi': { uploadAPI: {} },
     '~/composables/usePrevis': { ...domain, ...contract },
   }).default
   const target = panel()
@@ -157,6 +160,7 @@ test('generate resubmits with the refreshed revision after the service rejects a
   const api = evaluate(read('../app/composables/usePrevis.ts'), {
     vue, 'vue-sonner': { toast }, '../../../backend/src/services/previs-domain': domain,
     '../../../backend/src/services/previs-frame-contract': contract,
+    '../../../backend/src/services/previs-video-reference-domain': reference,
   }, {
     fetch: async (url, options) => {
       const method = options?.method || 'GET'

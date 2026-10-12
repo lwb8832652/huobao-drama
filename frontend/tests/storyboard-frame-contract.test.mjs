@@ -20,6 +20,7 @@ function evaluate(source, dependencies = {}, globals = {}) {
   return module.exports
 }
 const domain = evaluate(read('../../backend/src/services/previs-domain.ts'))
+const reference = evaluate(read('../../backend/src/services/previs-video-reference-domain.ts'), { './previs-domain.js': domain })
 const contract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
 const panel = (count = 0, beats = 1) => ({
   id: 7, title: '开门', description: Array.from({ length: beats }, (_, i) => `【镜头${i + 1}】动作${i + 1}。`).join(''),
@@ -36,6 +37,7 @@ function api(notices = [], globals = {}) {
     'vue-sonner': { toast: Object.fromEntries(['error', 'success', 'info'].map(kind => [kind, message => notices.push({ kind, message })])) },
     '../../../backend/src/services/previs-domain': domain,
     '../../../backend/src/services/previs-frame-contract': contract,
+    '../../../backend/src/services/previs-video-reference-domain': reference,
   }, globals)
 }
 function editor(target) {
@@ -43,7 +45,7 @@ function editor(target) {
   const component = evaluate(compileScript(parse(read('../app/components/previs/StoryboardFramesEditor.vue')).descriptor, { id: 'frame-limit-editor' }).content, {
     vue, 'vue-sonner': { toast: Object.fromEntries(['error', 'success'].map(kind => [kind, message => notices.push({ kind, message })])) },
     'lucide-vue-next': {}, '~/components/AppMenu.vue': {}, '~/components/AppMenuItem.vue': {},
-    './FrameSettingsDialog.vue': {}, '~/composables/useApi': { uploadAPI: {} },
+    './FrameSettingsDialog.vue': {}, './StoryboardContactSheet.vue': {}, '~/composables/useApi': { uploadAPI: {} },
     '~/composables/usePrevis': { ...domain, ...api() },
   }).default
   const props = { panel: target, editable: true, generatable: true, tasks: [] }

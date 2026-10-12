@@ -495,6 +495,7 @@
                   :aria-pressed="videoGenerationMode === 'storyboard_frames'" title="使用当前镜头的全部分镜画面生成"
                   @click="videoGenerationMode = 'storyboard_frames'"><Images :size="12" />分镜画面</button>
               </div>
+              <label v-if="videoUsesStoryboardFrames" class="video-reference-select">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
               <div class="ml-auto flex gap-1">
                 <button class="btn btn-sm btn-primary" @click="navigateTo(`/drama/${dramaId}/episode/${episodeNumber}/previs`)">
                   <Clapperboard :size="13" />
@@ -573,21 +574,7 @@
                     >
                       <svg v-if="isVideoSbSelected(task.id)" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
                     </span>
-                    <video
-                      v-if="hasVid(task.storyboard)"
-                      :src="'/' + getVideoUrl(task.storyboard)"
-                      :poster="posterOf('/' + getVideoUrl(task.storyboard)) || undefined"
-                      preload="none"
-                      playsinline
-                      muted
-                      tabindex="-1"
-                    />
-                    <img
-                      v-else-if="productionCoverById(task.id)"
-                      :src="mediaUrl(productionCoverById(task.id))"
-                      :alt="`${task.title} 分镜画面`"
-                      loading="lazy"
-                    />
+                    <StoryboardContactSheet v-if="productionPanelById(task.id)" :panel="productionPanelById(task.id)" :sheet="productionSheetById(task.id)" compact />
                     <div v-else class="video-task-empty">
                       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
                     </div>
@@ -705,6 +692,11 @@
                     </div>
                     <StoryboardFramesEditor
                       :panel="productionPanel"
+                      :contact-sheet="productionSheetById(productionPanel.id)"
+                      :generatable="productionGeneratable"
+                      :video-input-ready="productionReferenceState(productionPanel.id).ready"
+                      :video-input-error="productionReferenceState(productionPanel.id).error"
+                      @retry-sheet="retryProductionContactSheet(productionPanel.id)"
                       :editable="productionEditable && !productionFramePlanBusy"
                       :tasks="productionImageTasks"
                       :video-generation-mode="videoGenerationMode"
@@ -853,13 +845,14 @@
                   </section>
                   <div class="video-inspector-effective">
                     {{ t('episode.inspector.effective', { model: effectiveVideoModelLabel || t('episode.vid.defaultModel'), res: episodeResolutionShort, dur: effectiveVideoDuration }) }}
+                    <small v-if="!previewVideoUrl && productionOutputById(selectedSb?.id)?.referenceInput"> · 当前视频使用{{ productionOutputById(selectedSb?.id).referenceInput.effective === 'contact_sheet' ? '宫格参考' : '逐张参考' }}</small>
                   </div>
                   <div class="video-frame-readiness" :class="{ ready: videoCanGenerate(selectedSb?.id), direct: videoGenerationMode === 'direct' }">
                     {{ videoGenerationMode === 'direct'
                       ? '直接生成：使用视频提示词与已绑定素材，不依赖分镜画面'
-                      : videoFramesReady(selectedSb?.id)
-                        ? `分镜画面：全部 ${productionPanelById(selectedSb?.id)?.frames.length || 0} 张画面将作为视频输入`
-                        : `分镜画面：请先完成全部画面（缺 ${videoMissingFrameCount(selectedSb?.id)} 张）` }}
+                      : productionReferenceState(selectedSb?.id).ready
+                        ? `视频参考：${productionReferenceState(selectedSb?.id).effective === 'contact_sheet' ? '宫格画面' : '逐张画面'} · 全部 ${productionPanelById(selectedSb?.id)?.frames.length || 0} 张`
+                        : productionReferenceState(selectedSb?.id).error }}
                   </div>
                   <button
                     class="btn btn-primary video-inspector-action"
@@ -1479,6 +1472,7 @@
             <div class="batch-video-row"><span>{{ t('episode.vid.confirmModel') }}</span><strong>{{ effectiveVideoModelLabel || t('episode.vid.defaultModel') }}</strong></div>
             <div class="batch-video-row"><span>{{ t('episode.vid.confirmResolution') }}</span><strong>{{ episodeResolutionLabel }}</strong></div>
             <div class="batch-video-row"><span>生成模式</span><strong>{{ videoGenerationModeLabel }}</strong></div>
+            <label v-if="videoUsesStoryboardFrames" class="batch-video-row"><span>画面参考</span><select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
             <p class="batch-video-note">{{ videoGenerationMode === 'direct'
               ? '每个镜头将使用视频提示词与已绑定素材直接生成，不检查分镜画面。'
               : '每个镜头将按时间顺序使用全部分镜画面；未完成的画面会阻止提交。' }}</p>
@@ -1528,7 +1522,8 @@ import { toastError, mapError, MODERATION_RE } from '~/composables/useToast'
 import LocaleSwitcher from '~/components/LocaleSwitcher.vue'
 import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.vue'
 import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
-import { mediaUrl, useFramePlanner, usePrevis, useVideoGenerationMode } from '~/composables/usePrevis'
+import StoryboardContactSheet from '~/components/previs/StoryboardContactSheet.vue'
+import { contactSheetForPanel, videoReferenceReadiness, previsRequest, mediaUrl, useFramePlanner, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy } from '~/composables/usePrevis'
 
 definePageMeta({ layout: 'studio' })
 
@@ -1541,7 +1536,7 @@ const episodeNumber = Number(route.params.episodeNumber)
 const drama = ref(null), episode = ref(null), chars = ref([]), scenes = ref([]), propItems = ref([]), sbs = ref([]), mergeData = ref(null)
 const {
   version: productionVersion, timeline: productionTimeline, editable: productionEditable,
-  working: productionWorking, initialize: initializeProduction, create: createProduction,
+  generatable: productionGeneratable, retryContactSheet: retryProductionContactSheet, working: productionWorking, initialize: initializeProduction, create: createProduction,
   edit: editProduction, save: saveProduction, generate: generateProduction,
 } = usePrevis()
 const {
@@ -1553,6 +1548,8 @@ const {
   version: productionVersion, editable: productionEditable, save: saveProduction, edit: editProduction,
 }, () => ({ configId: chatConfigId(), model: chatModelOverride() }))
 const videoGenerationMode = useVideoGenerationMode()
+const videoReferenceInputStrategy = useVideoReferenceInputStrategy()
+const videoCapabilities = ref({})
 const videoUsesStoryboardFrames = computed(() => videoGenerationMode.value === 'storyboard_frames')
 const videoGenerationModeLabel = computed(() =>
   videoUsesStoryboardFrames.value ? '依赖分镜画面' : '直接生成')
@@ -2363,11 +2360,11 @@ function openBatchVideoConfirm(pool) {
   const targets = pool.filter(s => !isPendingVideo(s.id))
   if (!targets.length) { toast.info(t('episode.vid.noneToGenerate')); return }
   const incomplete = videoUsesStoryboardFrames.value
-    ? targets.filter(sb => !videoFramesReady(sb.id))
+    ? targets.filter(sb => !videoCanGenerate(sb.id))
     : []
   if (incomplete.length) {
     selectedSb.value = incomplete[0]
-    toast.error(`有 ${incomplete.length} 个镜头的分镜画面尚未全部完成`)
+    toast.error(productionReferenceState(incomplete[0].id).error)
     return
   }
   batchVideoConfirm.value = { open: true, targets }
@@ -2390,10 +2387,13 @@ async function confirmBatchVideos() {
   const ids = targets.map(s => s.id)
   const option = videoModelOptions.value.find(item => item.key === videoModel.value) || videoModelOptions.value[0]
   if (!productionVersion.value || !option) { toast.error('请先启用视频模型并载入当前工作版'); return }
+  const blocked = videoUsesStoryboardFrames.value && ids.find(id => !productionReferenceState(id).ready)
+  if (blocked) { toast.error(productionReferenceState(blocked).error); return }
   try {
     await generateProduction('video', {
       panelIds: ids, configId: option.configId, model: option.model,
       generationMode: videoGenerationMode.value,
+      videoReferenceInputStrategy: videoUsesStoryboardFrames.value ? videoReferenceInputStrategy.value : undefined,
     })
     toast.success(t('episode.vid.batchStarted', { n: ids.length }))
     if (videoSelectMode.value) toggleVideoSelectMode()
@@ -2792,8 +2792,17 @@ function videoFramesReady(id) {
   const frames = productionPanelById(id)?.frames || []
   return frames.length > 0 && frames.every(frame => !!frame.url)
 }
+function productionReferenceState(id) {
+  const target = productionPanelById(id)
+  return videoReferenceReadiness(target ? [target] : [], videoReferenceInputStrategy.value,
+    videoCapabilities.value[selectedVideoConfig.value?.provider]?.maxImages || 9, productionVersion.value?.contactSheets || [])
+}
 function videoCanGenerate(id) {
-  return !videoUsesStoryboardFrames.value || videoFramesReady(id)
+  return !videoUsesStoryboardFrames.value || productionReferenceState(id).ready
+}
+function productionSheetById(id) {
+  const panel = productionPanelById(id)
+  return panel && contactSheetForPanel(panel, productionVersion.value?.contactSheets?.find(sheet => sheet.panelId === id))
 }
 function productionCoverById(id) {
   const panel = productionPanelById(id)
@@ -3599,13 +3608,14 @@ function uploadAssetImage(kind, id) {
 async function genVid(sb, opts = {}) {
   const option = videoModelOptions.value.find(item => item.key === videoModel.value) || videoModelOptions.value[0]
   if (!productionVersion.value || !productionPanelById(sb.id)) { toast.error('当前工作版尚未就绪'); return }
-  if (!videoCanGenerate(sb.id)) { toast.error('请先完成当前镜头的全部分镜画面'); return }
+  if (!videoCanGenerate(sb.id)) { toast.error(productionReferenceState(sb.id).error); return }
   if (!option) { toast.error('请先启用视频模型'); return }
   try {
     delete failedVideoMessages.value[sb.id]
     await generateProduction('video', {
       panelIds: [sb.id], configId: option.configId, model: option.model,
       generationMode: videoGenerationMode.value,
+      videoReferenceInputStrategy: videoUsesStoryboardFrames.value ? videoReferenceInputStrategy.value : undefined,
     })
     if (!opts.silent) toast.success(t('episode.vid.generating'))
   } catch (e) {
@@ -3699,6 +3709,7 @@ async function loadConfigs() {
 }
 
 onMounted(async () => {
+  try { videoCapabilities.value = (await previsRequest('/previs/capabilities')).video || {} } catch {}
   await refresh()
   if (epId.value) {
     try { await initializeProduction(epId.value) } catch (e) { toastError(e) }
@@ -5001,6 +5012,8 @@ onMounted(() => setTimeout(() => autoTour('episode', EPISODE_TOUR, t), 900))
 .production-work-version > span { color: var(--text-0); font-size: 11px; font-weight: 700; }
 .production-work-version > small { color: var(--text-2); font-size: 10px; }
 .production-work-version > button { margin-left: auto; }
+.video-reference-select { display: flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 11px; }
+.video-reference-select select, .batch-video-row select { min-height: 28px; padding: 0 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-raised); color: var(--text-0); font-size: 11px; }
 .production-frames-section {
   padding: 12px;
   border: 1px solid var(--border);

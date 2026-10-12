@@ -14,10 +14,11 @@ import PrevisPlayer from '~/components/previs/PrevisPlayer.vue'
 import PrevisTimeline from '~/components/previs/PrevisTimeline.vue'
 import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.vue'
 import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
+import StoryboardContactSheet from '~/components/previs/StoryboardContactSheet.vue'
 import { uploadAPI } from '~/composables/useApi'
 import {
   FRAME_COUNT_MAX, frameCountChangeAllowed, checkContinuity, createFrameId, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl, orderedFrames,
-  planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode,
+  contactSheetForPanel, videoReferenceReadiness, planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy,
   type AudioClip, type ContinuityIssue, type ContinuityReview, type FrameType, type Keyframe,
   type Panel, type PanelFramePlan, type Timeline,
 } from '~/composables/usePrevis'
@@ -33,9 +34,10 @@ const episodePath = `/drama/${dramaId}/episode/${episodeNumber}`
 const {
   version, timeline, editable, generatable, dirty, working, saveError, pollError, undoStack, redoStack,
   framePlans: framePlansSummary,
-  initialize, open, create, edit, history, save, check, generate, batchAction,
+  initialize, open, create, edit, history, save, check, generate, batchAction, retryContactSheet,
 } = usePrevis()
 const videoGenerationMode = useVideoGenerationMode()
+const videoReferenceInputStrategy = useVideoReferenceInputStrategy()
 const videoUsesStoryboardFrames = computed(() => videoGenerationMode.value === 'storyboard_frames')
 const drama = ref<any>(), episode = ref<any>(), error = ref(''), loading = ref(true), enabled = ref(true)
 const groupId = ref(''), panelId = ref(0), currentMs = ref(0)
@@ -284,9 +286,17 @@ const videoTargetPanels = computed(() => {
 const incompleteVideoPanels = computed(() => videoTargetPanels.value.filter(p => !p.frames.length || p.frames.some(frame => !frame.url)))
 const emptyFramePanels = computed(() => timeline.value?.panels.filter(p => !p.frames.length) || [])
 function groupDuration(id: string) { return segments.value.filter(s => s.groupId === id).reduce((n, s) => n + s.panel.durationMs, 0) }
-function groupThumb(id: string) {
-  return timeline.value?.panels.find(p => p.id === groups.value.find(g => g.id === id)?.panelIds[0])?.frames.find(f => f.url)?.url
+function groupPanel(id: string) {
+  return timeline.value?.panels.find(p => p.id === groups.value.find(g => g.id === id)?.panelIds[0])
 }
+function sheetForPanel(target: Panel) {
+  return contactSheetForPanel(target, version.value?.contactSheets?.find(sheet => sheet.panelId === target.id))
+}
+const videoReferenceState = computed(() => {
+  const units = timeline.value?.strategy.mode === 'group' ? [videoTargetPanels.value] : videoTargetPanels.value.map(panel => [panel])
+  const states = units.map(panels => videoReferenceReadiness(panels, videoReferenceInputStrategy.value, videoCapability.value?.maxImages || 9, version.value?.contactSheets || []))
+  return states.find(state => !state.ready) || { ready: true, error: '', effective: states[0]?.effective }
+})
 function groupScene(id: string) {
   const item = groups.value.find(group => group.id === id)
   return timeline.value?.panels.find(panel => item?.panelIds.includes(panel.id))?.scene || '未填写场景'
@@ -548,9 +558,11 @@ async function startVideo() {
     toast.error(`请先完成 ${incompleteVideoPanels.value.length} 个镜头的全部分镜画面`)
     return
   }
+  if (videoUsesStoryboardFrames.value && !videoReferenceState.value.ready) { toast.error(videoReferenceState.value.error); return }
   await generate('video', { configId: choice.configId, model: choice.model,
     panelIds: videoPanelIds.value.length ? videoPanelIds.value : undefined,
-    generationMode: videoGenerationMode.value })
+    generationMode: videoGenerationMode.value,
+    videoReferenceInputStrategy: videoUsesStoryboardFrames.value ? videoReferenceInputStrategy.value : undefined })
   modal.value = ''; inspector.value = 'tasks'
 }
 function downloadDraft() {
@@ -789,6 +801,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
               :aria-pressed="videoGenerationMode === 'storyboard_frames'" title="使用当前镜头的全部分镜画面生成"
               @click="videoGenerationMode = 'storyboard_frames'"><Images :size="12" />分镜画面</button>
           </div>
+          <label v-if="videoUsesStoryboardFrames" class="pv-reference-select">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
           <div class="pv-header-actions">
             <button
               class="btn btn-sm"
@@ -838,7 +851,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
           >
             <span class="pv-group-number">{{ String(index + 1).padStart(2, '0') }}</span>
             <span class="pv-mini-still">
-              <img v-if="groupThumb(item.id)" :src="mediaUrl(groupThumb(item.id))" :alt="item.title" loading="lazy">
+              <StoryboardContactSheet v-if="groupPanel(item.id)" :panel="groupPanel(item.id)!" :sheet="sheetForPanel(groupPanel(item.id)!)" compact />
               <Clapperboard v-else :size="20" :stroke-width="1" />
               <b>{{ (groupDuration(item.id) / 1000).toFixed(1) }}″</b>
             </span>
@@ -864,6 +877,10 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
               <StoryboardFramesEditor
                 :key="`${version.id}-${panel.id}`"
                 :panel="panel"
+                :contact-sheet="sheetForPanel(panel)"
+                :video-input-ready="videoReferenceReadiness([panel], videoReferenceInputStrategy, videoCapability?.maxImages || 9, version.contactSheets || []).ready"
+                :video-input-error="videoReferenceReadiness([panel], videoReferenceInputStrategy, videoCapability?.maxImages || 9, version.contactSheets || []).error"
+                @retry-sheet="retryContactSheet(panel.id)"
                 :editable="editable"
                 :generatable="generatable"
                 :splitting="framePlanSubmitting || framePlanActive > 0"
@@ -951,7 +968,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
                   <button v-if="framePlansSummary.failed" :disabled="working" @click="run(retryFailedFramePlans)">重试失败项</button>
                 </div>
               </article>
-              <article v-for="batch in batches" :key="batch.id" class="pv-batch"><header><b>{{ batch.type === 'image' ? '关键帧' : '视频' }} #{{ batch.id }}</b><span>{{ statusNames[batch.status] || batch.status }}</span></header><progress :value="batch.items.filter(i => i.status === 'completed').length" :max="batch.items.length" /><small>{{ batch.items.filter(i => i.status === 'completed').length }} / {{ batch.items.length }} 已完成</small><div class="pv-batch-actions"><button v-if="batch.items.some(i => i.status === 'failed')" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry'))">重试失败项</button><button v-if="batch.items.some(i => i.status === 'pending')" :disabled="working" @click="run(() => batchAction(batch.id, 'cancel'))">取消排队任务</button></div><details><summary>查看 {{ batch.items.length }} 个任务</summary><div v-for="item in batch.items" :key="item.id" class="pv-task-item"><b>{{ timeline.panels.find(p => p.id === item.panelId)?.title || groups.find(g => g.id === item.groupId)?.title }} {{ item.frameType ? frameNames[item.frameType] : '' }}</b><span>{{ statusNames[item.status] || item.status }}<small v-if="item.actualStrategy"> · {{ constraintNames[item.actualStrategy] }}</small></span><p v-if="item.error" class="pv-frame-error">{{ item.error }}</p><button v-if="item.status === 'failed'" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry', [item.id]))">重试此项</button><a v-if="item.status === 'completed' && (item.localPath || item.resultUrl)" :href="mediaUrl(item.localPath || item.resultUrl)" target="_blank" rel="noopener">查看生成结果 ↗</a></div></details></article><div v-if="!batches.length" class="pv-small-empty"><Film :size="27" /><p>还没有生成任务</p><span>生成关键帧后，进度会显示在这里。</span></div>
+              <article v-for="batch in batches" :key="batch.id" class="pv-batch"><header><b>{{ batch.type === 'image' ? '关键帧' : '视频' }} #{{ batch.id }}</b><span>{{ statusNames[batch.status] || batch.status }}</span></header><progress :value="batch.items.filter(i => i.status === 'completed').length" :max="batch.items.length" /><small>{{ batch.items.filter(i => i.status === 'completed').length }} / {{ batch.items.length }} 已完成</small><div class="pv-batch-actions"><button v-if="batch.items.some(i => i.status === 'failed')" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry'))">重试失败项</button><button v-if="batch.items.some(i => i.status === 'pending')" :disabled="working" @click="run(() => batchAction(batch.id, 'cancel'))">取消排队任务</button></div><details><summary>查看 {{ batch.items.length }} 个任务</summary><div v-for="item in batch.items" :key="item.id" class="pv-task-item"><b>{{ timeline.panels.find(p => p.id === item.panelId)?.title || groups.find(g => g.id === item.groupId)?.title }} {{ item.frameType ? frameNames[item.frameType] : '' }}</b><span>{{ statusNames[item.status] || item.status }}<small v-if="item.referenceInput"> · {{ item.referenceInput.effective === 'contact_sheet' ? '宫格参考' : '逐张参考' }}</small><small v-if="item.actualStrategy"> · {{ constraintNames[item.actualStrategy] }}</small></span><p v-if="item.error" class="pv-frame-error">{{ item.error }}</p><button v-if="item.status === 'failed'" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry', [item.id]))">重试此项</button><a v-if="item.status === 'completed' && (item.localPath || item.resultUrl)" :href="mediaUrl(item.localPath || item.resultUrl)" target="_blank" rel="noopener">查看生成结果 ↗</a></div></details></article><div v-if="!batches.length" class="pv-small-empty"><Film :size="27" /><p>还没有生成任务</p><span>生成关键帧后，进度会显示在这里。</span></div>
             </template>
           </div>
         </aside>
@@ -963,6 +980,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
         <header><h2>{{ ({ strategy: '模型设置', video: '生成正式视频', audio: '编辑音轨', waiver: '确认连续性提示', lock: '锁定故事版', sync: '同步最新分镜', reload: '重新载入版本', split: '重新拆分分镜画面' } as Record<string, string>)[modal] }}</h2><button aria-label="关闭对话框" @click="modal = ''"><X :size="18" /></button></header>
         <div v-if="modal === 'strategy'" class="pv-form">
           <label>图片模型<select v-model="imageModel"><option value="" disabled>选择图片模型</option><option v-for="o in modelOptions('image')" :key="o.key" :value="o.key">{{ o.label }}</option></select></label>
+          <label v-if="videoUsesStoryboardFrames">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
           <label>视频模型<select v-model="videoModel"><option value="" disabled>选择视频模型</option><option v-for="o in modelOptions('video')" :key="o.key" :value="o.key">{{ o.label }}</option></select></label>
           <label>视频生成模式<div class="seg pv-dialog-mode"><button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'direct' }" @click="videoGenerationMode = 'direct'">直接生成</button><button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'storyboard_frames' }" @click="videoGenerationMode = 'storyboard_frames'">依赖分镜画面</button></div></label>
           <NuxtLink v-if="!modelOptions('image').length || !modelOptions('video').length" to="/settings">前往设置启用生成模型 →</NuxtLink>
@@ -974,10 +992,12 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
         <div v-else-if="modal === 'video'" class="pv-form">
           <p>将使用当前工作版 V{{ version?.versionNo }} 生成{{ videoPanelIds.length ? '当前镜头' : '全部镜头' }}。</p>
           <label>生成模式<div class="seg pv-dialog-mode"><button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'direct' }" @click="videoGenerationMode = 'direct'">直接生成</button><button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'storyboard_frames' }" @click="videoGenerationMode = 'storyboard_frames'">依赖分镜画面</button></div></label>
+          <label v-if="videoUsesStoryboardFrames">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
           <label>视频模型<select v-model="videoModel"><option value="" disabled>选择模型</option><option v-for="o in modelOptions('video')" :key="o.key" :value="o.key">{{ o.label }}</option></select></label>
           <p class="pv-help">{{ videoGenerationMode === 'direct' ? '使用视频提示词与已绑定素材直接生成，不依赖分镜画面。' : '全部分镜画面将按时间顺序作为视频参考。' }}</p>
+          <p v-if="videoUsesStoryboardFrames && !videoReferenceState.ready" class="pv-frame-error">{{ videoReferenceState.error }}</p>
           <p v-if="videoUsesStoryboardFrames && incompleteVideoPanels.length" class="pv-frame-error">还有 {{ incompleteVideoPanels.length }} 个镜头存在未完成画面，请先生成或上传全部画面。</p>
-          <footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="working || !videoModel || (videoUsesStoryboardFrames && !!incompleteVideoPanels.length)" @click="run(startVideo)"><Film :size="14" />提交生成</button></footer>
+          <footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="working || !videoModel || (videoUsesStoryboardFrames && !videoReferenceState.ready)" @click="run(startVideo)"><Film :size="14" />提交生成</button></footer>
         </div>
         <div v-else-if="modal === 'split'" class="pv-form"><p>重新拆分会按新方案重写「{{ panel?.title }}」的全部分镜画面，已生成的图片会保留在画面历史中。</p><footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="framePlanSubmitting || !editable" @click="run(async () => { modal = ''; await splitPanel(true) })">重新拆分</button></footer></div>
         <div v-else class="pv-form"><p>{{ ({ lock: '锁定后时间线和分镜画面不可修改；后续编辑需复制为新草稿。', sync: '读取视频制作中的最新分镜并建立新草稿，当前版本将保留。', reload: '载入远端最新版本。尚未保存的本地修改将被替换，建议先下载本地草稿。' } as Record<string, string>)[modal] }}</p><footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="working" @click="run(async () => { if (modal === 'lock') await check(true); else if (modal === 'sync') await create(); else if (modal === 'reload') { dirty = false; await open(version!.id) } modal = '' })">确认{{ modal === 'lock' ? '锁定' : modal === 'sync' ? '同步' : '' }}</button></footer></div>

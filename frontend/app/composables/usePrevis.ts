@@ -1,8 +1,12 @@
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { toast } from 'vue-sonner'
-import type { AnimaticVersion, Timeline, FrameType } from '../../../backend/src/services/previs-domain'
+import type { AnimaticVersion, Timeline, FrameType, Panel } from '../../../backend/src/services/previs-domain'
 import { makeFrame, orderedFrames, retimeBoundAudio } from '../../../backend/src/services/previs-domain'
 import { FRAME_COUNT_MAX } from '../../../backend/src/services/previs-frame-contract'
+import type { ContactSheetView } from '../../../backend/src/services/previs-contact-sheet-domain'
+import { selectVideoReferenceStrategy, type VideoReferenceInputStrategy } from '../../../backend/src/services/previs-video-reference-domain'
+export type { ContactSheetView, ContactSheetCell } from '../../../backend/src/services/previs-contact-sheet-domain'
+export type { VideoReferenceInputStrategy } from '../../../backend/src/services/previs-video-reference-domain'
 export { FRAME_COUNT_MIN, FRAME_COUNT_MAX, FRAME_COUNT_OPTIONS, frameCountChangeAllowed } from '../../../backend/src/services/previs-frame-contract'
 export {
   autoGroup, checkContinuity, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl,
@@ -79,6 +83,44 @@ export function createFrameId() {
     ?? `frame-${Date.now().toString(36)}-${(++frameIdSequence).toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
+/** A cached sheet only represents the exact frame sequence used to compose it. */
+export function contactSheetForPanel(panel: Panel, sheet?: ContactSheetView): ContactSheetView | undefined {
+  if (!sheet) return undefined
+  if (!sheet.descriptor && sheet.status === 'none') return sheet
+  const frames = orderedFrames(panel), cells = sheet.descriptor?.cells
+  const matches = sheet.panelId === panel.id && cells?.length === frames.length
+    && frames.every((frame, index) => frame.id === cells[index].frameId && frame.url === cells[index].url
+      && (frame.offsetMs || 0) === cells[index].offsetMs)
+  return matches ? sheet : { ...sheet, status: 'stale', annotatedUrl: null, cleanUrl: null, thumbnailUrl: null,
+    readyFrames: frames.filter(frame => frame.url).length, totalFrames: frames.length }
+}
+export function videoReferenceReadiness(panels: Panel[], requested: VideoReferenceInputStrategy, maxImages: number, sheets: ContactSheetView[] = []) {
+  try {
+    const effective = selectVideoReferenceStrategy(panels, requested, maxImages)
+    if (effective === 'contact_sheet') {
+      const unavailable = panels.find(panel => {
+        const sheet = contactSheetForPanel(panel, sheets.find(sheet => sheet.panelId === panel.id))
+        return sheet?.status !== 'ready' || !sheet.cleanUrl || sheet.readyFrames !== sheet.totalFrames
+      })
+      if (unavailable) return { ready: false, effective, error: `「${unavailable.title}」宫格尚未就绪，请等待合成、重试或选择逐张参考` }
+    }
+    return { ready: true, effective, error: '' }
+  } catch (cause: any) { return { ready: false, effective: undefined, error: cause.message || '分镜画面尚未就绪' } }
+}
+export function useVideoReferenceInputStrategy() {
+  const key = 'huobao:video-reference-input-strategy'
+  let initial: VideoReferenceInputStrategy = 'auto'
+  if (import.meta.client) {
+    try {
+      const stored = localStorage.getItem(key)
+      if (stored === 'auto' || stored === 'individual' || stored === 'contact_sheet') initial = stored
+    } catch {}
+  }
+  const strategy = ref<VideoReferenceInputStrategy>(initial)
+  watch(strategy, value => { try { localStorage.setItem(key, value) } catch {} })
+  return strategy
+}
+
 export function useVideoGenerationMode() {
   type Mode = 'direct' | 'storyboard_frames'
   let initial: Mode = 'direct'
@@ -110,10 +152,43 @@ export function usePrevis() {
   let autosave: ReturnType<typeof setTimeout> | undefined
   let saving: Promise<boolean> | undefined
   let pollingNow = false, disposed = false
+  const requestedSheets = new Set<string>()
+
+  async function composeContactSheets(panelIds?: number[], force = false) {
+    const current = version.value
+    if (!current || dirty.value || disposed) return
+    const result = await previsRequest<{ items: ContactSheetView[] }>(`/animatic-versions/${current.id}/contact-sheets`, 'POST',
+      { revision: current.revision, panelIds, force })
+    if (!disposed && !dirty.value && version.value?.id === current.id && version.value.revision === current.revision) {
+      version.value.contactSheets = result.items
+    }
+  }
+  function ensureContactSheets() {
+    const current = version.value
+    if (!current?.contactSheets || dirty.value || disposed) return
+    const missing = current.contactSheets.filter(sheet => {
+      const panel = current.timeline.panels.find(panel => panel.id === sheet.panelId)
+      const key = `${current.id}:${sheet.panelId}:${sheet.sourceHash}`
+      if (!panel?.frames.length || panel.frames.length > FRAME_COUNT_MAX || !['none', 'stale'].includes(sheet.status) || requestedSheets.has(key)) return false
+      requestedSheets.add(key)
+      return true
+    })
+    if (missing.length) void composeContactSheets(missing.map(sheet => sheet.panelId)).catch(() => { pollError.value = '宫格请求中断，可手动重试' })
+  }
+  async function retryContactSheet(panelId: number) {
+    if (!await save() || !version.value) return
+    const current = version.value
+    try {
+      const result = await previsRequest<{ items: ContactSheetView[] }>(`/animatic-versions/${current.id}/contact-sheets/${panelId}/retry`, 'POST',
+        { revision: current.revision })
+      if (!disposed && !dirty.value && version.value?.id === current.id && version.value.revision === current.revision) version.value.contactSheets = result.items
+    } catch (cause: any) { toast.error(cause.message || '宫格重试失败') }
+  }
 
   function accept(value: AnimaticVersion, clearHistory = false) {
     version.value = value; dirty.value = false; saveError.value = ''
     if (clearHistory) { undoStack.value = []; redoStack.value = [] }
+    ensureContactSheets()
   }
   async function refreshVersions() {
     versions.value = await previsRequest(`/episodes/${episodeId}/animatic-versions`)
@@ -130,7 +205,7 @@ export function usePrevis() {
     pollingNow = true
     const id = version.value.id
     try {
-      const state = await previsRequest<Partial<AnimaticVersion> & { requiresRefresh: boolean }>(
+      const state = await previsRequest<Partial<AnimaticVersion> & { requiresRefresh: boolean; framePlans?: FramePlanSummary }>(
         version.value.isCurrent
           ? `/episodes/${episodeId}/production-workspace-state?version_id=${id}`
           : `/animatic-versions/${id}/state`,
@@ -146,8 +221,10 @@ export function usePrevis() {
           if (state.batches) version.value.batches = state.batches
           if (typeof state.busy === 'boolean') version.value.busy = state.busy
           if (state.outputs) version.value.outputs = state.outputs
+          if (state.contactSheets) version.value.contactSheets = state.contactSheets
           if (typeof state.isCurrent === 'boolean') version.value.isCurrent = state.isCurrent
           if (state.framePlans) framePlans.value = state.framePlans
+          ensureContactSheets()
         }
       }
       pollError.value = ''
@@ -228,6 +305,7 @@ export function usePrevis() {
   async function generate(type: 'image' | 'video', options: {
     configId?: number; model?: string; panelIds?: number[]; frameTypes?: FrameType[]; frameIds?: string[]; force?: boolean;
     generationMode?: 'direct' | 'storyboard_frames';
+    videoReferenceInputStrategy?: VideoReferenceInputStrategy;
   } = {}) {
     if (!version.value) return
     working.value = true
@@ -273,7 +351,7 @@ export function usePrevis() {
   onUnmounted(() => { disposed = true; clearInterval(polling); clearTimeout(autosave) })
   return {
     version, versions, timeline, editable, generatable, dirty, working, saveError, pollError, undoStack, redoStack,
-    framePlans, initialize, open, create, edit, history, save, check, generate, batchAction,
+    framePlans, initialize, open, create, edit, history, save, check, generate, batchAction, composeContactSheets, retryContactSheet,
   }
 }
 

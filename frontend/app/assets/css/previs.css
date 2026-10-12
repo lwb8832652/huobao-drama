@@ -789,3 +789,5 @@
 @media (prefers-reduced-motion: reduce) {
   .pv-app *, .pv-app *::before, .pv-app *::after { animation: none !important; transition: none !important; }
 }
+.pv-reference-select { display: flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 11px; }
+.pv-reference-select select { min-height: 28px; padding: 0 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-raised); color: var(--text-0); font-size: 11px; }
