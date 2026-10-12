@@ -39,11 +39,13 @@ interface BatchOptions {
   videoReferenceInputStrategy?: VideoReferenceInputStrategy
   generationScope?: 'storyboard' | 'group'
 }
+// 分镜画面是唯一的正式生成模式：未显式传入时默认即为 storyboard_frames。
+// direct 分支仍保留，仅用于读取历史版本中已落库的直传输出（inheritedOutputs / 指纹比对）。
 export function videoInputs(
   t: Timeline,
   panels: Panel[],
   provider: string,
-  generationMode: VideoGenerationMode = 'direct',
+  generationMode: VideoGenerationMode = 'storyboard_frames',
   preparedReferenceUrls?: string[],
 ) {
   const cap = videoCapabilities[provider as keyof typeof videoCapabilities]
@@ -99,7 +101,7 @@ export async function createBatch(versionId: number, options: BatchOptions) {
   const config = await getConfigById(configRow.id)
   if (!config) throw new PrevisError('生成模型配置不可用')
   const model = options.model || config.model
-  const generationMode = options.generationMode || 'direct'
+  const generationMode = options.generationMode || 'storyboard_frames'
   const allowedModels: string[] = JSON.parse(configRow.model || '[]')
   if (!allowedModels.includes(model)) throw new PrevisError('所选模型不属于当前服务配置')
   const drama = db.select().from(schema.dramas).where(eq(schema.dramas.id, ep.dramaId)).get()

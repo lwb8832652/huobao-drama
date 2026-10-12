@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
+import { toast } from 'vue-sonner'
 import { Check, Grid2X2, Loader2, RefreshCw, SlidersHorizontal, Sparkles, Trash2, Upload, X } from 'lucide-vue-next'
 import { uploadAPI } from '~/composables/useApi'
-import { FRAME_COUNT_MAX, frameKey, mediaUrl, orderedFrames, previsRequest,
+import { FRAME_COUNT_MAX, frameKey, gridLayoutForCount, mediaUrl, orderedFrames, previsRequest,
   type AnimaticVersion, type GridCandidate, type GridCapabilities, type GridMode, type Panel } from '~/composables/usePrevis'
 
 const props = defineProps<{
@@ -40,8 +41,8 @@ const projectRatio = computed(() => props.aspectRatio || '16:9')
 const supportedResolutions = computed(() => [...new Set((capabilities.value?.sizes || [])
   .filter(size => size.aspectRatio === projectRatio.value).map(size => size.resolution))])
 const selectedSize = computed(() => capabilities.value?.sizes?.find(size => size.aspectRatio === projectRatio.value && size.resolution === resolution.value))
-const gridSide = computed(() => frames.value.length === 1 ? 1 : frames.value.length <= 4 ? 2 : 3)
-const predictedCell = computed(() => selectedSize.value && ({ width: Math.floor(selectedSize.value.width / gridSide.value), height: Math.floor(selectedSize.value.height / gridSide.value) }))
+const gridLayout = computed(() => gridLayoutForCount(frames.value.length, projectRatio.value))
+const predictedCell = computed(() => selectedSize.value && ({ width: Math.floor(selectedSize.value.width / gridLayout.value.columns), height: Math.floor(selectedSize.value.height / gridLayout.value.rows) }))
 const canSubmit = computed(() => props.editable && validFrameCount.value && !!capabilities.value?.enabled && !!selectedSize.value && !paidBusy.value)
 const canGenerate = computed(() => canSubmit.value && frames.value.every(frame => !frame.locked))
 const canGridEdit = computed(() => canSubmit.value && !!capabilities.value?.supportsEdit && frames.value.every(frame => frame.url) && frames.value.some(frame => !frame.locked))
@@ -50,9 +51,9 @@ const editFrames = computed(() => baseCandidate.value
   ? [...baseCandidate.value.grid.cells].sort((a, b) => a.index - b.index)
     .map(cell => frames.value.find(frame => frameKey(frame) === cell.frameId)).filter((frame): frame is NonNullable<typeof frame> => !!frame)
   : frames.value)
-const currentGridSlots = computed(() => Array.from({ length: gridSide.value ** 2 }, (_, index) => ({ index, frame: frames.value[index] })))
-const currentGridStyle = computed(() => ({ gridTemplateColumns: `repeat(${gridSide.value}, minmax(0, 1fr))`,
-  gridTemplateRows: `repeat(${gridSide.value}, minmax(0, 1fr))`, aspectRatio: projectRatio.value.replace(':', ' / ') }))
+const currentGridSlots = computed(() => Array.from({ length: gridLayout.value.columns * gridLayout.value.rows }, (_, index) => ({ index, frame: frames.value[index] })))
+const currentGridStyle = computed(() => ({ gridTemplateColumns: `repeat(${gridLayout.value.columns}, minmax(0, 1fr))`,
+  gridTemplateRows: `repeat(${gridLayout.value.rows}, minmax(0, 1fr))`, aspectRatio: projectRatio.value.replace(':', ' / ') }))
 function editFrameNumber(frame: Panel['frames'][number]) {
   return (baseCandidate.value?.grid.cells.find(cell => cell.frameId === frameKey(frame))?.index ?? frames.value.findIndex(item => frameKey(item) === frameKey(frame))) + 1
 }
@@ -63,7 +64,9 @@ const editValid = computed(() => selectedFrameIds.value.length > 0 && selectedFr
   && (editMode.value !== 'frame_edit' || (selectedFrameIds.value.length === 1 && !!selectedFrames.value[0]?.url))
   && selectedFrameIds.value.every(id => instruction.value.trim() || instructions.value[id]?.trim()))
 const visibleCandidates = computed(() => candidates.value.filter(candidate => candidate.status !== 'discarded'))
-const activeCandidates = computed(() => visibleCandidates.value.filter(candidate => candidate.status !== 'adopted'))
+const activeCandidates = computed(() => visibleCandidates.value.filter(candidate => candidate.status !== 'adopted'
+  // 整组生成完成即自动采用，ready 只是瞬时状态；仅当自动采用失败（带上错误）才需要人工介入
+  && !(candidate.mode === 'generate' && candidate.status === 'ready' && !candidate.error)))
 const reviewCells = computed(() => !review.value ? [] : review.value.mode === 'frame_edit'
   ? review.value.grid.cells.filter(cell => review.value!.targetFrameIds.includes(cell.frameId)).map(cell => ({ ...cell, index: 0, number: cell.index + 1 }))
   : review.value.grid.cells.map(cell => ({ ...cell, number: cell.index + 1 })))
@@ -71,6 +74,8 @@ let token = 0, mounted = false, disposed = false
 let polling: ReturnType<typeof setTimeout> | undefined
 let previousFocus: HTMLElement | null = null
 const discardedIds = new Set<number>()
+/** 候选上一次可见的状态，用于识别「整组生成 → 服务端自动采用」的完成时刻 */
+const candidateStatuses = new Map<number, string>()
 let contextKey = ''
 const currentContextKey = () => `${props.versionId}:${props.panel.id}:${props.configId || ''}:${props.model || ''}:${props.aspectRatio || ''}`
 const path = () => `/animatic-versions/${props.versionId}/grid-candidates`
@@ -87,6 +92,13 @@ async function refreshCandidates(requestToken = token, versionId = props.version
     const result = await previsRequest<{ items: GridCandidate[] }>(`/animatic-versions/${versionId}/grid-candidates?panel_id=${panelId}`)
     if (!active(requestToken, versionId, panelId)) return
     candidates.value = result.items.filter(candidate => !discardedIds.has(candidate.id))
+    for (const candidate of candidates.value) {
+      const previous = candidateStatuses.get(candidate.id)
+      candidateStatuses.set(candidate.id, candidate.status)
+      // 整组生成无需审核：服务端完成后自动切分写入画面，这里只提示结果
+      if (candidate.mode === 'generate' && previous && ['pending', 'processing'].includes(previous)
+        && candidate.status === 'adopted') toast.success('宫格已生成，画面已自动拆分')
+    }
     if (review.value) review.value = result.items.find(candidate => candidate.id === review.value!.id) || review.value
   } catch (cause) {
     if (active(requestToken, versionId, panelId)) failure(cause, '候选图进度读取失败，可点击刷新重试')
@@ -117,6 +129,8 @@ async function loadContext() {
       if (!supported.includes(resolution.value)) resolution.value = supported[0] || '2K'
     } else candidates.value = (result.value as { items: GridCandidate[] }).items
   }
+  // 初次载入的状态是基线，不触发完成提示
+  for (const candidate of candidates.value) candidateStatuses.set(candidate.id, candidate.status)
   loading.value = false
   schedulePolling(requestToken, versionId, panelId)
 }
@@ -156,8 +170,12 @@ async function submitCandidate(mode: GridMode) {
     const result = await previsRequest<{ items: GridCandidate[] }>(`/animatic-versions/${versionId}/grid-candidates`, 'POST',
       { revision: saved.revision, panelIds: [panelId], mode, ...chosenModel, ...(mode === 'generate' ? {} : edit) })
     if (!active(requestToken, versionId, panelId)) return
-    for (const candidate of result.items) candidates.value = [candidate, ...candidates.value.filter(item => item.id !== candidate.id)]
-    if (result.items[0]) reviewCandidate(result.items[0])
+    for (const candidate of result.items) {
+      candidates.value = [candidate, ...candidates.value.filter(item => item.id !== candidate.id)]
+      candidateStatuses.set(candidate.id, candidate.status)
+    }
+    // 整组生成免审核：完成后服务端直接切分写入画面，不再弹审核窗口；微调仍需人工确认
+    if (result.items[0] && mode !== 'generate') reviewCandidate(result.items[0])
     schedulePolling(requestToken, versionId, panelId)
   } catch (cause) { if (active(requestToken, versionId, panelId)) failure(cause, '宫格任务提交失败') }
   finally { if (active(requestToken, versionId, panelId)) submitting.value = false }
@@ -277,8 +295,11 @@ async function uploadGrid(event: Event) {
     const result = await previsRequest<GridCandidate>(`/animatic-versions/${versionId}/grid-candidates/upload`, 'POST',
       { revision: saved.revision, panelId, url: uploaded.path || uploaded.url })
     if (!active(requestToken, versionId, panelId)) return
-    candidates.value = [result, ...candidates.value]
-    reviewCandidate(result)
+    candidates.value = [result, ...candidates.value.filter(item => item.id !== result.id)]
+    candidateStatuses.set(result.id, result.status)
+    // 上传替换同样免审核：服务端已自动切分；未自动采用时回退到人工确认
+    if (result.status === 'adopted') toast.success('宫格已上传，画面已自动拆分')
+    else reviewCandidate(result)
   } catch (cause) { if (active(requestToken, versionId, panelId)) failure(cause, '宫格上传失败') }
   finally { if (active(requestToken, versionId, panelId)) submitting.value = false }
 }
@@ -306,7 +327,7 @@ onBeforeUnmount(() => { disposed = true; token++; stopPolling(); closeModal(); e
           <div class="grid-more-content">
             <button type="button" class="btn btn-sm" data-testid="grid-edit-planning" @click="togglePlanning">{{ planning ? '返回宫格' : '编辑规划' }}</button>
             <label class="grid-resolution"><span>生成设置 · 分辨率</span><select v-model="resolution" aria-label="宫格生成分辨率" :disabled="paidBusy || !editable || !supportedResolutions.length"><option v-for="option in supportedResolutions" :key="option" :value="option">{{ option }}</option></select></label>
-            <p v-if="validFrameCount && selectedSize && predictedCell" class="grid-hint">{{ gridSide }} × {{ gridSide }} 宫格 · {{ projectRatio }} · 原生输出 {{ selectedSize.width }} × {{ selectedSize.height }}px · 每格约 {{ predictedCell.width }} × {{ predictedCell.height }}px<template v-if="gridSide * gridSide > frames.length"> · {{ gridSide * gridSide - frames.length }} 个留白格</template></p>
+            <p v-if="validFrameCount && selectedSize && predictedCell" class="grid-hint">{{ gridLayout.label }} 宫格 · {{ projectRatio }} · 原生输出 {{ selectedSize.width }} × {{ selectedSize.height }}px · 每格约 {{ predictedCell.width }} × {{ predictedCell.height }}px<template v-if="gridLayout.count > frames.length"> · {{ gridLayout.count - frames.length }} 个留白格</template></p>
             <button type="button" class="btn btn-sm" :disabled="!editable || paidBusy || !validFrameCount || frames.some(frame => frame.locked)" @click="fileInput?.click()"><Upload :size="12" />上传替换宫格</button>
             <button type="button" class="btn btn-sm" data-testid="grid-records" @click="openModal('records')">生成记录 {{ visibleCandidates.length || '' }}</button>
             <button type="button" class="btn btn-sm" aria-label="刷新宫格候选" :disabled="loading || submitting" @click="loadContext"><RefreshCw :size="13" />刷新候选</button>

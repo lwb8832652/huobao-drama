@@ -19,6 +19,7 @@ function evaluate(source, dependencies = {}, globals = {}) {
   return module.exports
 }
 const componentPath = '../app/components/previs/StoryboardGridTools.vue'
+const frameContract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
 const candidate = (extra = {}) => ({ id: 20, versionId: 4, panelId: 7, mode: 'generate', status: 'ready',
   previewUrl: '/static/grid.png', rawUrl: '/static/raw.png', baseUrl: '/static/before.png',
   width: 2048, height: 1152, cellWidth: 1024, cellHeight: 576,
@@ -28,7 +29,7 @@ function harness({ items = [], save = async () => ({ versionId: 4, revision: 9 }
   assert.ok(existsSync(new URL(componentPath, import.meta.url)), 'Shared grid tools must implement the candidate workflow')
   const descriptor = parse(read(componentPath)).descriptor
   const script = compileScript(descriptor, { id: 'grid-tools-test' })
-  const requests = [], emitted = [], mounted = [], disposers = [], timers = new Map()
+  const requests = [], emitted = [], mounted = [], disposers = [], timers = new Map(), toasts = []
   let nextTimer = 0
   const props = vue.reactive({ versionId: 4, revision: 2, configId: 8, model: 'selected-image', editable, managementEditable: editable, beforeAction: save, aspectRatio,
     panel: { id: 7, frames: [{ id: 'one', offsetMs: 0, url: '/static/one.png' }, { id: 'two', offsetMs: 1000, url: '/static/two.png' }], referenceImages: [] } })
@@ -46,12 +47,13 @@ function harness({ items = [], save = async () => ({ versionId: 4, revision: 9 }
   props.commitAdoption = commitAdoption || ((versionId, candidateId, revision) => api(`/animatic-versions/${versionId}/grid-candidates/${candidateId}/adopt`, 'POST', { revision }))
   const component = evaluate(script.content, {
     vue: { ...vue, onMounted: fn => mounted.push(fn), onBeforeUnmount: fn => disposers.push(fn), onUnmounted: fn => disposers.push(fn), useId: () => 'grid-dialog' },
-    'lucide-vue-next': {}, '~/composables/useApi': { uploadAPI: { image: async () => ({ path: '/static/upload.png' }) } },
-    '~/composables/usePrevis': { previsRequest: api, mediaUrl: url => url, orderedFrames: panel => panel.frames, frameKey: frame => frame.id, FRAME_COUNT_MAX: 9 },
+    'lucide-vue-next': {}, 'vue-sonner': { toast: { success: message => toasts.push(message) } },
+    '~/composables/useApi': { uploadAPI: { image: async () => ({ path: '/static/upload.png' }) } },
+    '~/composables/usePrevis': { previsRequest: api, mediaUrl: url => url, orderedFrames: panel => panel.frames, frameKey: frame => frame.id, FRAME_COUNT_MAX: 9, gridLayoutForCount: frameContract.gridLayoutForCount },
   }, { localStorage: storage, setTimeout: callback => { const id = ++nextTimer; timers.set(id, callback); return id }, clearTimeout: id => timers.delete(id) }).default
   const effect = vue.effectScope()
   const setup = effect.run(() => component.setup(props, { expose() {}, emit: (event, ...args) => { emitted.push({ event, args }); onEvent?.(event, ...args) } }))
-  return { setup, props, requests, emitted, timers, async start() { for (const fn of mounted) await fn() }, dispose() { disposers.forEach(fn => fn()); effect.stop() }, descriptor, script }
+  return { setup, props, requests, emitted, timers, toasts, async start() { for (const fn of mounted) await fn() }, dispose() { disposers.forEach(fn => fn()); effect.stop() }, descriptor, script }
 }
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve() }
 
@@ -125,9 +127,13 @@ test('refinement rechecks eligibility after saving while keeping the submitted t
 })
 
 test('unadopted candidates have compact notices while adopted records stay closed by default', async () => {
-  const h = harness({ items: [candidate({ status: 'adopted' }), candidate({ id: 21 }), candidate({ id: 22, status: 'pending' }), candidate({ id: 23, status: 'failed' })] })
+  const h = harness({ items: [candidate({ status: 'adopted' }), candidate({ id: 21, mode: 'grid_edit' }), candidate({ id: 22, status: 'pending' }),
+    candidate({ id: 23, status: 'failed' }), candidate({ id: 24, status: 'ready', error: '自动采用失败' })] })
   await h.start()
-  assert.deepEqual(Array.from(h.setup.activeCandidates.value, item => item.id), [21, 22, 23])
+  assert.deepEqual(Array.from(h.setup.activeCandidates.value, item => item.id), [21, 22, 23, 24])
+  // 整组生成的 ready 是服务端自动采用前的瞬态，不占用提示区
+  h.setup.candidates.value.push(candidate({ id: 25 }))
+  assert.equal(h.setup.activeCandidates.value.some(item => item.id === 25), false)
   assert.equal(h.setup.modal.value, '')
   assert.match(h.descriptor.template.content, /modal === 'records'/)
   assert.ok(h.descriptor.template.content.indexOf('<slot ') < h.descriptor.template.content.indexOf('grid-candidate-notices'), 'Current images precede candidate notices')
@@ -273,12 +279,33 @@ test('ready preview pixel labels derive from actual artifact dimensions rather t
   assert.equal(h.setup.perCellPixels(single).height, 405); h.dispose()
 })
 
-test('uploaded local replacement is reviewed as one candidate without calling the model', async () => {
-  const h = harness({ request: (path, method) => method === 'POST' && path.endsWith('/upload') ? candidate() : undefined }); await h.start()
+test('uploaded local replacement is adopted without review and without calling the model', async () => {
+  const h = harness({ request: (path, method) => method === 'POST' && path.endsWith('/upload') ? candidate({ status: 'adopted' }) : undefined }); await h.start()
   await h.setup.uploadGrid({ target: { files: [{}], value: 'selected' } })
   assert.equal(h.requests.filter(r => r.method === 'POST').length, 1)
   assert.equal(h.requests.at(-1).body.url, '/static/upload.png')
-  assert.equal(h.setup.review.value.id, 20); h.dispose()
+  assert.equal(h.setup.modal.value, '', '上传替换免审核')
+  assert.deepEqual(h.toasts, ['宫格已上传，画面已自动拆分']); h.dispose()
+})
+
+test('an upload the server cannot adopt falls back to manual review', async () => {
+  const h = harness({ request: (path, method) => method === 'POST' && path.endsWith('/upload') ? candidate({ status: 'ready', error: '自动采用失败' }) : undefined }); await h.start()
+  await h.setup.uploadGrid({ target: { files: [{}], value: 'selected' } })
+  assert.equal(h.setup.review.value.id, 20)
+  assert.deepEqual(h.toasts, []); h.dispose()
+})
+
+test('whole-grid generation never opens review and reports the automatic split', async () => {
+  let items = [candidate({ id: 30, status: 'processing' })]
+  const h = harness({ request: path => path.endsWith('?panel_id=7') ? { items } : undefined }); await h.start()
+  await h.setup.generateGrid()
+  assert.equal(h.setup.modal.value, '', '整组生成免审核，不弹审核窗口')
+  assert.deepEqual(Array.from(h.setup.activeCandidates.value, item => item.id), [30])
+  items = [candidate({ id: 30, status: 'adopted' })]
+  await h.setup.refreshCandidates()
+  assert.deepEqual(h.toasts, ['宫格已生成，画面已自动拆分'])
+  assert.equal(h.setup.activeCandidates.value.length, 0)
+  assert.equal(h.setup.modal.value, ''); h.dispose()
 })
 
 test('every selected edit target needs a common instruction or its own instruction', async () => {
@@ -295,7 +322,8 @@ test('unsupported project ratios cannot submit and native per-cell size is shown
   const unsupported = harness({ aspectRatio: '9:16' }); await unsupported.start(); await unsupported.setup.generateGrid()
   assert.equal(unsupported.requests.some(r => r.method === 'POST'), false); unsupported.dispose()
   const h = harness(); await h.start()
-  assert.equal(h.setup.predictedCell.value.width, 1024); assert.equal(h.setup.predictedCell.value.height, 576)
+  // 2 帧 → 1×2 宫格（1 列 × 2 行），每格宽度 = 整图宽 / 1，高度 = 整图高 / 2
+  assert.equal(h.setup.predictedCell.value.width, 2048); assert.equal(h.setup.predictedCell.value.height, 576)
   h.dispose()
 })
 
@@ -401,17 +429,19 @@ test('locked frames block whole regeneration but allow refinement of another unl
 })
 
 test('the whole-grid chooser matches paid output geometry and missing or blank slots cannot be selected', async () => {
-  for (const [count, side] of [[1, 1], [3, 2], [6, 3]]) {
+  // [count, columns, rows]：1→1×1、3→1×3、6→2×3、9→3×3；5→向上取 2×3（留白 1 格）
+  for (const [count, columns, rows] of [[1, 1, 1], [3, 1, 3], [5, 2, 3], [6, 2, 3], [9, 3, 3]]) {
     const h = harness(); await h.start()
     h.props.panel.frames = Array.from({ length: count }, (_, index) => ({ id: `frame-${index}`, offsetMs: index, url: index === 1 ? '' : `/static/${index}.png` }))
     h.setup.openEdit('grid_edit')
-    assert.equal(h.setup.currentGridSlots.value.length, side * side)
-    assert.equal(h.setup.currentGridStyle.value.gridTemplateColumns, `repeat(${side}, minmax(0, 1fr))`)
+    assert.equal(h.setup.currentGridSlots.value.length, columns * rows)
+    assert.equal(h.setup.currentGridStyle.value.gridTemplateColumns, `repeat(${columns}, minmax(0, 1fr))`)
+    assert.equal(h.setup.currentGridStyle.value.gridTemplateRows, `repeat(${rows}, minmax(0, 1fr))`)
     assert.equal(h.setup.currentGridStyle.value.aspectRatio, '16 / 9')
     if (count > 1) {
       h.setup.toggleFrame('frame-1'); assert.equal(h.setup.selectedFrameIds.value.length, 0)
     }
-    if (side * side > count) assert.equal(h.setup.currentGridSlots.value.at(-1).frame, undefined)
+    if (columns * rows > count) assert.equal(h.setup.currentGridSlots.value.at(-1).frame, undefined)
     h.dispose()
   }
 })

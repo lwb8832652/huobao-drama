@@ -127,12 +127,12 @@ const run = async (id: number) => {
   for (let i = 0; i < 100; i++) {
     await grid.tickGridCandidates()
     const c = grid.listGridCandidates(versionId).find((x) => x.id === id)!
-    if (c.status === 'ready' || c.status === 'failed') return c
+    if (['ready', 'failed', 'adopted'].includes(c.status)) return c
     await new Promise((r) => setTimeout(r, 25))
   }
   throw new Error('timeout')
 }
-test('joint generation submits once, reads never enqueue, candidate does not overwrite, adopt locally', async () => {
+test('joint generation submits once, reads never enqueue, and adopts locally without review', async () => {
   const payload = {
     revision: 1,
     panelIds: [1],
@@ -144,17 +144,26 @@ test('joint generation submits once, reads never enqueue, candidate does not ove
   const a = await grid.startGridCandidates(versionId, payload),
     b = await grid.startGridCandidates(versionId, payload)
   assert.equal(a.items[0].id, b.items[0].id)
-  const ready = await run(a.items[0].id)
-  assert.equal(ready.status, 'ready', ready.error || '')
+  const done = await run(a.items[0].id)
+  // 整组生成免审核：完成后服务端直接切分写入画面
+  assert.equal(done.status, 'adopted', done.error || '')
   assert.equal(calls, 1)
   assert.ok(imagesSent >= 1)
   for (let i = 0; i < 10; i++) grid.listGridCandidates(versionId)
   assert.equal(calls, 1)
-  assert.ok(getVersion(versionId).timeline.panels[0].frames.every((f) => !f.url))
-  const adopted = await grid.adoptGridCandidate(versionId, ready.id, 1)
+  const adopted = getVersion(versionId)
   assert.equal(adopted.revision, 2)
   assert.ok(adopted.timeline.panels[0].frames.every((f) => f.url))
   assert.equal(calls, 1)
+  // 宫格生成要进任务面板：sys_task 必须带上分镜与剧集归属，完成后可展示原始宫格图
+  const task = db
+    .select()
+    .from(schema.sysTask)
+    .where(eq(schema.sysTask.previsItemKey, `grid-${a.items[0].id}`))
+    .get()!
+  assert.equal(task.storyboardId, 1)
+  assert.equal(task.dramaId, 1)
+  assert.ok(task.localPath, '完成任务保留返回的原始宫格图')
 })
 test('grid edit targets alone get replaced; frame edit after it uses latest source; stale candidate rejected atomically', async () => {
   const first = getVersion(versionId),
@@ -238,7 +247,7 @@ test('all-panel preflight failure does not create any task, frame lock blocks ad
     .run()
   await assert.rejects(grid.adoptGridCandidate(versionId, ready.id, current.revision), /锁定|变化/)
 })
-test('cancelling a queued candidate prevents submission; upload and pre-adoption grid edit preserve the unselected tiles', async () => {
+test('cancelling a queued candidate prevents submission; upload replaces every tile without review', async () => {
   const current = getVersion(versionId),
     t = structuredClone(current.timeline)
   t.panels[0].frames[0].locked = false
@@ -258,23 +267,27 @@ test('cancelling a queued candidate prevents submission; upload and pre-adoption
   grid.discardGridCandidate(versionId, pending.items[0].id)
   await grid.tickGridCandidates()
   assert.equal(calls, before)
+  // 上传替换与生成一致：就绪即自动切分，不经过人工采用
   const upload = await grid.uploadGridCandidate(versionId, current.revision, 1, '/static/asset.png')
+  assert.equal(upload.status, 'adopted', upload.error || '')
+  const uploaded = getVersion(versionId)
+  assert.equal(uploaded.revision, current.revision + 1)
+  assert.ok(uploaded.timeline.panels[0].frames.every((f) => f.url))
   const edit = await grid.startGridCandidates(versionId, {
-    revision: current.revision,
+    revision: uploaded.revision,
     panelIds: [1],
     configId,
     model: 'gpt-image-2',
     mode: 'grid_edit',
     resolution: '1K',
-    baseCandidateId: upload.id,
     targetFrameIds: ['f1'],
     instruction: 'smile',
   })
   const ready = await run(edit.items[0].id)
   assert.equal(ready.status, 'ready', ready.error || '')
-  assert.equal(ready.adoptFrameIds.length, 4)
+  assert.equal(ready.adoptFrameIds.length, 1)
   assert.equal(calls, before + 1)
-  const adopted = await grid.adoptGridCandidate(versionId, ready.id, current.revision)
+  const adopted = await grid.adoptGridCandidate(versionId, ready.id, uploaded.revision)
   assert.equal(adopted.timeline.panels[0].frames.length, 4)
   assert.equal(adopted.timeline.panels[0].frames[0].source?.mode, 'generate')
   assert.equal(adopted.timeline.panels[0].frames[0].source?.candidateId, upload.id)
@@ -451,7 +464,7 @@ test('missing mandatory identity refuses every image mode before enqueue, includ
     .where(eq(schema.animaticVersions.id, versionId))
     .run()
 })
-test('regeneration freezes existing source bytes and refuses in-place replacement at adoption', async () => {
+test('regeneration freezes existing source bytes and automatic adoption refuses in-place replacement', async () => {
   const v = getVersion(versionId),
     t = structuredClone(v.timeline)
   t.panels[0].frames.forEach((f) => {
@@ -470,7 +483,7 @@ test('regeneration freezes existing source bytes and refuses in-place replacemen
     mode: 'generate',
     resolution: '1K',
   })
-  const ready = await run(a.items[0].id)
+  // 冻结之后替换原图字节：完成即采用必须拒绝，并保留候选供人工处理
   writeFileSync(
     path.join(root, 'static', 'asset.png'),
     await sharp({
@@ -479,8 +492,13 @@ test('regeneration freezes existing source bytes and refuses in-place replacemen
       .png()
       .toBuffer(),
   )
-  await assert.rejects(grid.adoptGridCandidate(versionId, ready.id, v.revision), /文件已变化/)
+  const blocked = await run(a.items[0].id)
+  assert.equal(blocked.status, 'ready', blocked.error || '')
+  assert.match(blocked.error || '', /文件已变化/)
+  assert.equal(getVersion(versionId).revision, v.revision, '采用失败不应推进版本')
   writeFileSync(path.join(root, 'static', 'asset.png'), image)
+  const adopted = await grid.adoptGridCandidate(versionId, blocked.id, getVersion(versionId).revision)
+  assert.ok(adopted.timeline.panels[0].frames.every((f) => f.url && f.url !== '/static/asset.png'))
 })
 test('restart resumes a known synchronous result without a supplier id or a new model call', async () => {
   const { recoverPrevisTasks } = await import('../src/services/generation.js')

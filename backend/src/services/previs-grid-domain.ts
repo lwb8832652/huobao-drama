@@ -1,16 +1,19 @@
 /** Paid generation geometry is distinct from the adaptive display contact sheet. */
+import { gridLayoutForCount } from './previs-frame-contract.js'
+
 export type GridMode = 'generate' | 'grid_edit' | 'frame_edit'
 export interface GenerationGrid {
   columns: number
   rows: number
   cells: { frameId: string; index: number }[]
 }
-export function generationGrid(frameIds: string[]): GenerationGrid {
+export function generationGrid(frameIds: string[], aspectRatio?: string): GenerationGrid {
   if (frameIds.length < 1 || frameIds.length > 9) throw new Error('联合生图需要 1～9 个画面')
   if (frameIds.some((id) => !id) || new Set(frameIds).size !== frameIds.length)
     throw new Error('画面 ID 不能为空或重复')
-  const side = frameIds.length === 1 ? 1 : frameIds.length <= 4 ? 2 : 3
-  return { columns: side, rows: side, cells: frameIds.map((frameId, index) => ({ frameId, index })) }
+  // 宫格数量（2/3/4/6/9）精确命中 1×2/2×2/1×3/2×3/3×3 铺满不留白；竖屏画面翻转列行；非标准数量向上取最近宫格。
+  const { columns, rows } = gridLayoutForCount(frameIds.length, aspectRatio)
+  return { columns, rows, cells: frameIds.map((frameId, index) => ({ frameId, index })) }
 }
 export function gridBounds(index: number, grid: GenerationGrid, width: number, height: number) {
   const column = index % grid.columns,

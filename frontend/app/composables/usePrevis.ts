@@ -7,7 +7,8 @@ import type { ContactSheetView } from '../../../backend/src/services/previs-cont
 import { selectVideoReferenceStrategy, type VideoReferenceInputStrategy } from '../../../backend/src/services/previs-video-reference-domain'
 export type { ContactSheetView, ContactSheetCell } from '../../../backend/src/services/previs-contact-sheet-domain'
 export type { VideoReferenceInputStrategy } from '../../../backend/src/services/previs-video-reference-domain'
-export { FRAME_COUNT_MIN, FRAME_COUNT_MAX, FRAME_COUNT_OPTIONS, frameCountChangeAllowed } from '../../../backend/src/services/previs-frame-contract'
+export { FRAME_COUNT_MIN, FRAME_COUNT_MAX, FRAME_COUNT_OPTIONS, FRAME_GRID_LAYOUTS, FRAME_GRID_COUNTS, gridLayoutForCount, gridLayoutsForRatio, isPortraitRatio, frameCountChangeAllowed } from '../../../backend/src/services/previs-frame-contract'
+export type { FrameGridLayout } from '../../../backend/src/services/previs-frame-contract'
 export {
   autoGroup, checkContinuity, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl,
   orderedFrames, panelImageFallback, planFrames, rebuildTransitions, timelineSegments,
@@ -196,20 +197,16 @@ export function useVideoReferenceInputStrategy() {
   return strategy
 }
 
+/**
+ * 视频生成统一走「分镜画面」模式：视频制作不再提供「直接生成 / 分镜画面」切换入口，
+ * 模式恒为 storyboard_frames。保留该 composable 是为了让调用方继续以响应式引用读取模式，
+ * 也便于以后需要时扩展；旧版本地存储的 'direct' 偏好在初始化时清除，避免影响后续判断。
+ */
 export function useVideoGenerationMode() {
-  type Mode = 'direct' | 'storyboard_frames'
-  let initial: Mode = 'direct'
   if (import.meta.client) {
-    try {
-      const stored = localStorage.getItem(VIDEO_GENERATION_MODE_KEY)
-      if (stored === 'direct' || stored === 'storyboard_frames') initial = stored
-    } catch {}
+    try { localStorage.removeItem(VIDEO_GENERATION_MODE_KEY) } catch {}
   }
-  const mode = ref<Mode>(initial)
-  watch(mode, value => {
-    try { localStorage.setItem(VIDEO_GENERATION_MODE_KEY, value) } catch {}
-  })
-  return mode
+  return ref<'direct' | 'storyboard_frames'>('storyboard_frames')
 }
 
 export function usePrevis() {
@@ -473,7 +470,7 @@ export function useFramePlanner(
   workspace: Pick<ReturnType<typeof usePrevis>, 'version' | 'editable' | 'save' | 'edit'>,
   modelChoice: () => { configId?: number; model?: string },
 ) {
-  const open = ref(false), busy = ref(false), count = ref(3)
+  const open = ref(false), busy = ref(false), count = ref(4)
   const plans = ref<PanelFramePlan[]>([])
   let requestToken = 0, targetPanelId = 0, targetVersionId = 0
   function close() {

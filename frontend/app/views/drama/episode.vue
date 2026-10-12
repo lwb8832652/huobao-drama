@@ -487,15 +487,7 @@
               <span class="dim" style="font-size:12px">{{ t('episode.prod.videos') }}</span>
               <span class="tag mono">{{ t('episode.sb.segmentStat', { n: sbs.length, dur: totalDuration }) }}</span>
               <span class="tag mono" :title="t('episode.vid.aspectRatio')">{{ dramaAspectRatio }}</span>
-              <div class="seg video-generation-mode" aria-label="视频生成模式">
-                <button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'direct' }"
-                  :aria-pressed="videoGenerationMode === 'direct'" title="使用提示词与已绑定素材直接生成"
-                  @click="videoGenerationMode = 'direct'"><Film :size="12" />直接生成</button>
-                <button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'storyboard_frames' }"
-                  :aria-pressed="videoGenerationMode === 'storyboard_frames'" title="使用当前镜头的全部分镜画面生成"
-                  @click="videoGenerationMode = 'storyboard_frames'"><Images :size="12" />分镜画面</button>
-              </div>
-              <label v-if="videoUsesStoryboardFrames" class="video-reference-select">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
+              <label class="video-reference-select">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
               <div class="ml-auto flex gap-1">
                 <button class="btn btn-sm btn-primary" @click="navigateTo(`/drama/${dramaId}/episode/${episodeNumber}/previs`)">
                   <Clapperboard :size="13" />
@@ -681,15 +673,9 @@
                 </div>
 
                   <section
-                    v-if="productionPanel && (videoUsesStoryboardFrames || directFramesExpanded)"
+                    v-if="productionPanel"
                     class="video-inspector-section production-frames-section"
                   >
-                    <div v-if="!videoUsesStoryboardFrames" class="direct-frames-context">
-                      <Images :size="15" />
-                      <div><strong>可选预演画面</strong><small>直接生成不会读取这些画面</small></div>
-                      <button type="button" class="btn btn-icon btn-sm" title="收起分镜画面" aria-label="收起分镜画面"
-                        @click="directFramesExpanded = false"><ChevronUp :size="15" /></button>
-                    </div>
                     <StoryboardGridTools
                       v-if="productionVersion"
                       :key="`grid-${productionVersion.id}-${productionPanel.id}`"
@@ -713,7 +699,7 @@
                           :editable="productionEditable && !productionFramePlanBusy && !productionGridBusy"
                           :tasks="productionImageTasks"
                           :video-generation-mode="videoGenerationMode"
-                          :title="videoUsesStoryboardFrames ? '2 · 分镜画面' : '分镜画面 · 仅用于预演'"
+                          title="2 · 分镜画面"
                           @change="updateProductionFrames"
                           @generate="generateProductionFrames"
                           @split="splitProductionFrames"
@@ -721,23 +707,9 @@
                       </template>
                     </StoryboardGridTools>
                   </section>
-                  <button
-                    v-else-if="productionPanel"
-                    type="button"
-                    class="direct-frames-entry"
-                    @click="directFramesExpanded = true"
-                  >
-                    <span class="direct-frames-icon"><Images :size="16" /></span>
-                    <span class="direct-frames-copy">
-                      <strong>分镜画面（可选）</strong>
-                      <small>{{ productionPanel.frames.filter(frame => frame.url).length }} / {{ productionPanel.frames.length }} 张已就绪 · 仅用于预演和审核</small>
-                    </span>
-                    <ChevronRight :size="16" />
-                  </button>
-
                   <section class="video-inspector-section">
                     <div class="video-inspector-prompt-head">
-                      <span class="video-inspector-label video-inspector-label-hero">{{ videoUsesStoryboardFrames ? '3' : '2' }} · {{ t('episode.sb.videoPromptSection') }}</span>
+                      <span class="video-inspector-label video-inspector-label-hero">3 · {{ t('episode.sb.videoPromptSection') }}</span>
                       <button
                         type="button"
                         class="btn btn-sm"
@@ -805,7 +777,7 @@
                   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
                   <div class="video-player-empty-copy">
                     <div class="video-player-empty-title">{{ videoTaskState(selectedSb) === 'pending' ? t('episode.vid.emptyGenerating') : videoTaskState(selectedSb) === 'blocked' ? '分镜画面尚未全部完成' : t('episode.vid.emptyNoVideo') }}</div>
-                    <div class="video-player-empty-desc">{{ videoTaskState(selectedSb) === 'pending' ? t('episode.vid.emptyGeneratingDesc') : videoTaskState(selectedSb) === 'blocked' ? '分镜画面模式会按时间顺序使用当前镜头的全部画面' : videoGenerationMode === 'direct' ? '直接使用视频提示词与已绑定素材生成' : t('episode.vid.emptyNoVideoDesc') }}</div>
+                    <div class="video-player-empty-desc">{{ videoTaskState(selectedSb) === 'pending' ? t('episode.vid.emptyGeneratingDesc') : videoTaskState(selectedSb) === 'blocked' ? '分镜画面模式会按时间顺序使用当前镜头的全部画面' : t('episode.vid.emptyNoVideoDesc') }}</div>
                   </div>
                   <button
                     v-if="videoTaskState(selectedSb) !== 'pending'"
@@ -864,12 +836,10 @@
                     {{ t('episode.inspector.effective', { model: effectiveVideoModelLabel || t('episode.vid.defaultModel'), res: episodeResolutionShort, dur: effectiveVideoDuration }) }}
                     <small v-if="!previewVideoUrl && productionOutputById(selectedSb?.id)?.referenceInput"> · 当前视频使用{{ productionOutputById(selectedSb?.id).referenceInput.effective === 'contact_sheet' ? '宫格参考' : '逐张参考' }}</small>
                   </div>
-                  <div class="video-frame-readiness" :class="{ ready: videoCanGenerate(selectedSb?.id), direct: videoGenerationMode === 'direct' }">
-                    {{ videoGenerationMode === 'direct'
-                      ? '直接生成：使用视频提示词与已绑定素材，不依赖分镜画面'
-                      : productionReferenceState(selectedSb?.id).ready
-                        ? `视频参考：${productionReferenceState(selectedSb?.id).effective === 'contact_sheet' ? '宫格画面' : '逐张画面'} · 全部 ${productionPanelById(selectedSb?.id)?.frames.length || 0} 张`
-                        : productionReferenceState(selectedSb?.id).error }}
+                  <div class="video-frame-readiness" :class="{ ready: videoCanGenerate(selectedSb?.id) }">
+                    {{ productionReferenceState(selectedSb?.id).ready
+                      ? `视频参考：${productionReferenceState(selectedSb?.id).effective === 'contact_sheet' ? '宫格画面' : '逐张画面'} · 全部 ${productionPanelById(selectedSb?.id)?.frames.length || 0} 张`
+                      : productionReferenceState(selectedSb?.id).error }}
                   </div>
                   <button
                     class="btn btn-primary video-inspector-action"
@@ -1490,11 +1460,8 @@
             <div class="batch-video-row"><span>生成任务</span><strong>{{ batchVideoGenerationScope === 'group' ? 1 : batchVideoConfirm.targets.length }} 个{{ batchVideoGenerationScope === 'group' ? ` · 整组 ${batchVideoTotalDuration} 秒` : '' }}</strong></div>
             <div class="batch-video-row"><span>{{ t('episode.vid.confirmModel') }}</span><strong>{{ effectiveVideoModelLabel || t('episode.vid.defaultModel') }}</strong></div>
             <div class="batch-video-row"><span>{{ t('episode.vid.confirmResolution') }}</span><strong>{{ episodeResolutionLabel }}</strong></div>
-            <div class="batch-video-row"><span>生成模式</span><strong>{{ videoGenerationModeLabel }}</strong></div>
-            <label v-if="videoUsesStoryboardFrames" class="batch-video-row"><span>画面参考</span><select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
-            <p class="batch-video-note">{{ videoGenerationMode === 'direct'
-              ? '使用视频提示词与已绑定素材直接生成，不检查分镜画面。'
-              : '分镜画面按时间顺序作为视频参考；未完成的画面会阻止提交。' }}</p>
+            <label class="batch-video-row"><span>画面参考</span><select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
+            <p class="batch-video-note">分镜画面按时间顺序作为视频参考；未完成的画面会阻止提交。</p>
             <p class="batch-video-note">{{ batchVideoGenerationScope === 'group' ? '所选分镜按时间线顺序生成一个视频，计为一次生成任务。' : '每个所选分镜各生成一个视频，分别计为生成任务。' }}</p>
             <p v-if="!batchVideoReferenceState.ready" class="batch-video-note">{{ batchVideoReferenceState.error }}</p>
           </div>
@@ -1534,7 +1501,7 @@ import { toast } from 'vue-sonner'
 import { useI18n } from 'vue-i18n'
 import {
   Users, FileText, FolderKanban, Clapperboard, Download, Loader2,
-  Plus, X, ListTodo, CircleHelp, ChevronRight, ChevronUp, Film, Images,
+  Plus, X, ListTodo, CircleHelp,
 } from 'lucide-vue-next'
 import { api, dramaAPI, episodeAPI, storyboardAPI, characterAPI, sceneAPI, propAPI, taskAPI, mergeAPI, aiConfigAPI, uploadAPI } from '~/composables/useApi'
 import { startTour, autoTour } from '~/composables/useTour'
@@ -1572,14 +1539,7 @@ const {
 const videoGenerationMode = useVideoGenerationMode()
 const videoReferenceInputStrategy = useVideoReferenceInputStrategy()
 const videoCapabilities = ref({})
-const videoUsesStoryboardFrames = computed(() => videoGenerationMode.value === 'storyboard_frames')
-const videoGenerationModeLabel = computed(() =>
-  videoUsesStoryboardFrames.value ? '依赖分镜画面' : '直接生成')
-const directFramesExpanded = ref(false)
 const productionGridBusy = ref(false)
-watch(videoGenerationMode, value => {
-  if (value === 'direct') directFramesExpanded.value = false
-})
 // 工作台面板位置记忆（按剧集隔离）：仅页面刷新(reload)时恢复到上次所在步骤；
 // 从列表/详情页点击进入时始终默认「剧本」面板
 const PANEL_STORE_KEY = `huobao:workbench:panel:${dramaId}:${episodeNumber}`
@@ -2386,7 +2346,6 @@ const batchVideoReferenceState = computed(() => {
   const capability = videoCapabilities.value[selectedVideoConfig.value?.provider]
   const error = videoGenerationScopeError(panels, batchVideoGenerationScope.value, capability)
   if (error) return { ready: false, error }
-  if (!videoUsesStoryboardFrames.value) return { ready: true, error: '' }
   const units = batchVideoGenerationScope.value === 'group' ? [panels] : panels.map(panel => [panel])
   const states = units.map(unit => videoReferenceReadiness(unit, videoReferenceInputStrategy.value,
     capability?.maxImages || 9, productionVersion.value?.contactSheets || [], batchVideoGenerationScope.value))
@@ -2396,9 +2355,7 @@ const batchVideoReferenceState = computed(() => {
 function openBatchVideoConfirm(pool) {
   const targets = pool.filter(s => !isPendingVideo(s.id))
   if (!targets.length) { toast.info(t('episode.vid.noneToGenerate')); return }
-  const incomplete = videoUsesStoryboardFrames.value
-    ? targets.filter(sb => !videoCanGenerate(sb.id))
-    : []
+  const incomplete = targets.filter(sb => !videoCanGenerate(sb.id))
   if (incomplete.length) {
     selectedSb.value = incomplete[0]
     toast.error(productionReferenceState(incomplete[0].id).error)
@@ -2432,7 +2389,7 @@ async function confirmBatchVideos() {
       panelIds: ids, configId: option.configId, model: option.model,
       generationMode: videoGenerationMode.value,
       generationScope,
-      videoReferenceInputStrategy: videoUsesStoryboardFrames.value ? videoReferenceInputStrategy.value : undefined,
+      videoReferenceInputStrategy: videoReferenceInputStrategy.value,
     })
     toast.success(`已提交 ${generationScope === 'group' ? 1 : ids.length} 个视频生成任务`)
     if (videoSelectMode.value) toggleVideoSelectMode()
@@ -2837,7 +2794,7 @@ function productionReferenceState(id) {
     videoCapabilities.value[selectedVideoConfig.value?.provider]?.maxImages || 9, productionVersion.value?.contactSheets || [])
 }
 function videoCanGenerate(id) {
-  return !videoUsesStoryboardFrames.value || productionReferenceState(id).ready
+  return productionReferenceState(id).ready
 }
 function productionSheetById(id) {
   const panel = productionPanelById(id)
@@ -3660,7 +3617,7 @@ async function genVid(sb, opts = {}) {
     await generateProduction('video', {
       panelIds: [sb.id], configId: option.configId, model: option.model,
       generationMode: videoGenerationMode.value,
-      videoReferenceInputStrategy: videoUsesStoryboardFrames.value ? videoReferenceInputStrategy.value : undefined,
+      videoReferenceInputStrategy: videoReferenceInputStrategy.value,
     })
     if (!opts.silent) toast.success(t('episode.vid.generating'))
   } catch (e) {
@@ -4559,11 +4516,6 @@ onMounted(() => setTimeout(() => autoTour('episode', EPISODE_TOUR, t), 900))
 .prod-content { flex: 1; overflow-y: auto; padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 10px; }
 .prod-section-bar { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .prod-section-bar > .ml-auto { min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
-.video-generation-mode { flex-shrink: 0; border: 1px solid var(--border); border-radius: var(--radius); }
-.video-generation-mode .seg-item {
-  min-height: 26px; padding: 4px 9px; display: inline-flex; align-items: center; gap: 5px;
-  border-radius: calc(var(--radius) - 2px); font-size: 11px; letter-spacing: 0;
-}
 
 /* 资产栏动作：提取（虚线中性）与批量生成（强调色）视觉分组 */
 .asset-bar-actions { align-items: center; }
@@ -5065,31 +5017,6 @@ onMounted(() => setTimeout(() => autoTour('episode', EPISODE_TOUR, t), 900))
   border-radius: var(--radius);
   background: var(--surface-raised);
 }
-.direct-frames-entry {
-  appearance: none; width: 100%; min-height: 56px; display: flex; align-items: center; gap: 10px;
-  padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--radius);
-  background: var(--surface-soft); color: var(--text-1); box-shadow: none; text-align: left;
-  cursor: pointer; letter-spacing: 0; transition: border-color .16s, background .16s;
-}
-.direct-frames-entry:hover { border-color: var(--border-strong); background: var(--bg-hover); }
-.direct-frames-entry:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--button-focus); }
-.direct-frames-entry > svg { flex-shrink: 0; color: var(--text-2); }
-.direct-frames-icon {
-  width: 32px; height: 32px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
-  border-radius: var(--radius-sm); background: var(--info-bg); color: var(--info);
-}
-.direct-frames-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
-.direct-frames-copy strong { color: var(--text-0); font-size: 12px; font-weight: 700; }
-.direct-frames-copy small { color: var(--text-2); font-size: 10px; line-height: 1.5; white-space: normal; }
-.direct-frames-context {
-  display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 6px 8px;
-  border: 1px solid var(--border); border-radius: 7px; background: var(--surface-soft); color: var(--text-2);
-}
-.direct-frames-context > svg { flex-shrink: 0; }
-.direct-frames-context > div { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 1px; }
-.direct-frames-context strong { font-size: 11px; }
-.direct-frames-context small { font-size: 10px; line-height: 1.4; }
-.direct-frames-context .btn { flex-shrink: 0; padding: 0; }
 /* 生成前检查动线集中一屏：上双栏（画面描述/氛围 ｜ 参考绑定），下整宽（视频提示词） */
 .video-main-grid {
   display: grid;
@@ -5572,7 +5499,6 @@ button.video-task-metric.on { box-shadow: 0 0 0 2px var(--accent); }
   line-height: 1.5;
 }
 .video-frame-readiness.ready { background: var(--success-bg); color: var(--success); }
-.video-frame-readiness.direct { background: var(--info-bg); color: var(--info); }
 .video-inspector-section { display: flex; flex-direction: column; gap: 7px; }
 .video-inspector-label { color: var(--text-0); font-size: 12px; font-weight: 700; }
 .video-inspector-label-hero {
@@ -6526,7 +6452,6 @@ button.video-task-metric.on { box-shadow: 0 0 0 2px var(--accent); }
     flex-wrap: wrap;
   }
 
-  .video-generation-mode { order: 2; }
   .prod-section-bar > .ml-auto { width: 100%; margin-left: 0; justify-content: flex-start; }
 
   .asset-grid,

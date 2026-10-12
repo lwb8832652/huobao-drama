@@ -35,7 +35,7 @@ const props = withDefaults(defineProps<{
   canRefineGrid?: boolean
   canRefineFrame?: boolean
 }>(), {
-  generatable: true, tasks: () => [], showVideoAction: false, videoGenerationMode: 'direct', activeFrameId: '', title: '分镜画面', splitting: false,
+  generatable: true, tasks: () => [], showVideoAction: false, videoGenerationMode: 'storyboard_frames', activeFrameId: '', title: '分镜画面', splitting: false,
 })
 const emit = defineEmits<{
   change: [frames: Keyframe[], coverFrameId?: string]
@@ -289,7 +289,7 @@ watch(settingsFrame, frame => {
       </div>
     </div>
     <footer v-if="usesStoryboardFrames || showVideoAction" class="frame-editor-video">
-      <div><Film :size="14" /><span>{{ usesStoryboardFrames ? (videoReady ? `全部 ${frames.length} 张画面已就绪` : videoInputError || (frames.length ? `还需完成 ${missingVideoFrames} 张画面` : '先添加分镜画面')) : '当前为直接生成模式' }}<small>{{ usesStoryboardFrames ? '视频按时间顺序使用全部画面' : '这些画面仅用于预演和审核，不作为当前视频输入' }}</small></span></div>
+      <div><Film :size="14" /><span>{{ videoReady ? `全部 ${frames.length} 张画面已就绪` : videoInputError || (frames.length ? `还需完成 ${missingVideoFrames} 张画面` : '先添加分镜画面') }}<small>视频按时间顺序使用全部画面</small></span></div>
       <button v-if="showVideoAction" type="button" class="btn btn-primary btn-sm" :disabled="!videoReady" @click="emit('video')"><Film :size="13" />生成视频</button>
     </footer>
     <FrameSettingsDialog

@@ -31,6 +31,14 @@ const geminiBase = [[1024, 1024], [848, 1264], [1264, 848], [896, 1200], [1200, 
 const seedreamRatios = ['1:1', '4:3', '3:4', '16:9', '9:16', '3:2', '2:3', '21:9']
 const seedreamBase = [[1024, 1024], [1152, 864], [864, 1152], [1280, 720], [720, 1280], [1248, 832], [832, 1248], [1512, 648]]
 
+/**
+ * 未在能力表里声明的模型默认按常见原生尺寸开放宫格：图片模型默认支持整组宫格，
+ * 真正不支持时会在提交生成时由模型返回错误，而不是在界面上静默禁用。
+ * 切分用的是相对坐标，实际返回尺寸与声明值不同也能正确落格。
+ */
+const DEFAULT_GRID_REFERENCES = 6
+const defaultGridSizes = () => scaledSizes(ratios, geminiBase, ['1K', '2K'], tier => (tier === '2K' ? 2 : 1))
+
 function size(aspectRatio: string, resolution: GridResolution, width: number, height: number): GridImageSize {
   return { size: `${width}x${height}`, width, height, aspectRatio, resolution }
 }
@@ -94,8 +102,9 @@ export function gridImageCapabilities(config: AIConfig, model: string): GridImag
     const maxReferences = Number(declared?.maxReferences)
     const hasSizeMapping = Object.entries(wf.extraParams).some(([key, value]) => key !== wf.promptKey && key !== wf.referenceKey && /^\s*\{\{\s*size\s*\}\}\s*$/.test(value))
     if (!hasSizeMapping || !Number.isInteger(maxReferences) || maxReferences < 1 || maxReferences > 16 || !Array.isArray(declared?.sizes)) {
-      // Preserve the existing mapped workflow's six-reference path; joint grids still require a declaration.
-      return { ...disabled(provider, name, '工作流须声明参考图上限、原图编辑能力与原生尺寸，并映射 {{size}}'), supportsReferences: true, maxReferences: 6 }
+      // 工作流未显式声明 gridImage 时不再整体禁用：按默认尺寸开放，
+      // 已确认有独立参考图入参（mapped），宫格请求可以照常发出。
+      return result(provider, name, DEFAULT_GRID_REFERENCES, defaultGridSizes())
     }
     const sizes = declared.sizes.filter((item: any) => ratios.includes(item?.aspectRatio) && ['1K', '2K', '4K'].includes(item?.resolution)
       && Number.isInteger(item?.width) && item.width > 0 && Number.isInteger(item?.height) && item.height > 0)
@@ -103,7 +112,8 @@ export function gridImageCapabilities(config: AIConfig, model: string): GridImag
     if (!sizes.length) return disabled(provider, name, '工作流未声明有效原生尺寸')
     return result(provider, name, maxReferences, sizes, declared.supportsEdit === true)
   }
-  return disabled(provider, name, '此模型尚未声明可验证的参考生图与原图编辑能力')
+  // 白名单之外的模型一并按默认能力开放，不再因"未声明"而禁用。
+  return result(provider, name, DEFAULT_GRID_REFERENCES, defaultGridSizes())
 }
 
 /** Refuse unsupported dimensions instead of stretching a different native ratio or silently lowering resolution. */

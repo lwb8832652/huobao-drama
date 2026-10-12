@@ -4,7 +4,7 @@ import { test } from 'node:test'
 const api = await import('../src/services/previs-grid-capabilities.js').catch(() => null)
 const config = (provider: string, model: string, settings?: Record<string, unknown>) => ({ provider, model, settings, baseUrl: 'https://provider.example', apiKey: 'test-key' })
 
-test('grid capabilities only enable identified reference and editing models', () => {
+test('identified models enable with exact limits; unknown models default open; unmapped nuwax stays disabled', () => {
   assert.ok(api, 'grid capability API must exist')
   for (const [provider, model, limit] of [
     ['openai', 'gpt-image-2', 16], ['gemini', 'gemini-3-pro-image', 14],
@@ -16,9 +16,14 @@ test('grid capabilities only enable identified reference and editing models', ()
     assert.equal(caps.supportsEdit, true)
     assert.equal(caps.maxReferences, limit)
   }
-  for (const [provider, model] of [['openai', 'dall-e-3'], ['gemini', 'gemini-3-pro'], ['volcengine', 'ep-unknown'], ['nuwax', '20']]) {
-    assert.equal(api.gridImageCapabilities(config(provider, model), model).enabled, false)
+  // 白名单之外的图片模型默认开放（6 参考图），不再因"未声明"而禁用
+  for (const [provider, model] of [['openai', 'dall-e-3'], ['gemini', 'gemini-3-pro'], ['volcengine', 'ep-unknown']]) {
+    const caps = api.gridImageCapabilities(config(provider, model), model)
+    assert.equal(caps.enabled, true)
+    assert.equal(caps.maxReferences, 6)
   }
+  // 无参考图入参映射的 nuwax 工作流仍禁用
+  assert.equal(api.gridImageCapabilities(config('nuwax', '20'), '20').enabled, false)
 })
 
 test('size selection preserves native dimensions and rejects unsupported ratio or tier', () => {
@@ -36,7 +41,7 @@ test('size selection preserves native dimensions and rejects unsupported ratio o
   assert.ok(api.chooseGridSize(seedream, '16:9', '2K').width * api.chooseGridSize(seedream, '16:9', '2K').height >= 3686400)
 })
 
-test('custom workflows require actual reference and size mappings plus declared limits', () => {
+test('custom workflows with reference mapping default open and honor declared limits', () => {
   assert.ok(api)
   const declaration = { maxReferences: 3, supportsEdit: true, sizes: [{ aspectRatio: '16:9', resolution: '2K', width: 2048, height: 1152 }] }
   const settings = { workflow: { referenceKey: 'images', extraParams: { output_size: '{{size}}' }, gridImage: declaration } }
@@ -44,8 +49,11 @@ test('custom workflows require actual reference and size mappings plus declared 
   assert.equal(caps.enabled, true)
   assert.equal(caps.maxReferences, 3)
   assert.equal(api.chooseGridSize(caps, '16:9', '2K').size, '2048x1152')
+  // 有参考图映射但未声明 size mapping 时按默认尺寸开放，不再整体禁用
   const withoutSize = { workflow: { referenceKey: 'images', gridImage: declaration } }
-  assert.equal(api.gridImageCapabilities(config('nuwax', '20', withoutSize), '20').enabled, false)
+  const defaultOpen = api.gridImageCapabilities(config('nuwax', '20', withoutSize), '20')
+  assert.equal(defaultOpen.enabled, true)
+  assert.equal(defaultOpen.maxReferences, 6)
   const shadowedInput = { workflow: { promptKey: 'images', referenceKey: 'images', extraParams: { output_size: '{{size}}' }, gridImage: declaration } }
   assert.equal(api.gridImageCapabilities(config('nuwax', '20', shadowedInput), '20').enabled, false)
 })
