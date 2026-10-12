@@ -13,12 +13,13 @@ import ThemeToggle from '~/components/ThemeToggle.vue'
 import PrevisPlayer from '~/components/previs/PrevisPlayer.vue'
 import PrevisTimeline from '~/components/previs/PrevisTimeline.vue'
 import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.vue'
+import StoryboardGridTools from '~/components/previs/StoryboardGridTools.vue'
 import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
 import StoryboardContactSheet from '~/components/previs/StoryboardContactSheet.vue'
 import { uploadAPI } from '~/composables/useApi'
 import {
   FRAME_COUNT_MAX, frameCountChangeAllowed, checkContinuity, createFrameId, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl, orderedFrames,
-  contactSheetForPanel, videoReferenceReadiness, videoGenerationScopeError, planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy,
+  applyFramePlanToPanel, contactSheetForPanel, videoReferenceReadiness, videoGenerationScopeError, planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy,
   type AudioClip, type ContinuityIssue, type ContinuityReview, type FrameType, type Keyframe,
   type Panel, type PanelFramePlan, type Timeline, type VideoGenerationScope,
 } from '~/composables/usePrevis'
@@ -34,7 +35,7 @@ const episodePath = `/drama/${dramaId}/episode/${episodeNumber}`
 const {
   version, timeline, editable, generatable, dirty, working, saveError, pollError, undoStack, redoStack,
   framePlans: framePlansSummary,
-  initialize, open, create, edit, history, save, check, generate, batchAction, retryContactSheet,
+  initialize, open, create, edit, history, save, check, generate, batchAction, retryContactSheet, adoptGridCandidate,
 } = usePrevis()
 const videoGenerationMode = useVideoGenerationMode()
 const videoReferenceInputStrategy = useVideoReferenceInputStrategy()
@@ -51,6 +52,7 @@ const previewViews: Array<{ key: PrevisStageView; label: string }> = [
 const player = ref<InstanceType<typeof PrevisPlayer>>()
 const modal = ref(''), dialog = ref<HTMLDialogElement>()
 const framePlanOpen = ref(false), framePlanCount = ref(3)
+const gridBusy = ref(false)
 const framePlans = ref<PanelFramePlan[]>([])
 const framePlanActive = computed(() => framePlansSummary.value.pending + framePlansSummary.value.processing)
 const videoPanelIds = ref<number[]>([])
@@ -423,6 +425,10 @@ async function generateFrames(ids?: number[], frameIds?: string[], force = false
   await generate('image', { configId: model.configId, model: model.model, panelIds: ids, frameIds, force })
   inspector.value = 'tasks'
 }
+async function beforeGridAction() {
+  if (!await save() || !version.value) return false
+  return { versionId: version.value.id, revision: version.value.revision }
+}
 async function planAndGenerate(ids?: number[]) {
   const selected = ids?.length ? ids : timeline.value?.panels.map(p => p.id) || []
   const planned = new Map<number, Keyframe[]>()
@@ -503,6 +509,11 @@ async function recountFramePlan(count: number) {
   if (panelIds.length) await submitFrameSplit(panelIds, true, count)
 }
 function applyFramePlan(plans: PanelFramePlan[]) {
+  if (!editable.value) return
+  if (timeline.value?.panels.some(panel => plans.some(plan => plan.panelId === panel.id) && panel.frames.some(frame => frame.locked))) {
+    toast.error('存在已锁定画面，不能应用新的拆分方案')
+    return
+  }
   const total = plans.reduce((sum, plan) => sum + plan.frames.length, 0)
   if (!total) return
   if (plans.some(plan => plan.frames.length > FRAME_COUNT_MAX)) {
@@ -513,19 +524,11 @@ function applyFramePlan(plans: PanelFramePlan[]) {
     for (const plan of plans) {
       const target = t.panels.find(p => p.id === plan.panelId)
       if (!target) continue
-      target.frames = plan.frames.map(frame => ({
-        ...makeFrame(createFrameId(), Math.min(frame.offsetMs, Math.max(0, target.durationMs - 1)), frame.title),
-        type: frame.type,
-        prompt: frame.prompt,
-        shotType: frame.shotType,
-        angle: frame.angle,
-        composition: frame.composition,
-      }))
-      target.coverFrameId = target.frames[0]?.id
+      applyFramePlanToPanel(target, plan)
     }
   })
   framePlanOpen.value = false
-  toast.success(`已写入 ${total} 张画面，可点击「生成缺失」出图`)
+  toast.success(`已写入 ${total} 张画面，可点击「生成整组宫格」出图`)
 }
 const uploading = ref(false)
 const audioDraft = ref<AudioClip>()
@@ -883,6 +886,15 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
           <div class="seg pv-inspector-tabs"><button v-for="tab in ['frames', 'issues', 'properties']" :key="tab" class="seg-item" :class="{ on: inspector === tab }" :aria-pressed="inspector === tab" @click="inspector = tab">{{ { frames: '画面', issues: '连续性', properties: '属性' }[tab] }}</button></div>
           <div class="pv-inspector-scroll">
             <template v-if="inspector === 'frames' && panel">
+              <StoryboardGridTools
+                :key="`grid-${version.id}-${panel.id}`"
+                :panel="panel" :version-id="version.id" :revision="version.revision"
+                :config-id="modelChoice('image')?.configId" :model="modelChoice('image')?.model"
+                :aspect-ratio="drama?.aspect_ratio || drama?.aspectRatio || '16:9'"
+                :editable="editable && !framePlanSubmitting && !framePlanActive"
+                :management-editable="generatable && !working"
+                :before-action="beforeGridAction" :commit-adoption="adoptGridCandidate" @busy="gridBusy = $event"
+              />
               <StoryboardFramesEditor
                 :key="`${version.id}-${panel.id}`"
                 :panel="panel"
@@ -890,8 +902,8 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
                 :video-input-ready="videoReferenceReadiness([panel], videoReferenceInputStrategy, videoCapability?.maxImages || 9, version.contactSheets || []).ready"
                 :video-input-error="videoReferenceReadiness([panel], videoReferenceInputStrategy, videoCapability?.maxImages || 9, version.contactSheets || []).error"
                 @retry-sheet="retryContactSheet(panel.id)"
-                :editable="editable"
-                :generatable="generatable"
+                :editable="editable && !gridBusy"
+                :generatable="generatable && !gridBusy"
                 :splitting="framePlanSubmitting || framePlanActive > 0"
                 :tasks="batches.filter(b => b.type === 'image').flatMap(b => b.items).filter(item => item.panelId === panel!.id)"
                 :video-generation-mode="videoGenerationMode"

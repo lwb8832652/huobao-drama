@@ -41,7 +41,7 @@ const missingReferences = computed(() => references.value.some(url => !props.pan
 const canGenerate = computed(() => !readOnly.value && references.value.length > 0 && !missingReferences.value)
 const historyImages = computed(() => {
   const entries = [
-    ...(props.frame.url ? [{ url: props.frame.url, taskId: props.frame.taskId }] : []),
+    ...(props.frame.url ? [{ url: props.frame.url, taskId: props.frame.taskId, source: props.frame.source }] : []),
     ...[...(props.frame.history || [])].reverse(),
   ]
   return entries.filter((entry, index) => entry.url && entries.findIndex(item => item.url === entry.url) === index)
@@ -49,6 +49,9 @@ const historyImages = computed(() => {
 const heading = computed(() => props.isNew ? '添加分镜画面' : '生成设置')
 const subtitle = computed(() => `${props.panel.title} · ${props.isNew ? '新画面' : props.frame.title || '分镜画面'}`)
 const invalidTime = computed(() => !Number.isFinite(seconds.value) || seconds.value < 0 || seconds.value > maxSeconds.value)
+function sourceLabel(source?: Keyframe['source']) {
+  return source?.mode === 'generate' ? '原始切分' : source?.mode === 'grid_edit' ? '整图微调' : source?.mode === 'frame_edit' ? '单格精修' : '图片'
+}
 const previousFocus = props.returnFocus || (typeof document === 'undefined' ? null : document.activeElement as HTMLElement | null)
 
 function toggleReference(url: string) {
@@ -70,7 +73,7 @@ function save(generate = false) {
   }
   if (draft.value.url !== initial.url) {
     const selected = historyImages.value.find(entry => entry.url === draft.value.url)
-    if (selected) { changes.url = selected.url; changes.taskId = selected.taskId }
+    if (selected) { changes.url = selected.url; changes.taskId = selected.taskId; changes.source = selected.source }
   }
   emit('frame', changes, generate)
 }
@@ -125,7 +128,7 @@ onUnmounted(() => {
                   :disabled="readOnly" :class="{ selected: draft.url === entry.url, current: frame.url === entry.url }"
                   :aria-pressed="draft.url === entry.url" :aria-label="`使用历史图片 ${index + 1}`"
                   @click="draft.url = entry.url"
-                ><img :src="mediaUrl(entry.url)" :alt="`历史图片 ${index + 1}`"><span v-if="frame.url === entry.url">当前</span><Check v-if="draft.url === entry.url" :size="14" /></button>
+                ><img :src="mediaUrl(entry.url)" :alt="`历史图片 ${index + 1}`"><span>{{ frame.url === entry.url ? '当前 · ' : '' }}{{ sourceLabel(entry.source) }}</span><Check v-if="draft.url === entry.url" :size="14" /></button>
               </div>
               <p class="settings-hint">选择历史图片后点击保存，即可切换当前使用画面。</p>
             </div>

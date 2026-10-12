@@ -57,8 +57,8 @@ test('backend rejects unsupported providers at DB and route boundaries', () => {
 
   assert.match(ai, /officialProviders/)
   assert.match(ai, /text:\s*\[\s*'openai',\s*'gemini',\s*'volcengine'\s*\]/)
-  assert.match(ai, /image:\s*\[\s*'openai',\s*'gemini',\s*'volcengine'\s*\]/)
-  assert.match(ai, /video:\s*\[\s*'volcengine',\s*'minimax',\s*'aliyun'\s*\]/)
+  assert.match(ai, /image:\s*\[\s*'openai',\s*'gemini',\s*'volcengine',\s*'nuwax'\s*\]/)
+  assert.match(ai, /video:\s*\[\s*'volcengine',\s*'minimax',\s*'aliyun',\s*'nuwax'\s*\]/)
   assert.doesNotMatch(ai, /'deepseek'/)
   assert.doesNotMatch(ai, /'ali'/)
   assert.doesNotMatch(ai, /'vidu'/)
@@ -174,9 +174,10 @@ test('new image and video models use their current API shapes', () => {
 
   assert.match(openaiImage, /isGptImage2/)
   assert.match(openaiImage, /normalizeGptImage2Size/)
-  assert.match(geminiImage, /isGemini3Image/)
-  assert.match(geminiImage, /\/v1beta'[\s\S]*'\/interactions'/)
-  assert.match(geminiImage, /response_format/)
+  assert.match(geminiImage, /generateContent/)
+  assert.match(geminiImage, /inline_data/)
+  assert.match(geminiImage, /imageConfig/)
+  assert.doesNotMatch(geminiImage, /\/interactions/)
   assert.doesNotMatch(geminiImage, /Authorization': `Bearer/)
   assert.match(volcVideo, /doubao-seedance-2-0-mini-260615/)
   // Seedance 2.0 多模态能力

@@ -14,7 +14,9 @@ export interface Keyframe {
   title?: string
   offsetMs?: number
   useForVideo?: boolean
-  history?: { url: string; taskId?: number }[]
+  history?: { url: string; taskId?: number; source?: FrameSource }[]
+  source?: FrameSource
+  continuity?: string
   referenceImages?: string[]
   shotType?: string
   angle?: string
@@ -25,7 +27,15 @@ export interface Keyframe {
   locked: boolean
   taskId?: number
 }
+export interface FrameSource {
+  candidateId: number
+  mode: 'generate' | 'grid_edit' | 'frame_edit'
+  gridIndex: number
+  bounds: { left: number; top: number; width: number; height: number }
+  inputDigest?: string
+}
 export interface Panel {
+  continuityConstraints?: string
   id: number
   title: string
   description: string
@@ -213,8 +223,12 @@ export function normalizeTimeline(value: Timeline): Timeline {
       f.title ||= f.type === 'start' ? '开场画面' : f.type === 'end' ? '结束画面' : `画面 ${i + 1}`
       f.offsetMs ??= f.type === 'end' ? Math.max(0, p.durationMs - 1) : f.type === 'middle' ? Math.floor(p.durationMs / 2) : 0
       f.useForVideo = true
-      f.locked = false
+      f.locked ??= false
+      // Legacy SQL rows used null for absent task IDs; the public timeline uses
+      // optional IDs so it can be edited and saved without schema rejection.
+      if (f.taskId === null) delete f.taskId
       f.history ||= f.url ? [{ url: f.url, taskId: f.taskId }] : []
+      for (const entry of f.history) if (entry.taskId === null) delete entry.taskId
     })
     p.coverFrameId ||= p.frames.find(f => f.url)?.id
   }

@@ -95,6 +95,10 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
             <span class="plan-source" :class="plan.source"><Sparkles v-if="plan.source === 'ai'" :size="11" />{{ sourceLabel(plan) }}</span>
             <span class="plan-count">{{ plan.frames.length }} 张</span>
           </header>
+          <label class="plan-continuity">
+            <span>整组连续性约束</span>
+            <textarea v-model="plan.continuityConstraints" rows="2" maxlength="4000" aria-label="整组连续性约束" placeholder="人物、服装、背景、轴线和光线等需要保持一致的条件" :disabled="!editable || busy" />
+          </label>
           <article v-for="(frame, frameIndex) in plan.frames" :key="`${plan.panelId}-${frameIndex}`" class="plan-frame">
             <div class="plan-frame-head">
               <span class="plan-index">{{ String(frameIndex + 1).padStart(2, '0') }}</span>
@@ -107,6 +111,7 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
               ><Trash2 :size="13" /></button>
             </div>
             <textarea v-model="frame.prompt" rows="3" maxlength="4000" aria-label="画面提示词" :disabled="!editable || busy" />
+            <label class="plan-frame-continuity"><span>与前后画面的衔接</span><textarea v-model="frame.continuity" rows="2" maxlength="2000" aria-label="画面连续性要求" placeholder="例如：人物位置和视线沿用上一画面，仅抬起右手" :disabled="!editable || busy" /></label>
             <div class="plan-camera">
               <label>
                 <span>景别</span>
@@ -139,7 +144,7 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
       </div>
 
       <footer class="plan-footer">
-        <span class="plan-tip">应用后只写入画面（标题/提示词/时间点/景别/机位/构图），不会立即生成图片。</span>
+        <span class="plan-tip">应用后写入画面规划与连续性约束，保留已有图片，不会立即生成图片。</span>
         <div class="plan-actions">
           <button type="button" class="btn" :disabled="busy" @click="emit('close')">取消</button>
           <button type="button" class="btn btn-primary" :disabled="!canApply" @click="apply">应用 {{ totalFrames }} 张画面</button>
@@ -185,6 +190,9 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
 .plan-source.ai { color: var(--accent-text); }
 .plan-count { color: var(--text-2); font: 10px var(--font-mono); }
 .plan-frame { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.plan-continuity { display: flex; flex-direction: column; gap: 5px; padding: 9px 10px; font-size: 11px; color: var(--text-2); background: var(--surface-soft); }
+.plan-continuity textarea { padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-0); font: inherit; line-height: 1.6; resize: vertical; }
+.plan-frame-continuity { display: block; margin-top: 7px; font-size: 11px; color: var(--text-2); }
 .plan-frame:last-child { border-bottom: 0; }
 .plan-frame-head { display: flex; align-items: center; gap: 6px; }
 .plan-index { color: var(--text-3); font: 10px var(--font-mono); }

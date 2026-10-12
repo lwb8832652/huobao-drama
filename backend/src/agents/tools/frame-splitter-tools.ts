@@ -21,13 +21,61 @@ function requireIds(context: ToolContext): { episodeId: number; dramaId: number 
   return { episodeId, dramaId }
 }
 
-async function namesOf(table: 'characters' | 'props', ids: number[]) {
+function assetsOf(table: 'characters' | 'props', ids: number[], dramaId: number) {
   return ids.map(id => (table === 'characters'
     ? db.select().from(schema.characters).where(eq(schema.characters.id, id)).get()
     : db.select().from(schema.props).where(eq(schema.props.id, id)).get()))
-    .filter(Boolean)
-    .map(item => ({ id: item!.id, name: item!.name }))
-    .filter(item => item.name)
+    .filter(item => item && item.dramaId === dramaId && !item.deletedAt)
+    .map(item => table === 'characters' ? {
+      id: item!.id, name: item!.name, description: item!.description,
+      appearance: (item as typeof schema.characters.$inferSelect).appearance,
+      styling: (item as typeof schema.characters.$inferSelect).styling,
+      finalPrompt: item!.finalPrompt,
+    } : {
+      id: item!.id, name: item!.name, description: item!.description,
+      prompt: (item as typeof schema.props.$inferSelect).prompt, finalPrompt: item!.finalPrompt,
+    })
+}
+
+/** Shared readonly context used by the agent and the plan's input fingerprint. */
+export async function readFramePlanningContext(versionId: number, panelIds: number[], episodeId: number, dramaId: number) {
+  const row = db.select().from(schema.animaticVersions)
+    .where(eq(schema.animaticVersions.id, versionId)).get()
+  if (!row) return { error: 'Animatic version not found' }
+  if (row.episodeId !== episodeId) return { error: 'Animatic version does not belong to current episode' }
+  const episode = db.select().from(schema.episodes).where(eq(schema.episodes.id, episodeId)).get()
+  if (!episode || episode.dramaId !== dramaId) return { error: 'Episode does not belong to current drama' }
+
+  const timeline = normalizeTimeline(JSON.parse(row.timelineJson))
+  const style = await getDramaStylePrompt(dramaId)
+  const panels = []
+  for (const panelId of panelIds) {
+    const panel = timeline.panels.find(item => item.id === panelId)
+    if (!panel) { panels.push({ panelId, error: 'Panel not found in this version' }); continue }
+    const scene = panel.sceneId
+      ? db.select().from(schema.scenes).where(eq(schema.scenes.id, panel.sceneId)).get()
+      : null
+    panels.push({
+      panelId: panel.id, title: panel.title, description: panel.description,
+      videoPrompt: panel.videoPrompt, atmosphere: panel.atmosphere,
+      durationSeconds: Number(((panel.durationMs || 0) / 1000).toFixed(1)), durationMs: panel.durationMs,
+      shotType: panel.shotType, angle: panel.angle, movement: panel.movement,
+      continuityConstraints: panel.continuityConstraints,
+      scene: scene && scene.dramaId === dramaId && !scene.deletedAt ? {
+        id: scene.id, location: scene.location, time: scene.time,
+        prompt: scene.prompt, lighting: scene.lighting, finalPrompt: scene.finalPrompt,
+      } : { name: panel.scene },
+      characters: assetsOf('characters', panel.characterIds, dramaId),
+      props: assetsOf('props', panel.propIds, dramaId),
+      existingFrameCount: panel.frames.length,
+      existingFrames: panel.frames.map(frame => ({
+        id: frame.id, title: frame.title, offsetMs: frame.offsetMs, type: frame.type, url: frame.url, source: frame.source,
+        prompt: frame.prompt, shotType: frame.shotType, angle: frame.angle,
+        composition: frame.composition, continuity: frame.continuity,
+      })),
+    })
+  }
+  return { style: style || undefined, panels }
 }
 
 const readPrevisContext = createTool({
@@ -40,37 +88,7 @@ const readPrevisContext = createTool({
   execute: async (input, context) => {
     const ids = requireIds(context)
     if ('error' in ids) return ids
-    const { episodeId, dramaId } = ids
-    const row = db.select().from(schema.animaticVersions)
-      .where(eq(schema.animaticVersions.id, input.versionId)).get()
-    if (!row) return { error: 'Animatic version not found' }
-    if (row.episodeId !== episodeId) return { error: 'Animatic version does not belong to current episode' }
-
-    const timeline = normalizeTimeline(JSON.parse(row.timelineJson))
-    const style = await getDramaStylePrompt(dramaId)
-    const panels = []
-    for (const panelId of input.panelIds) {
-      const panel = timeline.panels.find(item => item.id === panelId)
-      if (!panel) { panels.push({ panelId, error: 'Panel not found in this version' }); continue }
-      const scene = panel.sceneId
-        ? db.select().from(schema.scenes).where(eq(schema.scenes.id, panel.sceneId)).get()
-        : null
-      panels.push({
-        panelId: panel.id,
-        title: panel.title,
-        description: panel.description,
-        atmosphere: panel.atmosphere,
-        durationSeconds: Number(((panel.durationMs || 0) / 1000).toFixed(1)),
-        shotType: panel.shotType,
-        angle: panel.angle,
-        movement: panel.movement,
-        scene: scene ? { id: scene.id, location: scene.location, time: scene.time } : { name: panel.scene },
-        characters: await namesOf('characters', panel.characterIds),
-        props: await namesOf('props', panel.propIds),
-        existingFrameCount: panel.frames.length,
-      })
-    }
-    return { style: style || undefined, panels }
+    return readFramePlanningContext(input.versionId, input.panelIds, ids.episodeId, ids.dramaId)
   },
 })
 

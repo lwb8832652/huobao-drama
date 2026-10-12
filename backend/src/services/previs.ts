@@ -22,6 +22,8 @@ const ms = z.number().int().min(0).max(86_400_000)
 const url = z.string().max(4000).refine(v => !v || /^(\/?static\/[^?#]+|https?:\/\/)/.test(v), '媒体地址必须为 static 路径或 HTTP(S) URL')
 const state = z.record(z.string().max(80), z.string().max(2000))
 const constraint = z.enum(['auto', 'first_last', 'first', 'reference', 'text'])
+const frameSource = z.object({ candidateId: id, mode: z.enum(['generate', 'grid_edit', 'frame_edit']), gridIndex: z.number().int().min(0).max(8),
+  bounds: z.object({ left: ms, top: ms, width: ms.min(1), height: ms.min(1) }), inputDigest: z.string().length(64).optional() })
 const referenceInputSchema = z.object({
   generationScope: z.enum(['storyboard', 'group']).optional(),
   version: z.literal(1), requested: z.enum(['auto', 'individual', 'contact_sheet']), effective: z.enum(['individual', 'contact_sheet']),
@@ -42,10 +44,11 @@ export const timelineSchema = z.object({
     characterIds: z.array(id), propIds: z.array(id), referenceImages: z.array(url).max(30), videoUrl: url,
     referenceLabels: z.array(text).max(30).optional(), sourceFingerprint: z.string().optional(),
     generation: z.object({ constraint, includeAssets: z.boolean() }).optional(),
-    coverFrameId: z.string().max(100).optional(),
+    coverFrameId: z.string().max(100).optional(), continuityConstraints: text.optional(),
     frames: z.array(z.object({
       id: z.string().min(1).max(100).optional(), title: z.string().max(200).optional(), offsetMs: ms.optional(),
-      useForVideo: z.boolean().optional(), history: z.array(z.object({ url, taskId: id.optional() })).max(200).optional(),
+      useForVideo: z.boolean().optional(), history: z.array(z.object({ url, taskId: id.optional(), source: frameSource.optional() })).max(200).optional(),
+      source: frameSource.optional(), continuity: text.optional(),
       referenceImages: z.array(url).max(30).optional(),
       shotType: z.string().max(200).optional(), angle: z.string().max(200).optional(), composition: z.string().max(1000).optional(),
       type: z.enum(['start', 'middle', 'end', 'beat']), url, prompt: text, locked: z.boolean(), taskId: id.optional(),
@@ -348,6 +351,7 @@ export function readBatches(versionId: number): BatchRun[] {
 }
 export function isBusy(versionId: number, batches = readBatches(versionId)) {
   return batches.some(b => b.type === 'image' && b.items.some(i => ['pending', 'processing'].includes(i.status)))
+    || db.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.versionId, versionId)).all().some(c => ['pending', 'processing'].includes(c.status))
 }
 export function getVersion(versionId: number): AnimaticVersion {
   const row = versionRow(versionId)
@@ -526,11 +530,18 @@ export function saveTimeline(versionId: number, revision: number, input: unknown
         return !old || (old.sourceFingerprint && old.sourceFingerprint !== p.sourceFingerprint)
       })) throw new PrevisError('分镜资料已在其他页面更新，请刷新当前工作版后重试。', 409)
     }
+    for (const p of original.panels) for (const frame of p.frames.filter(f => f.locked)) {
+      if (!timeline.panels.find(next => next.id === p.id)?.frames.some(f => frameKey(f) === frameKey(frame)))
+        throw new PrevisError('锁定画面不可删除，请先解除画面锁定', 409)
+    }
     for (const p of timeline.panels) {
       p.sourceFingerprint = hashContent(sourceMetadata(p))
       for (const f of p.frames) {
         const old = original.panels.find(o => o.id === p.id)?.frames.find(o => frameKey(o) === frameKey(f))
-        f.history = [...(old?.history || []), ...(old?.url ? [{ url: old.url, taskId: old.taskId }] : []), ...(f.url ? [{ url: f.url, taskId: f.taskId }] : [])]
+        if (old?.locked && hashContent(old) !== hashContent({ ...f, locked: true })) throw new PrevisError('锁定画面不可修改，请先解除画面锁定', 409)
+        const restored = old?.history?.find(h => h.url === f.url)
+        if (old) f.source = old.url === f.url ? old.source : restored?.source
+        f.history = [...(old?.history || []), ...(old?.url ? [{ url: old.url, taskId: old.taskId, source: old.source }] : []), ...(f.url ? [{ url: f.url, taskId: f.taskId, source: f.source }] : [])]
           .filter((h, i, all) => all.findIndex(v => v.url === h.url) === i).slice(-200)
       }
     }

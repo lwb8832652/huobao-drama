@@ -90,6 +90,8 @@ export interface ImageGenerationRecord {
   model?: string | null
   prompt?: string | null
   size?: string | null
+  /** Frozen grid geometry must be sent exactly; legacy callers allow size normalization. */
+  strictSize?: boolean
   frameType?: string | null
   referenceImages?: string | null
   // ... 其他字段

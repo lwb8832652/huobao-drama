@@ -26,6 +26,7 @@ import serverUpdate from './routes/serverUpdate.js'
 import previs from './routes/previs.js'
 import { startPrevisWorker } from './services/previs-batch.js'
 import { startFramePlanWorker } from './services/previs-frames.js'
+import { startGridWorker } from './services/previs-grid.js'
 import { startContactSheetWorker } from './services/previs-contact-sheets.js'
 import { requestLogger, errorHandler } from './middleware/logger.js'
 import { serveStaticRanges } from './middleware/static-range.js'
@@ -114,3 +115,5 @@ serve({ fetch: app.fetch, port })
 void startPrevisWorker().catch(err => console.error('Previs worker startup failed:', err.message))
 void startContactSheetWorker().catch(err => console.error('Contact sheet worker startup failed:', err.message))
 void startFramePlanWorker().catch(err => console.error('Frame plan worker startup failed:', err.message))
+
+void startGridWorker().catch(err => console.error('Grid candidate worker startup failed:', err.message))

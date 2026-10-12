@@ -8,6 +8,7 @@
  */
 import { and, desc, eq, inArray } from 'drizzle-orm'
 import { z } from 'zod'
+import { randomUUID } from 'node:crypto'
 import { mastra } from '../mastra/index.js'
 import { buildAgentRequestContext } from '../agents/context.js'
 import { db, schema } from '../db/index.js'
@@ -15,11 +16,13 @@ import { getActiveConfigId, getConfigById } from './ai.js'
 import { normalizeTimeline, panelImageFallback, type FrameType, type Panel } from './previs-domain.js'
 import { hashContent, PrevisError, episodeForPrevis, requireEditable, versionRow } from './previs.js'
 import { FRAME_COUNT_MIN, FRAME_COUNT_MAX } from './previs-frame-contract.js'
+import { readFramePlanningContext } from '../agents/tools/frame-splitter-tools.js'
 
 export { FRAME_COUNT_MIN, FRAME_COUNT_MAX, FRAME_COUNT_OPTIONS } from './previs-frame-contract.js'
 const FRAME_PLAN_LEASE_MS = 30 * 60 * 1000
 
 export interface FramePlanDraft {
+  id?: string
   title: string
   prompt: string
   offsetMs: number
@@ -28,6 +31,7 @@ export interface FramePlanDraft {
   shotType?: string
   angle?: string
   composition?: string
+  continuity?: string
 }
 export interface PanelFramePlan {
   taskId: number
@@ -35,6 +39,7 @@ export interface PanelFramePlan {
   panelTitle: string
   count: number
   source: 'ai' | 'rule'
+  continuityConstraints?: string
   frames: FramePlanDraft[]
 }
 export interface PlanFramesOptions {
@@ -55,6 +60,7 @@ export interface FramePlanStatus {
 }
 
 const planItemSchema = z.object({
+  id: z.string().trim().min(1).max(200).nullish(),
   title: z.string().trim().min(1).max(200),
   prompt: z.string().trim().min(1).max(4000),
   // 三个镜头参数用 nullish 而非 optional：提示词要求「未变化时填 null」，
@@ -62,8 +68,13 @@ const planItemSchema = z.object({
   shotType: z.string().trim().max(50).nullish(),
   angle: z.string().trim().max(50).nullish(),
   composition: z.string().trim().max(500).nullish(),
+  continuity: z.string().trim().max(2000).nullish(),
+  offsetMs: z.number().int().nullish(),
 })
-const planResultSchema = z.object({ frames: z.array(planItemSchema).min(1).max(FRAME_COUNT_MAX) })
+const planResultSchema = z.object({
+  continuityConstraints: z.string().trim().max(4000).nullish(),
+  frames: z.array(planItemSchema).min(1).max(FRAME_COUNT_MAX),
+})
 
 /** 按时长给出默认画面数：短镜头不必拆太碎，长镜头需要更多中间过程。 */
 export function suggestedFrameCount(panel: Panel) {
@@ -100,16 +111,36 @@ function optionalText(value: unknown): string | undefined {
   const text = String(value ?? '').trim()
   return text || undefined
 }
-function draftFrames(count: number, durationMs: number, source: { title: string; prompt: string; shotType?: string | null; angle?: string | null; composition?: string | null }[]): FramePlanDraft[] {
-  return source.slice(0, count).map((item, index) => ({
+type DraftSource = z.infer<typeof planItemSchema>
+function validOffsets(offsets: unknown[], count: number, durationMs: number): offsets is number[] {
+  return offsets.length === count && offsets.every((offset, index) => typeof offset === 'number'
+    && Number.isInteger(offset) && offset >= 0 && offset < durationMs && (index === 0 || offset > Number(offsets[index - 1])))
+}
+function draftFrames(panel: Panel, count: number, source: DraftSource[]): FramePlanDraft[] {
+  const items = source.slice(0, count)
+  const existingOffsets = panel.frames.map(frame => frame.offsetMs)
+  const proposedOffsets = items.map(item => item.offsetMs)
+  const offsets = validOffsets(existingOffsets, count, panel.durationMs) ? existingOffsets
+    : validOffsets(proposedOffsets, count, panel.durationMs) ? proposedOffsets
+    : items.map((_, index) => offsetAt(index, count, panel.durationMs))
+  return items.map((item, index) => ({
+    id: panel.frames[index]?.id || randomUUID(),
     title: item.title.trim() || (index === 0 ? '开场画面' : index === count - 1 ? '结束画面' : `画面 ${index + 1}`),
     prompt: item.prompt.trim(),
-    offsetMs: offsetAt(index, count, durationMs),
+    offsetMs: offsets[index],
     type: frameTypeAt(index, count),
     shotType: optionalText(item.shotType),
     angle: optionalText(item.angle),
     composition: optionalText(item.composition),
+    continuity: optionalText(item.continuity),
   })).filter(frame => frame.prompt)
+}
+
+/** Old plan fields remain readable; AI generation separately requires the continuity contract. */
+export function normalizeFramePlan(panel: Panel, count: number, input: unknown): { frames: FramePlanDraft[]; continuityConstraints?: string } | null {
+  const parsed = planResultSchema.safeParse(input)
+  if (!parsed.success || parsed.data.frames.length !== count) return null
+  return { frames: draftFrames(panel, count, parsed.data.frames), continuityConstraints: optionalText(parsed.data.continuityConstraints) }
 }
 
 /** 规则兜底：描述分句优先，句数不足时用时点提示补足。 */
@@ -134,14 +165,22 @@ export function ruleFrames(panel: Panel, count: number): FramePlanDraft[] {
       angle: panel.angle,
     }
   })
-  return draftFrames(count, panel.durationMs, items)
+  return draftFrames(panel, count, items.map((item, index) => ({
+    ...item,
+    continuity: index === 0 ? `规则草稿：起始静态状态「${item.prompt}」，请人工核对动作阶段。`
+      : `规则草稿：上一格「${items[index - 1].prompt}」→变化需人工核对→当前格「${item.prompt}」。`,
+  })))
 }
 
-function planInputHash(panel: Panel) {
+export function planInputHash(panel: Panel, context?: unknown) {
   return hashContent({
-    description: panel.description, atmosphere: panel.atmosphere, durationMs: panel.durationMs,
+    description: panel.description, videoPrompt: panel.videoPrompt, imagePrompt: panel.imagePrompt,
+    atmosphere: panel.atmosphere, durationMs: panel.durationMs,
     shotType: panel.shotType, angle: panel.angle, movement: panel.movement,
     scene: panel.scene, characterIds: panel.characterIds, propIds: panel.propIds,
+    frames: panel.frames.map(frame => ({ id: frame.id, title: frame.title, prompt: frame.prompt, offsetMs: frame.offsetMs, url: frame.url, source: frame.source,
+      type: frame.type, shotType: frame.shotType, angle: frame.angle, composition: frame.composition, continuity: frame.continuity })),
+    continuityConstraints: panel.continuityConstraints, context,
   })
 }
 
@@ -153,7 +192,7 @@ function parseJsonObject(text: string): unknown {
 
 type PlanRow = typeof schema.framePlans.$inferSelect
 
-async function aiFrames(row: PlanRow, panel: Panel): Promise<FramePlanDraft[] | null> {
+async function aiFrames(row: PlanRow, panel: Panel): Promise<ReturnType<typeof normalizeFramePlan>> {
   try {
     const version = versionRow(row.versionId)
     const episode = episodeForPrevis(version.episodeId)
@@ -170,9 +209,8 @@ async function aiFrames(row: PlanRow, panel: Panel): Promise<FramePlanDraft[] | 
       content: `请把镜头「${panel.title}」（panelId=${panel.id}）拆成 ${row.count} 张画面。先调用 read_previs_context 读取 versionId=${version.id} 的镜头资料。`,
     }], { maxSteps: 3, requestContext })
     const parsed = planResultSchema.safeParse(parseJsonObject(response.text))
-    if (!parsed.success || !parsed.data.frames.length) return null
-    const frames = draftFrames(Math.min(row.count, parsed.data.frames.length), panel.durationMs, parsed.data.frames)
-    return frames.length ? frames : null
+    if (!parsed.success || !parsed.data.continuityConstraints || parsed.data.frames.some(frame => !frame.continuity)) return null
+    return normalizeFramePlan(panel, row.count, parsed.data)
   } catch {
     return null
   }
@@ -192,12 +230,14 @@ export async function startFramePlan(versionId: number, options: PlanFramesOptio
   const configId = options.configId || await getActiveConfigId('text') || 0
   const config = configId ? await getConfigById(configId) : null
   const model = options.model || config?.model || ''
+  const episode = episodeForPrevis(row.episodeId)
   const ts = new Date().toISOString()
   let queued = 0
   const taskIds: number[] = []
 
   for (const panel of targets) {
-    const inputHash = planInputHash(panel)
+    const context = await readFramePlanningContext(versionId, [panel.id], episode.id, episode.dramaId)
+    const inputHash = planInputHash(panel, context)
     const count = clampCount(options.count, suggestedFrameCount(panel))
     const existing = db.select().from(schema.framePlans)
       .where(and(
@@ -251,10 +291,12 @@ async function processOne(row: PlanRow) {
       const panel = timeline.panels.find(item => item.id === row.panelId)
       if (!panel) throw new Error('镜头不存在，可能已从版本中移除')
       const ai = await aiFrames(row, panel)
-      const frames = ai || ruleFrames(panel, row.count)
+      const frames = ai?.frames || ruleFrames(panel, row.count)
+      const continuityConstraints = ai?.continuityConstraints || panel.continuityConstraints
+        || '规则草稿：人物身份与服装、场景空间、光源和道具外观须由用户审阅确认；动作衔接尚未通过 AI 连续性审查。'
       db.update(schema.framePlans).set({
         status: 'completed',
-        resultJson: JSON.stringify({ source: ai ? 'ai' : 'rule', frames }),
+        resultJson: JSON.stringify({ source: ai ? 'ai' : 'rule', continuityConstraints, frames }),
         error: null,
         createdAt: new Date().toISOString(),
       }).where(eq(schema.framePlans.id, row.id)).run()
@@ -291,8 +333,9 @@ export function listFramePlans(versionId: number) {
   for (const item of rows) {
     if (item.status !== 'completed') continue
     try {
-      const parsed = JSON.parse(item.resultJson) as { source: 'ai' | 'rule'; frames: FramePlanDraft[] }
-      plans.push({ taskId: item.id, panelId: item.panelId, panelTitle: titleOf(item.panelId), count: parsed.frames.length, source: parsed.source, frames: parsed.frames })
+      const parsed = JSON.parse(item.resultJson) as { source: 'ai' | 'rule'; continuityConstraints?: string; frames: FramePlanDraft[] }
+      plans.push({ taskId: item.id, panelId: item.panelId, panelTitle: titleOf(item.panelId), count: parsed.frames.length,
+        source: parsed.source, continuityConstraints: parsed.continuityConstraints, frames: parsed.frames })
     } catch { /* 忽略损坏结果 */ }
   }
   const count = (status: string) => rows.filter(item => item.status === status).length

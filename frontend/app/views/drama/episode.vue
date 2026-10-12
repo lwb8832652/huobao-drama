@@ -631,11 +631,11 @@
                     <span class="video-inspector-label">{{ t('episode.sb.descSection') }}</span>
                     <label class="field">
                       <span class="field-label">{{ t('episode.sb.descLabel') }} <span class="dim">({{ t('episode.sb.descHint') }})</span></span>
-                      <textarea :value="selectedSb.description || ''" class="textarea" rows="7" @blur="updateField(selectedSb, 'description', $event.target.value)" :placeholder="t('episode.sb.descPlaceholder')" />
+                      <textarea :value="selectedSb.description || ''" class="textarea" rows="7" :disabled="productionWorking" @blur="updateField(selectedSb, 'description', $event.target.value)" :placeholder="t('episode.sb.descPlaceholder')" />
                     </label>
                     <label class="field">
                       <span class="field-label">{{ t('episode.sb.atmosphere') }}</span>
-                      <textarea :value="selectedSb.atmosphere || ''" class="textarea" rows="2" @blur="updateField(selectedSb, 'atmosphere', $event.target.value)" :placeholder="t('episode.sb.atmospherePlaceholder')" />
+                      <textarea :value="selectedSb.atmosphere || ''" class="textarea" rows="2" :disabled="productionWorking" @blur="updateField(selectedSb, 'atmosphere', $event.target.value)" :placeholder="t('episode.sb.atmospherePlaceholder')" />
                     </label>
                   </section>
 
@@ -690,14 +690,24 @@
                       <button type="button" class="btn btn-icon btn-sm" title="收起分镜画面" aria-label="收起分镜画面"
                         @click="directFramesExpanded = false"><ChevronUp :size="15" /></button>
                     </div>
+                    <StoryboardGridTools
+                      v-if="productionVersion"
+                      :key="`grid-${productionVersion.id}-${productionPanel.id}`"
+                      :panel="productionPanel" :version-id="productionVersion.id" :revision="productionVersion.revision"
+                      :config-id="productionGridModel?.configId" :model="productionGridModel?.model"
+                      :aspect-ratio="dramaAspectRatio"
+                      :editable="productionEditable && !productionFramePlanBusy"
+                      :management-editable="productionGeneratable && !productionWorking"
+                      :before-action="beforeProductionGridAction" :commit-adoption="adoptProductionGridCandidate" @busy="productionGridBusy = $event"
+                    />
                     <StoryboardFramesEditor
                       :panel="productionPanel"
                       :contact-sheet="productionSheetById(productionPanel.id)"
-                      :generatable="productionGeneratable"
+                      :generatable="productionGeneratable && !productionGridBusy"
                       :video-input-ready="productionReferenceState(productionPanel.id).ready"
                       :video-input-error="productionReferenceState(productionPanel.id).error"
                       @retry-sheet="retryProductionContactSheet(productionPanel.id)"
-                      :editable="productionEditable && !productionFramePlanBusy"
+                      :editable="productionEditable && !productionFramePlanBusy && !productionGridBusy"
                       :tasks="productionImageTasks"
                       :video-generation-mode="videoGenerationMode"
                       :title="videoUsesStoryboardFrames ? '2 · 分镜画面' : '分镜画面 · 仅用于预演'"
@@ -726,13 +736,14 @@
                       <button
                         type="button"
                         class="btn btn-sm"
-                        :disabled="videoPromptGeneratingIds.includes(selectedSb?.id) || videoPromptBatch.running"
+                        :disabled="productionWorking || videoPromptGeneratingIds.includes(selectedSb?.id) || videoPromptBatch.running"
                         @click="genVideoPrompt(selectedSb)"
                       >
                         <Loader2 v-if="videoPromptGeneratingIds.includes(selectedSb?.id)" :size="11" class="animate-spin" />
                         {{ (selectedSb.video_prompt || selectedSb.videoPrompt) ? t('episode.sb.regenPrompt') : t('episode.sb.aiGenerate') }}
                       </button>
                     </div>
+                    <fieldset :disabled="productionWorking" style="border: 0; padding: 0; margin: 0; min-width: 0">
                     <MentionTextarea
                       :model-value="selectedSb.video_prompt || selectedSb.videoPrompt || ''"
                       :options="mentionOptions"
@@ -741,6 +752,7 @@
                       :placeholder="t('episode.inspector.videoPromptPlaceholder')"
                       @commit="v => updateField(selectedSb, 'video_prompt', v)"
                     />
+                    </fieldset>
                   </section>
               </div>
               </div>
@@ -1525,6 +1537,7 @@ import { useAgent } from '~/composables/useAgent'
 import { toastError, mapError, MODERATION_RE } from '~/composables/useToast'
 import LocaleSwitcher from '~/components/LocaleSwitcher.vue'
 import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.vue'
+import StoryboardGridTools from '~/components/previs/StoryboardGridTools.vue'
 import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
 import StoryboardContactSheet from '~/components/previs/StoryboardContactSheet.vue'
 import { contactSheetForPanel, videoReferenceReadiness, videoGenerationScopeError, previsRequest, mediaUrl, useFramePlanner, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy } from '~/composables/usePrevis'
@@ -1541,7 +1554,7 @@ const drama = ref(null), episode = ref(null), chars = ref([]), scenes = ref([]),
 const {
   version: productionVersion, timeline: productionTimeline, editable: productionEditable,
   generatable: productionGeneratable, retryContactSheet: retryProductionContactSheet, working: productionWorking, initialize: initializeProduction, create: createProduction,
-  edit: editProduction, save: saveProduction, generate: generateProduction,
+  edit: editProduction, save: saveProduction, generate: generateProduction, adoptGridCandidate: adoptProductionGridCandidate,
 } = usePrevis()
 const {
   open: productionFramePlanOpen, busy: productionFramePlanBusy,
@@ -1558,6 +1571,7 @@ const videoUsesStoryboardFrames = computed(() => videoGenerationMode.value === '
 const videoGenerationModeLabel = computed(() =>
   videoUsesStoryboardFrames.value ? '依赖分镜画面' : '直接生成')
 const directFramesExpanded = ref(false)
+const productionGridBusy = ref(false)
 watch(videoGenerationMode, value => {
   if (value === 'direct') directFramesExpanded.value = false
 })
@@ -2847,6 +2861,11 @@ function updateProductionFrames(frames, coverFrameId) {
     if (target) { target.frames = frames; target.coverFrameId = coverFrameId }
   })
 }
+const productionGridModel = computed(() => imageModelOptions.value.find(item => item.key === imageModel.value) || imageModelOptions.value[0])
+async function beforeProductionGridAction() {
+  if (!await saveProduction() || !productionVersion.value) return false
+  return { versionId: productionVersion.value.id, revision: productionVersion.value.revision }
+}
 async function generateProductionFrames(frameIds, force = false) {
   const target = productionPanel.value
   const option = imageModelOptions.value.find(item => item.key === imageModel.value) || imageModelOptions.value[0]
@@ -2864,6 +2883,7 @@ const selectedVideoTaskNumber = computed(() => {
 })
 
 function updateField(sb, field, value) {
+  if (productionWorking.value) return
   const current = sb[field] ?? sb[toCamel(field)]
   if (current === value) return
   sb[field] = value
@@ -3181,7 +3201,7 @@ async function onBreakdownDone() {
 
 // 按需为单个分镜生成视频提示词：由 prompt_generator 读取分镜字段生成并保存到 video_prompt
 async function genVideoPrompt(sb) {
-  if (!sb || videoPromptGeneratingIds.value.includes(sb.id)) return
+  if (productionWorking.value || !sb || videoPromptGeneratingIds.value.includes(sb.id)) return
   const idx = sbs.value.indexOf(sb) + 1
   const cfg = selectedVideoConfig.value
   const label = cfg ? `${cfg.name} (${cfg.provider})` : '默认'

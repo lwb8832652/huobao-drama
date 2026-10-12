@@ -14,6 +14,8 @@ import type {
 } from './types'
 import { joinProviderUrl } from './url'
 import { parseDataUrl } from '../../utils/storage.js'
+import { assertImageReferenceSupport, parseImageReferences } from './reference-images.js'
+import { gridImageCapabilities } from '../previs-grid-capabilities.js'
 
 export class GeminiImageAdapter implements ImageProviderAdapter {
   provider = 'gemini'
@@ -21,50 +23,18 @@ export class GeminiImageAdapter implements ImageProviderAdapter {
   buildGenerateRequest(config: AIConfig, record: ImageGenerationRecord): ProviderRequest {
     // Gemini 模型名格式: "models/gemini-3-pro-image" 或直接 "gemini-3-pro-image"
     const modelName = record.model || config.model || 'gemini-3-pro-image'
-    // interactions 端点仅官方 API 可用;中转站(new-api 类)普遍未配置该端点类型,
-    // 会报 "endpointType=GEMINI_INTERACTIONS 未启用",此类端点回退到 generateContent 分支
-    const isGemini3Image = /gemini-3.*image/.test(modelName)
-    const isOfficialHost = /generativelanguage\.googleapis\.com/.test(config.baseUrl || '')
-
-    if (isGemini3Image && isOfficialHost) {
-      return {
-        url: joinProviderUrl(config.baseUrl, '/v1beta', '/interactions'),
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': config.apiKey,
-        },
-        body: {
-          model: modelName.replace(/^models\//, ''),
-          input: record.prompt || 'Generate an image',
-          response_format: {
-            type: 'image',
-            aspect_ratio: this.parseAspectRatio(record.size),
-            image_size: this.parseImageSize(record.size),
-          },
-        },
-      }
-    }
-
+    const refs = parseImageReferences(record.referenceImages)
+    assertImageReferenceSupport(config, modelName, refs)
     const model = modelName.startsWith('models/') ? modelName : `models/${modelName}`
+    const caps = gridImageCapabilities(config, modelName)
+    const nativeSize = caps.sizes.find(item => item.size === record.size)
 
     // Google REST 风格请求体
     const parts: any[] = []
-    if (record.referenceImages) {
-      try {
-        const refs = JSON.parse(record.referenceImages)
-        for (const ref of refs) {
-          const parsed = parseDataUrl(String(ref || ''))
-          if (parsed) {
-            parts.push({
-              inline_data: {
-                mime_type: parsed.mimeType,
-                data: parsed.data,
-              },
-            })
-          }
-        }
-      } catch {}
+    for (const [index, ref] of refs.entries()) {
+      const parsed = parseDataUrl(ref)
+      if (!parsed) throw new Error(`参考图片 ${index + 1} 必须先转换为 data URL`)
+      parts.push({ inline_data: { mime_type: parsed.mimeType, data: parsed.data } })
     }
     parts.push({ text: record.prompt || 'Generate an image' })
 
@@ -76,8 +46,8 @@ export class GeminiImageAdapter implements ImageProviderAdapter {
         responseModalities: ['IMAGE', 'TEXT'],
         imageConfig: {
           // 解析 size 如 "1920x1080" -> aspectRatio
-          aspectRatio: this.parseAspectRatio(record.size),
-          imageSize: this.parseImageSize(record.size),
+          aspectRatio: nativeSize?.aspectRatio || this.parseAspectRatio(record.size, caps.aspectRatios),
+          ...(!/^models\/gemini-2\.5-flash-image/.test(model) ? { imageSize: nativeSize?.resolution || this.parseImageSize(record.size) } : {}),
         },
       },
     }
@@ -164,6 +134,7 @@ export class GeminiImageAdapter implements ImageProviderAdapter {
 
     const parts = result.candidates?.[0]?.content?.parts || []
     for (const part of parts) {
+      if (part.thought === true) continue
       if (part.inlineData || part.inline_data) {
         const inline = part.inlineData || part.inline_data
         return {
@@ -175,22 +146,27 @@ export class GeminiImageAdapter implements ImageProviderAdapter {
     return null
   }
 
-  private parseAspectRatio(size?: string | null): string {
+  private parseAspectRatio(size?: string | null, supported: string[] = []): string {
     if (!size) return '16:9'
     const [w, h] = size.split('x').map(Number)
     if (!w || !h) return '16:9'
+    // Native Gemini sizes approximate their ratio names (1376x768 is the native 16:9 output).
+    const nearest = supported.find(ratio => {
+      const [rw, rh] = ratio.split(':').map(Number)
+      return Math.abs((w / h) / (rw / rh) - 1) < 0.02
+    })
+    if (nearest) return nearest
     const gcd = this.gcd(w, h)
     return `${w / gcd}:${h / gcd}`
   }
 
   private parseImageSize(size?: string | null): string {
     if (!size) return '1K'
-    const [w] = size.split('x').map(Number)
-    if (!w) return '1K'
-    if (w >= 2048) return '4K'
-    if (w >= 1024) return '2K'
-    if (w >= 512) return '1K'
-    return '512'
+    const [w, h] = size.split('x').map(Number)
+    const longest = Math.max(w || 0, h || 0)
+    if (longest >= 4096) return '4K'
+    if (longest >= 2048) return '2K'
+    return '1K'
   }
 
   private gcd(a: number, b: number): number {

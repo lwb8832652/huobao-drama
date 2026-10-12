@@ -12,6 +12,7 @@ import type {
   ImagePollResponse,
 } from './types'
 import { joinProviderUrl } from './url'
+import { assertImageReferenceSupport, parseImageReferences } from './reference-images.js'
 
 export class VolcEngineImageAdapter implements ImageProviderAdapter {
   provider = 'volcengine'
@@ -19,20 +20,18 @@ export class VolcEngineImageAdapter implements ImageProviderAdapter {
   buildGenerateRequest(config: AIConfig, record: ImageGenerationRecord): ProviderRequest {
     // 火山引擎使用 seedream 模型
     const model = record.model || config.model || 'doubao-seedream-5-0-260128'
+    const refs = parseImageReferences(record.referenceImages)
+    assertImageReferenceSupport(config, model, refs)
 
     const body: any = {
       model,
       prompt: record.prompt,
+      size: record.size || '2K',
+      response_format: 'url',
+      watermark: false,
     }
-
-    // 尺寸参数
-    if (record.size) {
-      const [w, h] = record.size.split('x')
-      if (w && h) {
-        body.width = parseInt(w)
-        body.height = parseInt(h)
-      }
-    }
+    if (refs.length) body.image = refs
+    if (!/^doubao-seedream-5-0-(?:pro|flash)-/.test(model)) body.sequential_image_generation = 'disabled'
 
     return {
       url: joinProviderUrl(config.baseUrl, '/api/v3', '/images/generations'),

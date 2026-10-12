@@ -27,11 +27,11 @@ import {
   findMediaBase64,
   findMediaUrl,
   nuwaxNoMediaError,
-  parseUrlArray,
   renderExtraParams,
   resolveWorkflowSettings,
   stripMediaRefs,
 } from './nuwax-shared'
+import { assertImageReferenceSupport, parseImageReferences } from './reference-images.js'
 
 export class NuwaxImageAdapter implements ImageProviderAdapter {
   provider = 'nuwax'
@@ -39,7 +39,8 @@ export class NuwaxImageAdapter implements ImageProviderAdapter {
   buildGenerateRequest(config: AIConfig, record: ImageGenerationRecord): ProviderRequest {
     const workflowId = extractWorkflowId(record.model || config.model)
     const wf = resolveWorkflowSettings(config)
-    const refs = parseUrlArray(record.referenceImages)
+    const refs = parseImageReferences(record.referenceImages)
+    assertImageReferenceSupport(config, record.model || config.model, refs)
 
     const body: Record<string, unknown> = {
       // 附加参数先铺，随后提示词覆盖同名 key，保证提示词始终以 promptKey 为准

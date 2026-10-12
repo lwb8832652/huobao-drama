@@ -1,8 +1,9 @@
+import { hasGridTask } from './previs-grid.js'
 import { and, eq, gt, inArray } from 'drizzle-orm'
 import { db, schema } from '../db/index.js'
 import { getActiveConfigId, getConfigById } from './ai.js'
 import { getImageAdapter, getVideoAdapter } from './adapters/registry.js'
-import { generateImage, generateVideo, recoverPrevisTasks, startQueuedPrevisTask } from './generation.js'
+import { generateImage, generateVideo, recoverPrevisTasks, startQueuedPrevisTask, cancelUnsubmittedPrevisTask } from './generation.js'
 import { now } from '../utils/response.js'
 import { getDramaStylePrompt } from './style-preset.js'
 import { FRAME_COUNT_MAX } from './previs-frame-contract.js'
@@ -83,7 +84,10 @@ export async function createBatch(versionId: number, options: BatchOptions) {
   const t = normalizeTimeline(raw)
   if (row.revision !== options.revision) throw new PrevisError('版本已更新，请刷新后生成', 409)
   if (row.status === 'locked' && row.contentHash !== hashContent(raw)) throw new PrevisError('锁定版本内容校验失败', 409)
-  if (options.type === 'image') requireEditable(versionId, options.revision)
+  if (options.type === 'image') {
+    requireEditable(versionId, options.revision)
+    if (hasGridTask(versionId, options.panelIds)) throw new PrevisError('所选分镜正在生成宫格，请等待或取消后再逐张生成', 409)
+  }
   if (options.type === 'video' && options.generationMode === 'storyboard_frames') {
     const oversized = t.panels.find(panel => (!options.panelIds?.length || options.panelIds.includes(panel.id))
       && panel.frames.length > FRAME_COUNT_MAX)
@@ -119,6 +123,7 @@ export async function createBatch(versionId: number, options: BatchOptions) {
           if (options.frameTypes?.length && !options.frameTypes.includes(type)) continue
           if (options.frameIds?.length && !options.frameIds.includes(frameKey(frame))) continue
           if (frame.url && !options.force) continue
+          if (frame.locked) throw new PrevisError('画面已锁定，请解除画面锁定后再生成', 409)
           const referenceImages = frame.referenceImages ?? panel.referenceImages
           if (!referenceImages.length) {
             throw new PrevisError(`「${panel.title} / ${frame.title || '分镜画面'}」尚未选择资产参考素材，请先绑定角色、场景或道具图片`)
@@ -211,7 +216,10 @@ export async function createBatch(versionId: number, options: BatchOptions) {
     : baseHash
   db.transaction(tx => {
     // Config lookup above is asynchronous; recheck revision and locks inside the write transaction.
-    if (options.type === 'image') requireEditable(versionId, options.revision)
+    if (options.type === 'image') {
+      requireEditable(versionId, options.revision)
+      if (hasGridTask(versionId, options.panelIds)) throw new PrevisError('所选分镜正在生成宫格，请等待或取消后再逐张生成', 409)
+    }
     else {
       if (versionRow(versionId).revision !== options.revision) throw new PrevisError('版本已更新，请刷新后生成', 409)
       const currentDrama = tx.select().from(schema.dramas).where(eq(schema.dramas.id, ep.dramaId)).get()
@@ -288,7 +296,7 @@ function reconcile() {
     const batchItems = itemsByBatch.get(batch.id) || []
     for (const item of batchItems.filter(i => i.status === 'processing')) {
       const task = item.taskId ? taskById.get(item.taskId) : null
-      if (!task || !['completed', 'failed'].includes(task.status || '')) continue
+      if (!task || !['completed', 'failed', 'cancelled'].includes(task.status || '')) continue
       const siblings = task.status === 'completed' ? siblingsFor(batch) : []
       db.transaction(tx => {
         if (task.status === 'completed') {
@@ -303,16 +311,17 @@ function reconcile() {
               const frame = panel.frames.find(f => request.frameId ? frameKey(f) === request.frameId : f.type === item.frameType)
               const newer = siblings.some(i => i.id > item.id && i.panelId === item.panelId
                 && (JSON.parse(i.requestJson).frameId || i.frameType) === (request.frameId || item.frameType))
-              if (frame && url) {
+              if (frame && url && !frame.locked) {
                 frame.history = [
                   ...(frame.history || []),
-                  ...(frame.url ? [{ url: frame.url, taskId: frame.taskId }] : []),
+                  ...(frame.url ? [{ url: frame.url, taskId: frame.taskId, source: frame.source }] : []),
                   { url, taskId: task.id },
                 ].filter((entry, index, all) =>
                   entry.url && all.findIndex(candidate => candidate.url === entry.url) === index,
                 ).slice(-200)
                 if (!newer && (!request.inputHash || request.inputHash === frameFingerprint(frame, panel))) {
                   frame.url = url; frame.taskId = task.id
+                  frame.source = undefined
                   panel.coverFrameId ||= frameKey(frame)
                 }
                 changed = true
@@ -364,6 +373,12 @@ export async function tickPrevisBatches() {
   ticking = true
   try {
     reconcile()
+    // Shared configuration slots may leave linked tasks pending. Retry their
+    // existing IDs each tick; never recreate a paid job when a slot frees up.
+    for (const item of db.select().from(schema.batchRunItems)
+      .where(eq(schema.batchRunItems.status, 'processing')).all().filter(item => item.taskId)) {
+      await startQueuedPrevisTask(item.taskId!)
+    }
     const batches = db.select().from(schema.batchRuns)
       .where(inArray(schema.batchRuns.status, ['pending', 'processing'])).all()
     const processingItems = db.select().from(schema.batchRunItems)
@@ -432,12 +447,29 @@ export function updateBatch(batchId: number, action: 'retry' | 'cancel', itemIds
   if (action === 'retry' && batch.type === 'image') requireEditable(row.id, row.revision)
   db.transaction(tx => {
     const items = tx.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.batchId, batchId)).all()
+    if (action === 'retry' && batch.type === 'image') {
+      const timeline = normalizeTimeline(JSON.parse(row.timelineJson))
+      for (const item of items.filter(item => item.status === 'failed' && (!itemIds?.length || itemIds.includes(item.id)))) {
+        const request = JSON.parse(item.requestJson)
+        const frame = timeline.panels.find(panel => panel.id === item.panelId)?.frames.find(frame =>
+          request.frameId ? frameKey(frame) === request.frameId : frame.type === item.frameType)
+        if (frame?.locked) throw new PrevisError('画面已锁定，请解除画面锁定后再重试', 409)
+      }
+    }
+    if(action==='retry'&&batch.type==='image'&&hasGridTask(row.id,items.filter(i=>i.status==='failed'&&(!itemIds?.length||itemIds.includes(i.id))).flatMap(i=>i.panelId?[i.panelId]:[]))) {
+      throw new PrevisError('该分镜正在生成宫格，请等待或取消后重试逐张生图',409)
+    }
     for (const item of items) {
       if (itemIds?.length && !itemIds.includes(item.id)) continue
       if (action === 'retry' && item.status === 'failed') tx.update(schema.batchRunItems)
         .set({ status: 'pending', error: null, taskId: null, attempt: item.attempt + 1 }).where(eq(schema.batchRunItems.id, item.id)).run()
       if (action === 'cancel' && item.status === 'pending') tx.update(schema.batchRunItems)
         .set({ status: 'cancelled' }).where(eq(schema.batchRunItems.id, item.id)).run()
+      if (action === 'cancel' && item.status === 'processing' && item.taskId) {
+        cancelUnsubmittedPrevisTask(item.taskId)
+        if (tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, item.taskId)).get()?.status === 'cancelled')
+          tx.update(schema.batchRunItems).set({ status: 'cancelled' }).where(eq(schema.batchRunItems.id, item.id)).run()
+      }
     }
     tx.update(schema.batchRuns).set({ status: action === 'cancel' ? 'cancelled' : 'pending' }).where(eq(schema.batchRuns.id, batchId)).run()
   })

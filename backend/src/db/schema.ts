@@ -292,3 +292,5 @@ export const appSettings = sqliteTable('app_settings', {
   value: text('value').notNull(),
   updatedAt: text('updated_at').notNull(),
 })
+
+export { gridCandidates } from './previs-grid-schema.js'

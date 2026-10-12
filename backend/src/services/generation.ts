@@ -3,6 +3,9 @@
  * 创建(processing) → 适配器构建请求 → 同步完成或异步轮询 → 下载落盘 → 回写业务表
  */
 import { db, getInsertId, schema } from '../db/index.js'
+import { hashContent } from './previs.js'
+import sharp from 'sharp'
+import { readReferenceMedia, mediaDigest } from './previs-reference-media.js'
 import { and, eq, isNotNull } from 'drizzle-orm'
 import { Agent } from 'undici'
 import { getActiveConfig, getConfigById } from './ai.js'
@@ -31,6 +34,8 @@ const POLL_PROFILES: Record<TaskType, { attempts: number; intervalMs: number; ma
 }
 
 interface GenerateImageParams {
+  frozenConfigHash?: string
+  frozenReferences?: { url: string; digest: string }[]
   previs?: { versionId: number; itemKey: string }
   storyboardId?: number
   dramaId?: number
@@ -77,6 +82,7 @@ export async function generateImage(params: GenerateImageParams): Promise<number
     ? (await getConfigById(params.configId)) ?? await getActiveConfig('image')
     : await getActiveConfig('image')
   if (!config) throw new Error('未配置图片模型，请先到「设置」页添加并启用 AI 服务')
+  if (params.frozenConfigHash && hashContent(config) !== params.frozenConfigHash) throw new Error('图片配置已变化，请核对后重新提交')
 
   const id = await createTask('image', config, {
     animaticVersionId: params.previs?.versionId,
@@ -93,6 +99,8 @@ export async function generateImage(params: GenerateImageParams): Promise<number
     size: params.size || '1920x1080',
     frameType: params.frameType,
     referenceImages: params.referenceImages,
+    frozenConfigHash: params.frozenConfigHash,
+    frozenReferences: params.frozenReferences,
   })
 
   logTaskStart('ImageTask', 'enqueue', {
@@ -207,8 +215,18 @@ export async function startQueuedPrevisTask(id: number) {
   const params = parseTaskParams(record.params)
   const config = await getConfigById(params.configId)
   if (!config) { await failTask(id, '生成配置已停用，请启用后重试'); return }
-  const claim = await db.update(schema.sysTask).set({ status: 'processing', updatedAt: now() })
-    .where(and(eq(schema.sysTask.id, id), eq(schema.sysTask.status, 'pending')))
+  if (params.frozenConfigHash && hashContent(config) !== params.frozenConfigHash) {
+    await failTask(id, '图片配置已变化，请核对后重新提交'); return
+  }
+  // Both grid and legacy batches reserve from the same durable slots. The count
+  // and claim have no await gap, so concurrent workers cannot oversubscribe.
+  const claim = db.transaction(tx => {
+    const active = tx.select().from(schema.sysTask).where(eq(schema.sysTask.status, 'processing')).all()
+      .filter(task => task.type === record.type && parseTaskParams(task.params).configId === params.configId)
+    if (active.length >= 2) return { changes: 0 }
+    return tx.update(schema.sysTask).set({ status: 'processing', updatedAt: now() })
+      .where(and(eq(schema.sysTask.id, id), eq(schema.sysTask.status, 'pending'))).run()
+  })
   if (claim.changes) void processTask(id, config)
 }
 
@@ -217,7 +235,26 @@ export async function recoverPrevisTasks() {
   const tasks = await db.select().from(schema.sysTask)
     .where(and(isNotNull(schema.sysTask.previsItemKey), eq(schema.sysTask.status, 'processing')))
   for (const task of tasks) {
-    const config = await getConfigById(parseTaskParams(task.params).configId)
+    if (task.type === 'image' && task.previsItemKey?.startsWith('grid-') && (task.localPath || task.resultUrl)) {
+      try {
+        if (task.localPath) {
+          await readReferenceMedia(task.localPath)
+          await db.update(schema.sysTask).set({ status: 'completed', errorMsg: null, completedAt: now(), updatedAt: now() }).where(eq(schema.sysTask.id, task.id))
+        } else {
+          const data = /^data:([^;]+);base64,(.+)$/s.exec(task.resultUrl!)
+          if (data) await handleImageCompleteBase64(task, data[2], data[1])
+          else await handleImageComplete(task, task.resultUrl!)
+        }
+      } catch (error) {
+        await failTask(task.id, `已保留模型结果，本地图片恢复失败，可重试处理：${(error as Error).message}`)
+      }
+      continue
+    }
+    const params = parseTaskParams(task.params)
+    const config = await getConfigById(params.configId)
+    if (params.frozenConfigHash && (!config || hashContent(config) !== params.frozenConfigHash)) {
+      await failTask(task.id, '恢复任务时图片配置已变化，请先核对服务商任务记录'); continue
+    }
     if (task.taskId && config) {
       // 保留已确认的外部任务编号，恢复时绝不重复提交付费请求
       void pollTask(task, config, task.taskId)
@@ -234,6 +271,40 @@ function parseTaskParams(raw: string | null | undefined): Record<string, any> {
   } catch {
     return {}
   }
+}
+
+/** Cancels queued/reference preparation work, but retains submitted task tracking. */
+export function cancelUnsubmittedPrevisTask(id: number) {
+  return db.transaction(tx => {
+    const task = tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
+    if (!task?.previsItemKey || !['pending', 'processing'].includes(task.status || '')
+      || parseTaskParams(task.params).submissionStarted || task.taskId || task.resultUrl || task.localPath) return
+    tx.update(schema.sysTask).set({ status: 'cancelled', updatedAt: now() })
+      .where(eq(schema.sysTask.id, id)).run()
+  })
+}
+
+// This synchronous boundary runs immediately before fetch: discard during async
+// image reads prevents submission; once started, tracking continues until completion.
+function beginPrevisSubmission(id: number): boolean {
+  return db.transaction(tx => {
+    const task = tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
+    if (!task || task.status !== 'processing') return false
+    if (!task.previsItemKey) return true
+    const gridId = /^grid-(\d+)$/.exec(task.previsItemKey)
+    const batchKey = /^(\d+):(\d+)$/.exec(task.previsItemKey)
+    const item = batchKey ? tx.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, Number(batchKey[1]))).get() : null
+    const batch = item ? tx.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, item.batchId)).get() : null
+    const cancelledGrid = gridId && tx.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, Number(gridId[1]))).get()?.status !== 'processing'
+    const cancelledBatch = batchKey && (!item || item.status !== 'processing' || item.attempt !== Number(batchKey[2]) || !batch || batch.status === 'cancelled')
+    if (cancelledGrid || cancelledBatch) {
+      tx.update(schema.sysTask).set({ status: 'cancelled', updatedAt: now() }).where(eq(schema.sysTask.id, id)).run()
+      return false
+    }
+    tx.update(schema.sysTask).set({ params: JSON.stringify({ ...parseTaskParams(task.params), submissionStarted: true }), updatedAt: now() })
+      .where(eq(schema.sysTask.id, id)).run()
+    return true
+  })
 }
 
 async function processTask(id: number, config: AIConfig) {
@@ -255,12 +326,15 @@ async function processTask(id: number, config: AIConfig) {
 
     if (type === 'image') {
       const adapter = getImageAdapter(config.provider)
-      const resolvedReferenceImages = await normalizeReferenceImages(params.referenceImages)
+      const resolvedReferenceImages = params.frozenReferences
+        ? await normalizeFrozenImageReferences(params.frozenReferences)
+        : await normalizeReferenceImages(params.referenceImages)
       ;({ url, method, headers, body } = adapter.buildGenerateRequest(config, {
         id: record.id,
         model: record.model,
         prompt: record.prompt,
         size: params.size,
+        strictSize: !!params.frozenConfigHash,
         frameType: params.frameType,
         referenceImages: resolvedReferenceImages.length ? JSON.stringify(resolvedReferenceImages) : null,
       }))
@@ -319,6 +393,7 @@ async function processTask(id: number, config: AIConfig) {
       body: isMultipart ? `[multipart/form-data: ${[...(body as FormData).keys()].join(', ')}]` : body,
     })
 
+    if (!beginPrevisSubmission(id)) return
     const resp = await fetch(url, {
       method,
       headers,
@@ -369,7 +444,8 @@ async function processTask(id: number, config: AIConfig) {
     await markPolling(id, taskId)
     pollTask(record, config, taskId!)
   } catch (err: any) {
-    await failTask(id, err.message)
+    const task = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
+    if (task?.status !== 'cancelled') await failTask(id, err.message)
   }
 }
 
@@ -468,6 +544,8 @@ async function pollTask(record: SysTaskRecord, config: AIConfig, taskId: string)
 }
 
 async function handleImageComplete(record: SysTaskRecord, imageUrl: string) {
+  // Persist the paid upstream result before local I/O so download failures can be repaired freely.
+  await db.update(schema.sysTask).set({ resultUrl: imageUrl, updatedAt: now() }).where(eq(schema.sysTask.id, record.id))
   const localPath = await downloadFile(imageUrl, 'images')
   // 列表页缩略图（前端按命名约定推导地址，失败不影响主流程）
   await generateImageThumb(localPath)
@@ -482,6 +560,9 @@ async function handleImageComplete(record: SysTaskRecord, imageUrl: string) {
 }
 
 async function handleImageCompleteBase64(record: SysTaskRecord, base64Data: string, mimeType: string) {
+  if (record.previsItemKey?.startsWith('grid-')) {
+    await db.update(schema.sysTask).set({ resultUrl: `data:${mimeType};base64,${base64Data}`, updatedAt: now() }).where(eq(schema.sysTask.id, record.id))
+  }
   const localPath = await saveBase64Image(base64Data, mimeType, 'images')
   await generateImageThumb(localPath)
 
@@ -535,6 +616,19 @@ async function handleVideoComplete(record: SysTaskRecord, videoUrl: string, dura
 }
 
 // ─── 参考素材归一化 ───────────────────────────────────────────────
+
+export async function normalizeFrozenImageReferences(refs: { url: string; digest: string }[]): Promise<string[]> {
+  return Promise.all(refs.map(async ref => {
+    const buffer = await readReferenceMedia(ref.url)
+    if (mediaDigest(buffer) !== ref.digest) throw new Error('冻结的参考图片已变化，停止提交')
+    const metadata = await sharp(buffer, { limitInputPixels: 80_000_000 }).metadata()
+    if (!metadata.width || !metadata.height) throw new Error('参考图片无法解码，停止提交')
+    const format = metadata.format
+    if (format === 'jpeg' || format === 'png' || format === 'webp') return `data:image/${format};base64,${buffer.toString('base64')}`
+    const png = await sharp(buffer).rotate().png().toBuffer()
+    return `data:image/png;base64,${png.toString('base64')}`
+  }))
+}
 
 async function normalizeReferenceImages(refs: string[] | null | undefined): Promise<string[]> {
   if (!Array.isArray(refs) || !refs.length) return []

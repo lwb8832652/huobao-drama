@@ -149,6 +149,26 @@ test('frame generation stays available while another frame is generating', () =>
   assert.equal(noRefs.canGenerate(bare.frames[0]), false)
 })
 
+test('locked frames reject settings, legacy generation, removal, upload and description planning', () => {
+  const descriptor = parse(read('../app/components/previs/StoryboardFramesEditor.vue')).descriptor
+  const changes = []
+  const component = evaluate(compileScript(descriptor, { id: 'locked-frame-test' }).content, {
+    vue, 'vue-sonner': { toast: { error() {}, success() {} } }, 'lucide-vue-next': {},
+    '~/components/AppMenu.vue': {}, '~/components/AppMenuItem.vue': {}, './FrameSettingsDialog.vue': {},
+    './StoryboardContactSheet.vue': {}, '~/composables/useApi': { uploadAPI: {} },
+    '~/composables/usePrevis': { ...domain, ...contract },
+  }).default
+  const target = panel(); target.referenceImages = ['/static/role.png']
+  target.frames = [{ ...domain.makeFrame('locked'), locked: true, url: '/static/locked.png' }]
+  const setup = component.setup({ panel: target, editable: true, generatable: true, tasks: [] }, {
+    expose() {}, emit: (event, ...args) => changes.push({ event, args }),
+  })
+  assert.equal(setup.canEdit(target.frames[0]), false)
+  assert.equal(setup.canGenerate(target.frames[0]), false)
+  setup.remove(target.frames[0]); setup.chooseUpload(target.frames[0]); setup.plan()
+  assert.equal(changes.length, 0); assert.equal(setup.uploadTarget.value, undefined)
+})
+
 test('generate resubmits with the refreshed revision after the service rejects a stale one', async () => {
   const notices = []
   const toast = Object.fromEntries(['error', 'success', 'info'].map(kind => [kind, message => notices.push({ kind, message })]))
@@ -215,11 +235,88 @@ test('applying a plan writes to its original panel, retains image history, and s
   await h.planner.apply(h.planner.plans.value)
   assert.equal(target.frames.length, 2)
   assert.equal(target.frames[0].prompt, '走到门前')
-  assert.equal(target.frames[0].url, '')
+  assert.equal(target.frames[0].url, '/static/old.png')
+  assert.equal(target.frames[0].id, 'old')
   assert.equal(target.frames[0].history[0].url, '/static/old.png')
   assert.equal(h.workspace.version.value.timeline.panels[1].frames.length, 0)
   assert.equal(h.planner.open.value, false)
   assert.equal(h.workspace.version.value.revision, 4)
+})
+
+test('revised plans match stable IDs before positions and carry shared and per-frame continuity', () => {
+  const h = harness(), target = panel()
+  target.continuityConstraints = '原约束'
+  target.frames = [
+    { ...domain.makeFrame('one', 0), url: '/static/one.png', referenceImages: ['/static/role.png'], source: { candidateId: 1, mode: 'generate' }, continuity: '原衔接' },
+    { ...domain.makeFrame('two', 1000), url: '/static/two.png', history: [{ url: '/static/older.png' }] },
+  ]
+  target.coverFrameId = 'one'
+  h.api.applyFramePlanToPanel(target, { ...draft(), continuityConstraints: '服装和轴线不变', frames: [
+    { id: 'two', title: '先开门', prompt: '开门', offsetMs: 0, type: 'start', continuity: '右手沿用前格' },
+    { id: 'one', title: '再转身', prompt: '转身', offsetMs: 3000, type: 'end' },
+  ] })
+  assert.equal(target.frames[0].id, 'two'); assert.equal(target.frames[0].url, '/static/two.png')
+  assert.equal(target.frames[0].history[0].url, '/static/older.png')
+  assert.equal(target.frames[0].continuity, '右手沿用前格')
+  assert.equal(target.frames[1].id, 'one'); assert.equal(target.frames[1].url, '/static/one.png')
+  assert.equal(target.frames[1].referenceImages[0], '/static/role.png')
+  assert.equal(target.frames[1].source.candidateId, 1); assert.equal(target.frames[1].continuity, '原衔接')
+  assert.equal(target.continuityConstraints, '服装和轴线不变'); assert.equal(target.coverFrameId, 'one')
+})
+
+test('frame plan application cannot change any metadata or image of a locked slot', () => {
+  const h = harness(), target = panel()
+  target.frames = [{ ...domain.makeFrame('locked'), locked: true, url: '/static/locked.png', prompt: '已确认的画面' }]
+  const before = JSON.stringify(target)
+  assert.equal(h.api.applyFramePlanToPanel(target, draft()), false)
+  assert.equal(JSON.stringify(target), before)
+})
+
+test('adopted versions reset saved history and keep the old autosave timer cancelled', async () => {
+  const timers = new Set(), writes = []
+  const payload = { id: 4, revision: 2, status: 'draft', busy: false, timeline: { panels: [panel()], groups: [], audio: [] } }
+  const api = evaluate(read('../app/composables/usePrevis.ts'), {
+    vue: { ...vue, onUnmounted() {} }, 'vue-sonner': { toast: {} },
+    '../../../backend/src/services/previs-domain': domain,
+    '../../../backend/src/services/previs-frame-contract': contract,
+    '../../../backend/src/services/previs-video-reference-domain': reference,
+  }, {
+    fetch: async (url, options) => { writes.push(options?.method); return { ok: true, json: async () => ({ data: { ...payload, revision: options?.method === 'PUT' ? 3 : 2 } }) } },
+    setTimeout: callback => { timers.add(callback); return callback }, clearTimeout: callback => timers.delete(callback),
+  })
+  const workspace = api.usePrevis(); await workspace.open(4)
+  workspace.edit(timeline => { timeline.panels[0].title = '保存后的候选' })
+  assert.equal(workspace.dirty.value, true); assert.equal(timers.size, 1)
+  await workspace.save()
+  workspace.acceptGridVersion({ ...payload, revision: 9 })
+  assert.equal(workspace.version.value.revision, 9); assert.equal(workspace.dirty.value, false)
+  assert.equal(workspace.undoStack.value.length, 0); assert.equal(timers.size, 0)
+  assert.equal(writes.filter(method => method === 'PUT').length, 1)
+})
+
+test('late adoption responses cannot replace dirty edits or a newer accepted revision', async () => {
+  const notices = []
+  const payload = { id: 4, revision: 2, status: 'draft', busy: false, timeline: { panels: [panel()], groups: [], audio: [] } }
+  const api = evaluate(read('../app/composables/usePrevis.ts'), {
+    vue: { ...vue, onUnmounted() {} }, 'vue-sonner': { toast: { error: message => notices.push(message) } },
+    '../../../backend/src/services/previs-domain': domain,
+    '../../../backend/src/services/previs-frame-contract': contract,
+    '../../../backend/src/services/previs-video-reference-domain': reference,
+  }, {
+    fetch: async () => ({ ok: true, json: async () => ({ data: structuredClone(payload) }) }),
+    setTimeout: () => 1, clearTimeout() {},
+  })
+  const workspace = api.usePrevis(); await workspace.open(4)
+  workspace.edit(timeline => { timeline.panels[0].title = '必须保留的新标题' })
+  const historyLength = workspace.undoStack.value.length
+  assert.equal(workspace.acceptGridVersion({ ...payload, revision: 3 }), false)
+  assert.equal(workspace.version.value.timeline.panels[0].title, '必须保留的新标题')
+  assert.equal(workspace.dirty.value, true); assert.equal(workspace.undoStack.value.length, historyLength)
+  workspace.dirty.value = false; workspace.version.value.revision = 5
+  assert.equal(workspace.acceptGridVersion({ ...payload, revision: 3 }), false)
+  assert.equal(workspace.version.value.revision, 5)
+  assert.equal(workspace.version.value.timeline.panels[0].title, '必须保留的新标题')
+  assert.ok(notices.length > 0)
 })
 
 test('changing the requested frame count submits a new forced plan', async () => {
@@ -308,6 +405,35 @@ test('a retained single historical image can be selected and restored before gen
   assert.equal(changes[0].args[0].url, '/static/old.png')
 })
 
+test('history restore carries the selected image source and clears stale refinement provenance for legacy images', () => {
+  const descriptor = parse(read('../app/components/previs/FrameSettingsDialog.vue')).descriptor
+  const component = evaluate(compileScript(descriptor, { id: 'history-source-test' }).content, {
+    vue: { ...vue, useId: () => 'history-test', onMounted() {}, onBeforeUnmount() {}, onUnmounted() {} },
+    'lucide-vue-next': {}, '~/composables/usePrevis': domain,
+  }).default
+  const splitSource = { candidateId: 20, mode: 'generate', gridIndex: 1 }
+  for (const historical of [
+    { url: '/static/split.png', taskId: 5, source: splitSource },
+    { url: '/static/legacy.png', taskId: 6 },
+  ]) {
+    const frame = { ...domain.makeFrame('two'), url: '/static/refined.png', taskId: 9,
+      source: { candidateId: 21, mode: 'frame_edit', gridIndex: 1 }, history: [historical] }
+    const changes = []
+    const setup = component.setup({ panel: panel(), frame, editable: true }, {
+      expose() {}, emit: (event, ...args) => changes.push({ event, args }),
+    })
+    assert.equal(setup.historyImages.value[0].source.mode, 'frame_edit')
+    assert.equal(setup.sourceLabel(setup.historyImages.value[0].source), '单格精修')
+    assert.equal(setup.sourceLabel(splitSource), '原始切分')
+    assert.equal(setup.sourceLabel({ mode: 'grid_edit' }), '整图微调')
+    setup.draft.value.url = historical.url; setup.form.value = { reportValidity: () => true }; setup.save()
+    const restored = changes[0].args[0]
+    assert.equal(restored.url, historical.url); assert.equal(restored.taskId, historical.taskId)
+    assert.equal(restored.source?.mode, historical.source?.mode)
+    assert.ok(Object.hasOwn(restored, 'source'), 'Legacy restore must explicitly clear newer source')
+  }
+})
+
 test('split submission identifies both new tasks and cached tasks, and results keep that identity', async () => {
   const source = read('../../backend/src/services/previs-frames.ts')
   const ast = ts.createSourceFile('previs-frames.ts', source, ts.ScriptTarget.Latest, true)
@@ -330,6 +456,8 @@ test('split submission identifies both new tasks and cached tasks, and results k
       db, schema: { framePlans: {} }, ...contract,
       and() {}, eq() {}, desc() {},
       requireEditable: () => ({ timelineJson: JSON.stringify(timeline) }),
+      episodeForPrevis: () => ({ id: 1, dramaId: 1 }),
+      readFramePlanningContext: async () => ({}),
       versionRow: () => ({ timelineJson: JSON.stringify(timeline) }),
       normalizeTimeline: domain.normalizeTimeline,
       getConfigById: async () => ({ model: 'selected-text-model' }),

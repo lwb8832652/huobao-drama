@@ -14,22 +14,24 @@ import type {
 } from './types'
 import { joinProviderUrl } from './url'
 import { parseDataUrl } from '../../utils/storage.js'
+import { assertImageReferenceSupport, parseImageReferences } from './reference-images.js'
 
 export class OpenAIImageAdapter implements ImageProviderAdapter {
   provider = 'openai'
 
   buildGenerateRequest(config: AIConfig, record: ImageGenerationRecord): ProviderRequest {
     const model = record.model || config.model || 'gpt-image-2'
-    const isGptImage = model.startsWith('gpt-image-')
-    const isGptImage2 = model === 'gpt-image-2'
+    const isGptImage = model.startsWith('gpt-image-') || model === 'chatgpt-image-latest'
+    const isGptImage2 = /^gpt-image-(?:2(?:-|$)|2\.5-)/.test(model)
     const size = isGptImage2
-      ? this.normalizeGptImage2Size(record.size)
+      ? this.normalizeGptImage2Size(record.size, record.strictSize)
       : isGptImage
       ? this.normalizeGptImageSize(record.size)
       : record.size || '1024x1024'
 
     // 有参考图 → 走 edits（multipart 上传图片文件）；无参考图 → 纯文生图 generations
-    const refs = this.parseReferenceImages(record.referenceImages)
+    const refs = parseImageReferences(record.referenceImages)
+    assertImageReferenceSupport(config, model, refs)
     if (refs.length) {
       return this.buildEditsRequest(config, model, record.prompt, size, refs)
     }
@@ -56,16 +58,6 @@ export class OpenAIImageAdapter implements ImageProviderAdapter {
     }
   }
 
-  private parseReferenceImages(raw?: string | null): string[] {
-    if (!raw) return []
-    try {
-      const parsed = JSON.parse(raw)
-      return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : []
-    } catch {
-      return []
-    }
-  }
-
   /**
    * /v1/images/edits：参考图以 multipart/form-data 的 image[] 文件上传。
    * 参考图在 generation.ts 已归一化为 data URL（本地压缩 / 远程下载），
@@ -87,7 +79,7 @@ export class OpenAIImageAdapter implements ImageProviderAdapter {
     let appended = 0
     for (const ref of refs) {
       const parsed = parseDataUrl(ref)
-      if (!parsed) continue
+      if (!parsed) throw new Error(`参考图片 ${appended + 1} 必须先转换为 data URL`)
       const buffer = Buffer.from(parsed.data, 'base64')
       const ext = parsed.mimeType === 'image/png' ? 'png' : parsed.mimeType === 'image/webp' ? 'webp' : 'jpg'
       form.append('image[]', new Blob([buffer], { type: parsed.mimeType }), `reference-${++appended}.${ext}`)
@@ -119,21 +111,23 @@ export class OpenAIImageAdapter implements ImageProviderAdapter {
     return width > height ? '1536x1024' : '1024x1536'
   }
 
-  private normalizeGptImage2Size(size?: string | null): string {
+  private normalizeGptImage2Size(size?: string | null, strict = false): string {
     if (!size) return '1024x1024'
     const normalized = size.toLowerCase()
     if (normalized === 'auto') return 'auto'
 
-    const [rawWidth, rawHeight] = normalized.split('x').map(Number)
-    if (!rawWidth || !rawHeight) return 'auto'
-
-    const width = this.roundToMultiple(Math.min(4096, Math.max(256, rawWidth)), 16)
-    const height = this.roundToMultiple(Math.min(4096, Math.max(256, rawHeight)), 16)
+    let [width, height] = normalized.split('x').map(Number)
+    if (!strict && /^\d+x\d+$/.test(normalized)) {
+      width = Math.round(width / 16) * 16
+      height = Math.round(height / 16) * 16
+    }
+    const pixels = width * height
+    if (!/^\d+x\d+$/.test(normalized) || !width || !height || width % 16 || height % 16
+      || Math.max(width, height) > 3840 || Math.max(width, height) / Math.min(width, height) > 3
+      || pixels < 655360 || pixels > 8294400) {
+      throw new Error('GPT Image 输出尺寸须为 16 的倍数，最长边不超过 3840、宽高比不超过 3:1，像素数在 655360–8294400 之间')
+    }
     return `${width}x${height}`
-  }
-
-  private roundToMultiple(value: number, multiple: number): number {
-    return Math.max(multiple, Math.round(value / multiple) * multiple)
   }
 
   parseGenerateResponse(result: any): ImageGenResponse {

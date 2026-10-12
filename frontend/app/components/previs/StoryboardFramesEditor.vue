@@ -70,20 +70,24 @@ function frameHistoryCount(frame: Keyframe) {
   return [...(frame.history || []), ...(frame.url ? [{ url: frame.url }] : [])]
     .filter((entry, index, all) => entry.url && all.findIndex(item => item.url === entry.url) === index).length
 }
-function canEdit(frame: Keyframe) { return props.editable && !inProgress(frame) && uploading.value !== frameKey(frame) }
+function canEdit(frame: Keyframe) { return props.editable && !frame.locked && !inProgress(frame) && uploading.value !== frameKey(frame) }
 // 生成入口不看 editable：busy（其他画面生成中）时仍可提交本画面，仅本画面有任务在跑或上传中时禁用。
 function canGenerate(frame: Keyframe) {
-  return props.generatable && !inProgress(frame) && uploading.value !== frameKey(frame)
+  return props.generatable && !frame.locked && !inProgress(frame) && uploading.value !== frameKey(frame)
     && frameReferenceUrls(frame).length > 0
 }
 function status(frame: Keyframe) {
   if (uploading.value === frameKey(frame)) return { label: '上传中', kind: 'busy' }
   if (inProgress(frame)) return { label: task(frame)?.status === 'pending' ? '排队中' : '生成中', kind: 'busy' }
   if (task(frame)?.status === 'failed') return { label: '生成失败', kind: 'error' }
-  return frame.url ? { label: '已就绪', kind: 'ready' } : { label: '待生成', kind: 'empty' }
+  return frame.url ? { label: frame.source?.mode === 'grid_edit' || frame.source?.mode === 'frame_edit' ? '已微调' : '已就绪', kind: 'ready' } : { label: '待生成', kind: 'empty' }
 }
 function changed(next: Keyframe[], cover = props.panel.coverFrameId) {
   if (!props.editable) return false
+  if (props.panel.frames.some(frame => frame.locked && JSON.stringify(frame) !== JSON.stringify(next.find(item => frameKey(item) === frameKey(frame))))) {
+    toast.error('已锁定画面不可修改，请先解除锁定')
+    return false
+  }
   if (!frameCountChangeAllowed(next, props.panel.frames)) {
     toast.error(`每个镜头最多 ${FRAME_COUNT_MAX} 张画面；旧方案超限时只能保留或删除已有画面`)
     return false
@@ -133,6 +137,7 @@ async function saveSettings(changes: Partial<Keyframe>, generate: boolean) {
 function plan() {
   toolbarMenu.value = false
   if (!props.editable) return
+  if (props.panel.frames.some(frame => frame.locked)) { toast.error('存在已锁定画面，不能重新规划'); return }
   const planned = planFrames(props.panel, createFrameId())
   const existing = frames.value
   const next = planned.map((frame, index) => {
@@ -205,11 +210,11 @@ watch(settingsFrame, frame => {
       <button v-if="frames.length" type="button" class="btn btn-sm frame-view-toggle" :aria-pressed="editing" @click="editing = !editing"><SlidersHorizontal :size="12" />{{ editing ? '返回宫格' : '编辑画面' }}</button>
       <button type="button" class="btn btn-sm frame-fill" :disabled="!canGenerateMissing"
         :title="missingFrames.some(frame => !frameReferenceUrls(frame).length) ? '请先在生成设置中选择参考素材' : '生成所有缺失画面'"
-        @click="emit('generate', missingFrames.map(frameKey))"><Sparkles :size="13" />生成缺失<span v-if="missingVideoFrames">{{ missingVideoFrames }}</span></button>
+        @click="emit('generate', missingFrames.map(frameKey))"><Sparkles :size="13" />逐张生成缺失<span v-if="missingVideoFrames">{{ missingVideoFrames }}</span></button>
       <AppMenu v-model:open="toolbarMenu" placement="bottom-end">
         <template #trigger><button type="button" class="btn btn-sm frame-icon" title="更多画面操作" aria-label="更多画面操作"><MoreHorizontal :size="16" /></button></template>
-        <AppMenuItem :disabled="splitting" :title="splitting ? '拆分任务进行中' : (!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '')" @click="menuAction(() => emit('split'))"><Sparkles :size="13" />AI 拆分画面</AppMenuItem>
-        <AppMenuItem v-if="frames.length" :disabled="splitting" :title="splitting ? '拆分任务进行中' : (!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '')" @click="menuAction(() => emit('split', { force: true }))">重新拆分画面（覆盖现有）</AppMenuItem>
+        <AppMenuItem :disabled="splitting || !editable" :title="splitting ? '拆分任务进行中' : (!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '')" @click="menuAction(() => emit('split'))"><Sparkles :size="13" />AI 拆分画面</AppMenuItem>
+        <AppMenuItem v-if="frames.length" :disabled="splitting || !editable" :title="splitting ? '拆分任务进行中' : (!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '')" @click="menuAction(() => emit('split', { force: true }))">重新拆分画面（覆盖现有）</AppMenuItem>
         <AppMenuItem :disabled="!editable" @click="plan">按镜头描述规划画面</AppMenuItem>
       </AppMenu>
     </div>
@@ -259,7 +264,7 @@ watch(settingsFrame, frame => {
       <p>用 AI 按镜头描述拆分画面，或手动添加。</p>
       <div class="frame-editor-empty-actions">
         <button
-          type="button" class="btn btn-sm btn-primary" :disabled="splitting"
+          type="button" class="btn btn-sm btn-primary" :disabled="splitting || !editable"
           :title="!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '提交后台拆分任务'"
           @click="emit('split')"
         ><Loader2 v-if="splitting" :size="13" class="frame-spin" /><Sparkles v-else :size="13" />{{ splitting ? '拆分中…' : 'AI 拆分画面' }}</button>
@@ -277,7 +282,7 @@ watch(settingsFrame, frame => {
       :frame="settingsFrame"
       :return-focus="settingsTrigger"
       :is-new="!!settings.newFrame"
-      :editable="editable && (!settingsFrame || (!inProgress(settingsFrame) && uploading !== frameKey(settingsFrame)))"
+      :editable="editable && (!settingsFrame || (!settingsFrame.locked && !inProgress(settingsFrame) && uploading !== frameKey(settingsFrame)))"
       @close="settings = undefined"
       @frame="saveSettings"
     />

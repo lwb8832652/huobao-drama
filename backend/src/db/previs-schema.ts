@@ -1,3 +1,4 @@
+import { initGridSchema } from './previs-grid-schema.js'
 import type Database from 'better-sqlite3'
 import { sqliteTable, integer, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
 
@@ -89,6 +90,7 @@ export const frameContactSheets = sqliteTable('frame_contact_sheets', {
 }, table => [uniqueIndex('idx_sheet_input').on(table.versionId, table.panelId, table.inputHash)])
 
 export function initPrevisSchema(sqlite: Database.Database) {
+  initGridSchema(sqlite)
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS animatic_versions (
       id INTEGER PRIMARY KEY AUTOINCREMENT, episode_id INTEGER NOT NULL, version_no INTEGER NOT NULL,

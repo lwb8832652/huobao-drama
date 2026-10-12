@@ -56,7 +56,7 @@ function standalone(globals) {
   const ast = ts.createSourceFile('previs.vue.ts', parse(read('../app/views/drama/previs.vue')).descriptor.scriptSetup.content, ts.ScriptTarget.Latest, true)
   const functions = ast.statements.filter(statement => ts.isFunctionDeclaration(statement) && ['planAndGenerate', 'applyFramePlan'].includes(statement.name?.text))
     .map(statement => `export ${statement.getText(ast)}`).join('\n')
-  return evaluate(functions, {}, { ...domain, ...api(), ...globals })
+  return evaluate(functions, {}, { ...domain, ...api(), editable: vue.ref(true), timeline: vue.ref({ panels: [] }), ...globals })
 }
 
 test('the frame count control offers every value from one through nine', () => {

@@ -1,7 +1,7 @@
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { toast } from 'vue-sonner'
-import type { AnimaticVersion, Timeline, FrameType, Panel } from '../../../backend/src/services/previs-domain'
-import { makeFrame, orderedFrames, retimeBoundAudio } from '../../../backend/src/services/previs-domain'
+import type { AnimaticVersion, Timeline, FrameType, Panel, Keyframe } from '../../../backend/src/services/previs-domain'
+import { frameKey, makeFrame, orderedFrames, retimeBoundAudio } from '../../../backend/src/services/previs-domain'
 import { FRAME_COUNT_MAX } from '../../../backend/src/services/previs-frame-contract'
 import type { ContactSheetView } from '../../../backend/src/services/previs-contact-sheet-domain'
 import { selectVideoReferenceStrategy, type VideoReferenceInputStrategy } from '../../../backend/src/services/previs-video-reference-domain'
@@ -29,6 +29,7 @@ export async function previsRequest<T = any>(path: string, method = 'GET', body?
   return result.data ?? result
 }
 export interface FramePlanDraft {
+  id?: string
   title: string
   prompt: string
   offsetMs: number
@@ -37,6 +38,7 @@ export interface FramePlanDraft {
   shotType?: string
   angle?: string
   composition?: string
+  continuity?: string
 }
 export interface PanelFramePlan {
   taskId: number
@@ -44,6 +46,7 @@ export interface PanelFramePlan {
   panelTitle: string
   count: number
   source: 'ai' | 'rule'
+  continuityConstraints?: string
   frames: FramePlanDraft[]
 }
 export interface FramePlanPayload {
@@ -72,6 +75,68 @@ export async function submitFramePlan(versionId: number, payload: FramePlanPaylo
 /** 查询拆分任务状态与已完成方案。 */
 export async function fetchFramePlans(versionId: number) {
   return previsRequest<FramePlansResult>(`/animatic-versions/${versionId}/frames/plan`)
+}
+export type GridMode = 'generate' | 'grid_edit' | 'frame_edit'
+export interface GridCapabilities {
+  enabled: boolean
+  supportsReferences: boolean
+  supportsEdit: boolean
+  maxReferences: number
+  aspectRatios: string[]
+  resolutions: string[]
+  sizes: { width: number; height: number; aspectRatio: string; resolution: string; size: string }[]
+  reason?: string
+}
+export interface GridCandidate {
+  id: number
+  versionId: number
+  panelId: number
+  mode: GridMode
+  status: 'pending' | 'processing' | 'ready' | 'failed' | 'adopted' | 'discarded'
+  taskId?: number | null
+  rawUrl?: string | null
+  previewUrl?: string | null
+  baseUrl?: string | null
+  width?: number | null
+  height?: number | null
+  error?: string | null
+  grid: { columns: number; rows: number; cells: { frameId: string; index: number }[] }
+  targetFrameIds: string[]
+  adoptFrameIds: string[]
+  model: string
+  resolution: string
+  size: string
+  cellWidth?: number | null
+  cellHeight?: number | null
+  createdAt: string
+  baseCandidateId?: number | null
+}
+
+/** Keep stable slots and their media when reviewing a revised frame plan. */
+export function applyFramePlanToPanel(panel: Panel, plan: PanelFramePlan) {
+  if (panel.frames.some(frame => frame.locked)) return false
+  const previous = orderedFrames(panel), used = new Set<string>()
+  const reserved = new Set(plan.frames.map(frame => frame.id).filter(id => previous.some(frame => frame.id === id)))
+  panel.frames = plan.frames.map((draft, index): Keyframe => {
+    const exact = draft.id && previous.find(frame => frame.id === draft.id && !used.has(frameKey(frame)))
+    const positional = previous[index] && !used.has(frameKey(previous[index])) && !reserved.has(previous[index].id) ? previous[index] : undefined
+    const old = exact || positional
+    if (old) used.add(frameKey(old))
+    const history = [...(old?.history || []), ...(old?.url ? [{ url: old.url, taskId: old.taskId, source: old.source }] : [])]
+      .filter((entry, index, all) => all.findIndex(item => item.url === entry.url) === index)
+    return {
+      ...(old || makeFrame(draft.id || createFrameId())),
+      title: draft.title, type: draft.type, prompt: draft.prompt, history,
+      offsetMs: Math.max(0, Math.min(draft.offsetMs, Math.max(0, panel.durationMs - 1))),
+      ...(draft.shotType ? { shotType: draft.shotType } : {}),
+      ...(draft.angle ? { angle: draft.angle } : {}),
+      ...(draft.composition ? { composition: draft.composition } : {}),
+      ...(draft.continuity !== undefined ? { continuity: draft.continuity } : {}),
+    }
+  })
+  if (plan.continuityConstraints !== undefined) panel.continuityConstraints = plan.continuityConstraints
+  if (!panel.frames.some(frame => frame.id === panel.coverFrameId)) panel.coverFrameId = panel.frames[0]?.id
+  return true
 }
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value))
 const VIDEO_GENERATION_MODE_KEY = 'huobao:video-generation-mode'
@@ -151,7 +216,9 @@ export function usePrevis() {
   const version = ref<AnimaticVersion | null>(null)
   const versions = ref<{ id: number; versionNo: number; status: string }[]>([])
   const framePlans = ref<FramePlanSummary>({ pending: 0, processing: 0, completed: 0, failed: 0 })
-  const working = ref(false), dirty = ref(false), saveError = ref(''), pollError = ref('')
+  const workingState = ref(false), gridAdopting = ref(false)
+  const working = computed({ get: () => workingState.value || gridAdopting.value, set: (value: boolean) => { workingState.value = value } })
+  const dirty = ref(false), saveError = ref(''), pollError = ref('')
   const undoStack = ref<Timeline[]>([]), redoStack = ref<Timeline[]>([])
   const editable = computed(() => !!version.value && version.value.status !== 'locked' && !version.value.busy && !working.value)
   // 生成提交只依赖版本未锁定：后台任务完成写回会把 revision 推高，但 createBatch 的事务内
@@ -200,10 +267,44 @@ export function usePrevis() {
     if (clearHistory) { undoStack.value = []; redoStack.value = [] }
     ensureContactSheets()
   }
+  function acceptGridVersion(value: AnimaticVersion) {
+    if (disposed || version.value?.id !== value.id) return false
+    if (dirty.value || version.value.revision > value.revision) {
+      if (dirty.value) {
+        clearTimeout(autosave)
+        saveError.value = '候选已在服务端采用，但出现新的本地修改，已保留本地内容；请先导出草稿再刷新工作版。'
+        toast.error(saveError.value)
+      }
+      return false
+    }
+    clearTimeout(autosave)
+    accept(value, true)
+    return true
+  }
+  /** A write lease belongs to the workspace, so leaving its review UI cannot lose the result. */
+  async function adoptGridCandidate(versionId: number, candidateId: number, revision: number): Promise<AnimaticVersion | false> {
+    if (disposed || working.value || dirty.value || version.value?.id !== versionId
+      || version.value.revision !== revision || version.value.status === 'locked') {
+      throw new Error('当前工作版无法采用，请保存并刷新后重试')
+    }
+    gridAdopting.value = true
+    saveError.value = ''
+    try {
+      const adopted = await previsRequest<AnimaticVersion>(`/animatic-versions/${versionId}/grid-candidates/${candidateId}/adopt`, 'POST', { revision })
+      return acceptGridVersion(adopted) ? adopted : false
+    } catch (cause: any) {
+      if (!disposed && version.value?.id === versionId) {
+        saveError.value = cause?.message || '采用候选失败，请刷新后重试'
+        toast.error(saveError.value)
+      }
+      throw cause
+    } finally { gridAdopting.value = false }
+  }
   async function refreshVersions() {
     versions.value = await previsRequest(`/episodes/${episodeId}/animatic-versions`)
   }
   async function initialize(id: number) {
+    if (gridAdopting.value) return
     episodeId = id
     await refreshVersions()
     accept(await previsRequest(`/episodes/${episodeId}/production-workspace`), true)
@@ -284,6 +385,7 @@ export function usePrevis() {
     scheduleSave()
   }
   async function save(): Promise<boolean> {
+    if (gridAdopting.value) return false
     clearTimeout(autosave)
     if (saving) return saving
     if (!dirty.value || !version.value) return true
@@ -318,7 +420,7 @@ export function usePrevis() {
     generationScope?: VideoGenerationScope;
     videoReferenceInputStrategy?: VideoReferenceInputStrategy;
   } = {}) {
-    if (!version.value) return
+    if (!version.value || gridAdopting.value) return
     working.value = true
     try {
       // 后台任务完成写回会推高 revision，本地旧 revision 会被 409 拒绝（表现为"点了没反应"）。
@@ -362,7 +464,7 @@ export function usePrevis() {
   onUnmounted(() => { disposed = true; clearInterval(polling); clearTimeout(autosave) })
   return {
     version, versions, timeline, editable, generatable, dirty, working, saveError, pollError, undoStack, redoStack,
-    framePlans, initialize, open, create, edit, history, save, check, generate, batchAction, composeContactSheets, retryContactSheet,
+    framePlans, initialize, open, create, edit, history, save, check, generate, batchAction, composeContactSheets, retryContactSheet, acceptGridVersion, adoptGridCandidate,
   }
 }
 
@@ -424,6 +526,7 @@ export function useFramePlanner(
     const plan = drafts.find(plan => plan.panelId === targetPanelId)
     const target = workspace.version.value.timeline.panels.find(panel => panel.id === targetPanelId)
     if (!plan?.frames.length || !target) return
+    if (target.frames.some(frame => frame.locked)) { toast.error('存在已锁定画面，不能应用新的拆分方案'); return }
     if (plan.frames.length > FRAME_COUNT_MAX) {
       toast.error(`每个镜头最多 ${FRAME_COUNT_MAX} 张画面，请先删减拆分方案`)
       return
@@ -433,25 +536,11 @@ export function useFramePlanner(
     try {
       workspace.edit(timeline => {
         const panel = timeline.panels.find(panel => panel.id === plan.panelId)!
-        const previous = orderedFrames(panel)
-        panel.frames = plan.frames.map((frame, index) => {
-          const old = previous[index]
-          const history = [...(old?.history || []), ...(old?.url ? [{ url: old.url, taskId: old.taskId }] : [])]
-            .filter((entry, index, all) => all.findIndex(item => item.url === entry.url) === index)
-          return {
-            ...makeFrame(createFrameId(), Math.max(0, Math.min(frame.offsetMs, panel.durationMs - 1)), frame.title),
-            type: frame.type, prompt: frame.prompt, history,
-            // 未指定的参数不写入 key，避免空串盖掉生图模板里的面板级回退。
-            ...(frame.shotType ? { shotType: frame.shotType } : {}),
-            ...(frame.angle ? { angle: frame.angle } : {}),
-            ...(frame.composition ? { composition: frame.composition } : {}),
-          }
-        })
-        panel.coverFrameId = panel.frames[0]?.id
+        applyFramePlanToPanel(panel, plan)
       })
       if (await workspace.save() && token === requestToken) {
         close()
-        toast.success(`已写入 ${plan.frames.length} 张画面，可点击「生成缺失」出图`)
+        toast.success(`已写入 ${plan.frames.length} 张画面，可点击「生成整组宫格」出图`)
       }
     } catch (cause: any) {
       if (token === requestToken) toast.error(cause.message || '应用拆分方案失败，请重试')
