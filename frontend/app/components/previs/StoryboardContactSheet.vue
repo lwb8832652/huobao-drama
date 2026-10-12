@@ -52,12 +52,12 @@ function select(frameId: string, event: Event) { emit('select', frameId, event) 
         <span v-for="(cell, index) in blankCells" :key="`blank-${index}`" class="sheet-blank" :style="cellStyle(cell)" aria-hidden="true" />
         <button v-for="cell in current?.descriptor?.cells || []" :key="cell.frameId" type="button"
           class="sheet-cell" :class="{ active: activeFrameId === cell.frameId, 'is-empty': !cell.url }" :style="cellStyle(cell)"
-          :aria-label="`编辑画面 ${cell.index}，${(cell.offsetMs / 1000).toFixed(1)} 秒`"
+          :aria-label="`${cell.url ? '查看与微调' : '规划'}画面 ${cell.index}，${(cell.offsetMs / 1000).toFixed(1)} 秒`"
           @click="select(cell.frameId, $event)">
           <span class="sheet-cell-number">{{ String(cell.index).padStart(2, '0') }}</span>
           <span v-if="!cell.url" class="sheet-cell-placeholder"><span class="sheet-cell-icon"><ImageIcon :size="22" :stroke-width="1.4" /></span><strong>待生成画面</strong></span>
           <span class="sheet-cell-time">{{ (cell.offsetMs / 1000).toFixed(1) }}s</span>
-          <span class="sheet-cell-edit"><MousePointer2 :size="11" />编辑画面</span>
+          <span class="sheet-cell-edit"><MousePointer2 :size="11" />{{ cell.url ? '查看 / 微调' : '画面规划' }}</span>
         </button>
       </template>
     </div>
@@ -68,7 +68,7 @@ function select(frameId: string, event: Event) { emit('select', frameId, event) 
     </div>
     <div v-if="!compact" class="sheet-caption">
       <span class="sheet-caption-state" :class="{ ready: status === 'ready' && readyCount === panel.frames.length }"><i />{{ label }}</span>
-      <small v-if="status === 'ready'">点击格子编辑 · 按时间排序</small>
+      <small v-if="status === 'ready'">点击格子查看 / 微调 · 按时间排序</small>
       <button v-if="status === 'failed' || status === 'stale' || status === 'none'" type="button" class="btn btn-sm"
         :disabled="!panel.frames.length || panel.frames.length > FRAME_COUNT_MAX" @click="emit('retry')">重新合成</button>
     </div>

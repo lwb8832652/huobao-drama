@@ -24,7 +24,7 @@ const candidate = (extra = {}) => ({ id: 20, versionId: 4, panelId: 7, mode: 'ge
   width: 2048, height: 1152, cellWidth: 1024, cellHeight: 576,
   grid: { columns: 2, rows: 2, cells: [{ frameId: 'one', index: 0 }, { frameId: 'two', index: 1 }] },
   adoptFrameIds: ['one', 'two'], targetFrameIds: ['one', 'two'], resolution: '2K', ...extra })
-function harness({ items = [], save = async () => ({ versionId: 4, revision: 9 }), request, editable = true, aspectRatio = '16:9', onEvent, commitAdoption } = {}) {
+function harness({ items = [], save = async () => ({ versionId: 4, revision: 9 }), request, editable = true, aspectRatio = '16:9', onEvent, commitAdoption, storage } = {}) {
   assert.ok(existsSync(new URL(componentPath, import.meta.url)), 'Shared grid tools must implement the candidate workflow')
   const descriptor = parse(read(componentPath)).descriptor
   const script = compileScript(descriptor, { id: 'grid-tools-test' })
@@ -48,12 +48,116 @@ function harness({ items = [], save = async () => ({ versionId: 4, revision: 9 }
     vue: { ...vue, onMounted: fn => mounted.push(fn), onBeforeUnmount: fn => disposers.push(fn), onUnmounted: fn => disposers.push(fn), useId: () => 'grid-dialog' },
     'lucide-vue-next': {}, '~/composables/useApi': { uploadAPI: { image: async () => ({ path: '/static/upload.png' }) } },
     '~/composables/usePrevis': { previsRequest: api, mediaUrl: url => url, orderedFrames: panel => panel.frames, frameKey: frame => frame.id, FRAME_COUNT_MAX: 9 },
-  }, { setTimeout: callback => { const id = ++nextTimer; timers.set(id, callback); return id }, clearTimeout: id => timers.delete(id) }).default
+  }, { localStorage: storage, setTimeout: callback => { const id = ++nextTimer; timers.set(id, callback); return id }, clearTimeout: id => timers.delete(id) }).default
   const effect = vue.effectScope()
   const setup = effect.run(() => component.setup(props, { expose() {}, emit: (event, ...args) => { emitted.push({ event, args }); onEvent?.(event, ...args) } }))
   return { setup, props, requests, emitted, timers, async start() { for (const fn of mounted) await fn() }, dispose() { disposers.forEach(fn => fn()); effect.stop() }, descriptor, script }
 }
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve() }
+
+test('frame details submit either refinement method once with the exact frame and instruction', async () => {
+  for (const mode of ['grid_edit', 'frame_edit']) {
+    const h = harness(); await h.start()
+    await Promise.all([
+      h.setup.refineFrame({ frameId: 'two', mode, instruction: '  保持服装，放低右手  ' }),
+      h.setup.refineFrame({ frameId: 'two', mode, instruction: '重复点击' }),
+    ])
+    const paid = h.requests.filter(r => r.method === 'POST')
+    assert.equal(paid.length, 1)
+    assert.equal(paid[0].body.mode, mode)
+    assert.deepEqual(paid[0].body.targetFrameIds, ['two'])
+    assert.equal(paid[0].body.instruction, '保持服装，放低右手')
+    assert.equal(paid[0].body.baseCandidateId, undefined, 'Details always use the current images')
+    assert.equal(h.setup.modal.value, 'review')
+    assert.equal(h.props.panel.frames[1].url, '/static/two.png')
+    h.dispose()
+  }
+})
+
+test('direct refinement guards missing images, locks, capability, save failure and changed context', async () => {
+  for (const condition of ['missing', 'locked', 'readOnly', 'unsupported', 'incomplete-grid', 'save-failed', 'context']) {
+    const h = harness({ save: condition === 'save-failed' ? async () => false : condition === 'context'
+      ? async () => { h.props.panel = { ...h.props.panel, id: 8 }; return { versionId: 4, revision: 9 } }
+      : undefined })
+    await h.start()
+    if (condition === 'missing') h.props.panel.frames[1].url = ''
+    if (condition === 'locked') h.props.panel.frames[1].locked = true
+    if (condition === 'readOnly') h.props.editable = false
+    if (condition === 'unsupported') h.setup.capabilities.value.supportsEdit = false
+    if (condition === 'incomplete-grid') h.props.panel.frames[0].url = ''
+    await h.setup.refineFrame({ frameId: 'two', mode: 'grid_edit', instruction: '放低右手' })
+    assert.equal(h.requests.filter(r => r.method === 'POST').length, 0, condition)
+    h.dispose()
+  }
+})
+
+test('refinement rechecks eligibility after saving while keeping the submitted targets frozen', async () => {
+  for (const change of ['locked', 'missing', 'deleted', 'disabled-model', 'edit-unsupported', 'readOnly', 'empty-panel', 'unsupported-size']) {
+    let finishSave
+    const h = harness({ save: () => new Promise(resolve => { finishSave = resolve }) }); await h.start()
+    const submitting = h.setup.refineFrame({ frameId: 'two', mode: 'grid_edit', instruction: '放低右手' })
+    if (change === 'locked') h.props.panel.frames[1].locked = true
+    if (change === 'missing') h.props.panel.frames[1].url = ''
+    if (change === 'deleted') h.props.panel.frames.pop()
+    if (change === 'disabled-model') h.setup.capabilities.value.enabled = false
+    if (change === 'edit-unsupported') h.setup.capabilities.value.supportsEdit = false
+    if (change === 'readOnly') h.props.editable = false
+    if (change === 'empty-panel') h.props.panel.frames = []
+    if (change === 'unsupported-size') h.setup.capabilities.value.sizes = []
+    finishSave({ versionId: 4, revision: 9 }); await submitting
+    assert.equal(h.requests.filter(r => r.method === 'POST').length, 0, change)
+    assert.equal(h.setup.submitting.value, false)
+    h.dispose()
+  }
+  let finishSave
+  const h = harness({ save: () => new Promise(resolve => { finishSave = resolve }) }); await h.start()
+  h.setup.openEdit('grid_edit'); h.setup.selectedFrameIds.value = ['one', 'two']; h.setup.instruction.value = '保持服装'
+  const submission = h.setup.submitEdit()
+  h.props.editable = false
+  h.setup.selectedFrameIds.value = ['one']; h.setup.instruction.value = '尚未提交的改动'
+  h.props.editable = true // Internal save releases its workspace busy state before returning.
+  finishSave({ versionId: 4, revision: 9 }); await submission
+  const paid = h.requests.filter(r => r.method === 'POST')
+  assert.equal(paid.length, 1)
+  assert.deepEqual(paid[0].body.targetFrameIds, ['one', 'two'])
+  assert.equal(paid[0].body.instruction, '保持服装')
+  h.dispose()
+})
+
+test('unadopted candidates have compact notices while adopted records stay closed by default', async () => {
+  const h = harness({ items: [candidate({ status: 'adopted' }), candidate({ id: 21 }), candidate({ id: 22, status: 'pending' }), candidate({ id: 23, status: 'failed' })] })
+  await h.start()
+  assert.deepEqual(Array.from(h.setup.activeCandidates.value, item => item.id), [21, 22, 23])
+  assert.equal(h.setup.modal.value, '')
+  assert.match(h.descriptor.template.content, /modal === 'records'/)
+  assert.ok(h.descriptor.template.content.indexOf('<slot ') < h.descriptor.template.content.indexOf('grid-candidate-notices'), 'Current images precede candidate notices')
+  h.setup.openModal('records'); assert.equal(h.setup.modal.value, 'records')
+  h.dispose()
+})
+
+test('both workspaces integrate frame details in the shared generation area', () => {
+  for (const path of ['../app/views/drama/episode.vue', '../app/views/drama/previs.vue']) {
+    const source = read(path)
+    assert.match(source, /<StoryboardGridTools\b[\s\S]*?<template #default="\{[^}]*refineFrame[^}]*\}">[\s\S]*?<StoryboardFramesEditor\b[\s\S]*?\bintegrated\b[\s\S]*?@refine="refineFrame"[\s\S]*?<\/StoryboardGridTools>/)
+  }
+})
+
+test('generation resolution remembers the choice and filters unsupported native outputs', async () => {
+  let remembered = '4K'
+  const storage = { getItem: () => remembered, setItem: (_key, value) => { remembered = value } }
+  const first = harness({ storage }); await first.start()
+  assert.equal(first.setup.resolution.value, '4K')
+  first.setup.resolution.value = '1K'; await vue.nextTick(); first.dispose()
+  const reopened = harness({ storage }); await reopened.start()
+  assert.equal(reopened.setup.resolution.value, '1K'); reopened.dispose()
+  remembered = '4K'
+  const limited = harness({ storage, request: path => path.includes('grid-capabilities') ? { enabled: true, supportsEdit: true, sizes: [{ aspectRatio: '16:9', resolution: '2K', width: 2048, height: 1152 }] } : undefined })
+  await limited.start()
+  assert.equal(limited.setup.resolution.value, '2K')
+  await limited.setup.generateGrid()
+  assert.equal(limited.requests.find(r => r.method === 'POST').body.resolution, '2K')
+  limited.dispose()
+})
 
 test('opening the grid tools only reads capabilities and candidates', async () => {
   const h = harness({ items: [candidate()] }); await h.start()

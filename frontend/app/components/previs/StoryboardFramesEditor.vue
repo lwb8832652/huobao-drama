@@ -30,6 +30,10 @@ const props = withDefaults(defineProps<{
   videoInputError?: string
   /** 拆分任务提交中或排队中：与资产批量生成一致，按钮转圈显示“拆分中…” */
   splitting?: boolean
+  integrated?: boolean
+  planning?: boolean
+  canRefineGrid?: boolean
+  canRefineFrame?: boolean
 }>(), {
   generatable: true, tasks: () => [], showVideoAction: false, videoGenerationMode: 'direct', activeFrameId: '', title: '分镜画面', splitting: false,
 })
@@ -40,6 +44,7 @@ const emit = defineEmits<{
   'settings-open': []
   split: [options?: { force?: boolean }]
   'retry-sheet': []
+  refine: [edit: { frameId: string; mode: 'grid_edit' | 'frame_edit'; instruction: string }]
 }>()
 
 const uploading = ref('')
@@ -51,6 +56,7 @@ const menuId = ref('')
 const toolbarMenu = ref(false)
 const settings = ref<{ panelId: number; frameId?: string; newFrame?: Keyframe }>()
 const frames = computed(() => orderedFrames(props.panel))
+const showPlanning = computed(() => props.integrated ? props.planning : editing.value)
 const canAdd = computed(() => props.editable && frames.value.length < FRAME_COUNT_MAX)
 const usesStoryboardFrames = computed(() => props.videoGenerationMode === 'storyboard_frames')
 const settingsFrame = computed(() => settings.value?.newFrame
@@ -106,8 +112,16 @@ function openSettings(frame: Keyframe, event: Event) {
 function selectSheetFrame(frameId: string, event: Event) {
   const frame = props.panel.frames.find(frame => frameKey(frame) === frameId)
   if (!frame) return
-  editing.value = true
+  if (!props.integrated) editing.value = true
   openSettings(frame, event)
+}
+function refineFrame(edit: { frameId: string; mode: 'grid_edit' | 'frame_edit'; instruction: string }) {
+  const context = settings.value, frame = settingsFrame.value
+  if (!context || context.panelId !== props.panel.id || !frame || frameKey(frame) !== edit.frameId
+    || !frame.url || !canEdit(frame) || !edit.instruction.trim()
+    || (edit.mode === 'grid_edit' ? !props.canRefineGrid : !props.canRefineFrame)) return
+  settings.value = undefined
+  emit('refine', edit)
 }
 function add(event: Event) {
   if (!canAdd.value) return
@@ -181,11 +195,11 @@ async function upload(event: Event) {
     const result = await uploadAPI.image(file)
     if (target.panelId !== props.panel.id || !props.editable) return
     const latest = props.panel.frames.find(item => frameKey(item) === target.frameId)
-    if (!latest) return
+    if (!latest || latest.locked || inProgress(latest)) return
     const url = result.path || result.url
-    const history = [...(latest.history || []), ...(latest.url ? [{ url: latest.url, taskId: latest.taskId }] : []), { url }]
+    const history = [...(latest.history || []), ...(latest.url ? [{ url: latest.url, taskId: latest.taskId, source: latest.source }] : []), { url }]
       .filter((entry, index, all) => all.findIndex(item => item.url === entry.url) === index)
-    patch(target.frameId, { url, taskId: undefined, history })
+    patch(target.frameId, { url, taskId: undefined, source: undefined, history })
   } catch (error: any) { toast.error(error.message || '图片上传失败，请重试') }
   finally { uploading.value = '' }
 }
@@ -202,25 +216,27 @@ watch(settingsFrame, frame => {
 
 <template>
   <section class="frame-editor">
-    <header class="frame-editor-head">
+    <header v-if="!integrated" class="frame-editor-head">
       <div><strong>{{ title }}</strong><span class="frame-count" :class="{ complete: frames.length > 0 && !missingVideoFrames }"><i />{{ frames.length - missingVideoFrames }} / {{ frames.length }} 张已就绪</span></div>
       <button type="button" class="btn btn-sm frame-add" :disabled="!canAdd" :title="`每个镜头最多 ${FRAME_COUNT_MAX} 张画面`" @click="add"><ImagePlus :size="13" />添加画面</button>
     </header>
-    <div class="frame-editor-tools">
-      <button v-if="frames.length" type="button" class="btn btn-sm frame-view-toggle" :aria-pressed="editing" @click="editing = !editing"><SlidersHorizontal :size="12" />{{ editing ? '返回宫格' : '编辑画面' }}</button>
-      <button type="button" class="btn btn-sm frame-fill" :disabled="!canGenerateMissing"
+    <div v-if="!integrated || showPlanning" class="frame-editor-tools">
+      <button v-if="!integrated && frames.length" type="button" class="btn btn-sm frame-view-toggle" :aria-pressed="editing" @click="editing = !editing"><SlidersHorizontal :size="12" />{{ editing ? '返回宫格' : '编辑规划' }}</button>
+      <button v-if="integrated" type="button" class="btn btn-sm frame-add" :disabled="!canAdd" @click="add"><ImagePlus :size="13" />添加画面</button>
+      <button v-if="!integrated" type="button" class="btn btn-sm frame-fill" :disabled="!canGenerateMissing"
         :title="missingFrames.some(frame => !frameReferenceUrls(frame).length) ? '请先在生成设置中选择参考素材' : '生成所有缺失画面'"
         @click="emit('generate', missingFrames.map(frameKey))"><Sparkles :size="13" />逐张生成缺失<span v-if="missingVideoFrames">{{ missingVideoFrames }}</span></button>
       <AppMenu v-model:open="toolbarMenu" placement="bottom-end">
         <template #trigger><button type="button" class="btn btn-sm frame-icon" title="更多画面操作" aria-label="更多画面操作"><MoreHorizontal :size="16" /></button></template>
-        <AppMenuItem :disabled="splitting || !editable" :title="splitting ? '拆分任务进行中' : (!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '')" @click="menuAction(() => emit('split'))"><Sparkles :size="13" />AI 拆分画面</AppMenuItem>
-        <AppMenuItem v-if="frames.length" :disabled="splitting || !editable" :title="splitting ? '拆分任务进行中' : (!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '')" @click="menuAction(() => emit('split', { force: true }))">重新拆分画面（覆盖现有）</AppMenuItem>
+        <AppMenuItem :disabled="splitting || !editable" :title="splitting ? '拆分任务进行中' : (!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '')" @click="menuAction(() => emit('split'))"><Sparkles :size="13" />AI 分镜规划</AppMenuItem>
+        <AppMenuItem v-if="frames.length" :disabled="splitting || !editable" :title="splitting ? '拆分任务进行中' : (!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '')" @click="menuAction(() => emit('split', { force: true }))">重新规划画面（确认后应用）</AppMenuItem>
         <AppMenuItem :disabled="!editable" @click="plan">按镜头描述规划画面</AppMenuItem>
+        <AppMenuItem v-if="integrated" :disabled="!canGenerateMissing" @click="menuAction(() => emit('generate', missingFrames.map(frameKey)))">兼容旧方案：逐张生成缺失</AppMenuItem>
       </AppMenu>
     </div>
     <input ref="fileInput" class="frame-upload-input" type="file" accept="image/*" aria-label="上传分镜画面" @change="upload">
 
-    <StoryboardContactSheet v-if="frames.length && !editing" :panel="panel" :sheet="contactSheet" :active-frame-id="activeFrameId"
+    <StoryboardContactSheet v-if="frames.length && !showPlanning" :panel="panel" :sheet="contactSheet" :active-frame-id="activeFrameId"
       @select="selectSheetFrame" @retry="emit('retry-sheet')" />
     <div v-else-if="frames.length" class="frame-editor-grid">
       <article v-for="(frame, index) in frames" :key="frameKey(frame)" class="frame-card" :class="{ selected: activeFrameId === frameKey(frame) }">
@@ -237,38 +253,39 @@ watch(settingsFrame, frame => {
           </AppMenu>
         </header>
         <div class="frame-card-content">
-          <button type="button" class="frame-thumb" :aria-label="`查看画面 ${index + 1} 与生成设置`" @click="openSettings(frame, $event)">
+          <button type="button" class="frame-thumb" :aria-label="`查看画面 ${index + 1} 详情与微调`" @click="openSettings(frame, $event)">
             <img v-if="frame.url" :src="mediaUrl(frame.url)" :alt="frame.title || '分镜画面'" loading="lazy">
             <ImagePlus v-else :size="24" />
             <span v-if="panel.coverFrameId === frameKey(frame)" class="frame-cover"><Star :size="10" fill="currentColor" />封面</span>
           </button>
           <div class="frame-card-summary">
             <div class="frame-state" :class="status(frame).kind"><Loader2 v-if="status(frame).kind === 'busy'" :size="11" class="frame-spin" /><i v-else />{{ status(frame).label }}</div>
-            <p :title="frame.prompt || panelImageFallback(panel)">{{ frame.prompt || panelImageFallback(panel) || '点击生成设置，描述这张画面' }}</p>
-            <small>{{ frameReferenceUrls(frame).length }} 项参考 · {{ frame.shotType || panel.shotType || '默认景别' }}</small>
+            <p :title="frame.prompt || panelImageFallback(panel)">{{ frame.prompt || panelImageFallback(panel) || '打开画面规划，描述这张画面' }}</p>
+            <small>{{ frame.shotType || panel.shotType || '默认景别' }}</small>
           </div>
         </div>
         <p v-if="task(frame)?.status === 'failed'" class="frame-error" :title="task(frame)?.error || undefined">{{ task(frame)?.error || '生成失败，请检查设置后重试' }}</p>
         <footer class="frame-card-actions">
-          <button type="button" class="btn btn-sm" :disabled="!canGenerate(frame)" :title="!frameReferenceUrls(frame).length ? '请先在生成设置中选择参考素材' : ''"
+          <button v-if="!integrated" type="button" class="btn btn-sm" :disabled="!canGenerate(frame)" :title="!frameReferenceUrls(frame).length ? '请先绑定参考素材' : ''"
             @click="emit('generate', [frameKey(frame)], !!frame.url)"><Sparkles :size="12" />{{ frame.url ? '重新生成' : '生成' }}</button>
           <button v-if="frameHistoryCount(frame) > 1" type="button" class="btn btn-sm" title="切换历史图片" @click="openSettings(frame, $event)"><History :size="12" />历史 {{ frameHistoryCount(frame) }}</button>
           <button type="button" class="btn btn-sm" :disabled="!canEdit(frame) || !!uploading" @click="chooseUpload(frame)"><Upload :size="12" />上传</button>
-          <button type="button" class="btn btn-sm frame-settings-action" @click="openSettings(frame, $event)"><SlidersHorizontal :size="12" />生成设置</button>
+          <button type="button" class="btn btn-sm frame-settings-action" @click="openSettings(frame, $event)"><SlidersHorizontal :size="12" />{{ frame.url ? '画面详情' : '画面规划' }}</button>
         </footer>
       </article>
     </div>
     <div v-else class="frame-editor-empty">
       <ImagePlus :size="26" />
       <strong>还没有分镜画面</strong>
-      <p>用 AI 按镜头描述拆分画面，或手动添加。</p>
+      <p>用 AI 按镜头描述规划画面，或手动添加。</p>
       <div class="frame-editor-empty-actions">
         <button
           type="button" class="btn btn-sm btn-primary" :disabled="splitting || !editable"
           :title="!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '提交后台拆分任务'"
           @click="emit('split')"
-        ><Loader2 v-if="splitting" :size="13" class="frame-spin" /><Sparkles v-else :size="13" />{{ splitting ? '拆分中…' : 'AI 拆分画面' }}</button>
+        ><Loader2 v-if="splitting" :size="13" class="frame-spin" /><Sparkles v-else :size="13" />{{ splitting ? '规划中…' : 'AI 分镜规划' }}</button>
         <button type="button" class="btn btn-sm" :disabled="!editable" @click="plan">按描述规划</button>
+        <button v-if="integrated" type="button" class="btn btn-sm" :disabled="!canAdd" @click="add">添加画面</button>
       </div>
     </div>
     <footer v-if="usesStoryboardFrames || showVideoAction" class="frame-editor-video">
@@ -280,11 +297,15 @@ watch(settingsFrame, frame => {
       :key="`${settings.panelId}-${settings.frameId || settings.newFrame?.id}`"
       :panel="panel"
       :frame="settingsFrame"
+      :frame-number="frames.findIndex(frame => frameKey(frame) === frameKey(settingsFrame!)) + 1"
+      :can-refine-grid="canRefineGrid"
+      :can-refine-frame="canRefineFrame"
       :return-focus="settingsTrigger"
       :is-new="!!settings.newFrame"
       :editable="editable && (!settingsFrame || (!settingsFrame.locked && !inProgress(settingsFrame) && uploading !== frameKey(settingsFrame)))"
       @close="settings = undefined"
       @frame="saveSettings"
+      @refine="refineFrame"
     />
   </section>
 </template>

@@ -699,22 +699,27 @@
                       :editable="productionEditable && !productionFramePlanBusy"
                       :management-editable="productionGeneratable && !productionWorking"
                       :before-action="beforeProductionGridAction" :commit-adoption="adoptProductionGridCandidate" @busy="productionGridBusy = $event"
-                    />
-                    <StoryboardFramesEditor
-                      :panel="productionPanel"
-                      :contact-sheet="productionSheetById(productionPanel.id)"
-                      :generatable="productionGeneratable && !productionGridBusy"
-                      :video-input-ready="productionReferenceState(productionPanel.id).ready"
-                      :video-input-error="productionReferenceState(productionPanel.id).error"
-                      @retry-sheet="retryProductionContactSheet(productionPanel.id)"
-                      :editable="productionEditable && !productionFramePlanBusy && !productionGridBusy"
-                      :tasks="productionImageTasks"
-                      :video-generation-mode="videoGenerationMode"
-                      :title="videoUsesStoryboardFrames ? '2 · 分镜画面' : '分镜画面 · 仅用于预演'"
-                      @change="updateProductionFrames"
-                      @generate="generateProductionFrames"
-                      @split="splitProductionFrames"
-                    />
+                    >
+                      <template #default="{ planning, refineFrame, canRefineGrid, canRefineFrame }">
+                        <StoryboardFramesEditor
+                          integrated :planning="planning" :can-refine-grid="canRefineGrid" :can-refine-frame="canRefineFrame"
+                          @refine="refineFrame"
+                          :panel="productionPanel"
+                          :contact-sheet="productionSheetById(productionPanel.id)"
+                          :generatable="productionGeneratable && !productionGridBusy"
+                          :video-input-ready="productionReferenceState(productionPanel.id).ready"
+                          :video-input-error="productionReferenceState(productionPanel.id).error"
+                          @retry-sheet="retryProductionContactSheet(productionPanel.id)"
+                          :editable="productionEditable && !productionFramePlanBusy && !productionGridBusy"
+                          :tasks="productionImageTasks"
+                          :video-generation-mode="videoGenerationMode"
+                          :title="videoUsesStoryboardFrames ? '2 · 分镜画面' : '分镜画面 · 仅用于预演'"
+                          @change="updateProductionFrames"
+                          @generate="generateProductionFrames"
+                          @split="splitProductionFrames"
+                        />
+                      </template>
+                    </StoryboardGridTools>
                   </section>
                   <button
                     v-else-if="productionPanel"

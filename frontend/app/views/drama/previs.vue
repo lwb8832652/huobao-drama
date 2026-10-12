@@ -894,28 +894,33 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
                 :editable="editable && !framePlanSubmitting && !framePlanActive"
                 :management-editable="generatable && !working"
                 :before-action="beforeGridAction" :commit-adoption="adoptGridCandidate" @busy="gridBusy = $event"
-              />
-              <StoryboardFramesEditor
-                :key="`${version.id}-${panel.id}`"
-                :panel="panel"
-                :contact-sheet="sheetForPanel(panel)"
-                :video-input-ready="videoReferenceReadiness([panel], videoReferenceInputStrategy, videoCapability?.maxImages || 9, version.contactSheets || []).ready"
-                :video-input-error="videoReferenceReadiness([panel], videoReferenceInputStrategy, videoCapability?.maxImages || 9, version.contactSheets || []).error"
-                @retry-sheet="retryContactSheet(panel.id)"
-                :editable="editable && !gridBusy"
-                :generatable="generatable && !gridBusy"
-                :splitting="framePlanSubmitting || framePlanActive > 0"
-                :tasks="batches.filter(b => b.type === 'image').flatMap(b => b.items).filter(item => item.panelId === panel!.id)"
-                :video-generation-mode="videoGenerationMode"
-                :active-frame-id="activeFrameId"
-                :title="videoUsesStoryboardFrames ? '分镜画面 · 视频输入' : '分镜画面 · 仅用于预演'"
-                show-video-action
-                @change="updateFrames"
-                @split="options => options?.force ? (modal = 'split') : run(splitPanel)"
-                @settings-open="player?.stop()"
-                @generate="(ids, force) => run(() => generateFrames([panel!.id], ids, force))"
-                @video="videoPanelIds = [panel!.id]; modal = 'video'"
-              />
+              >
+                <template #default="{ planning, refineFrame, canRefineGrid, canRefineFrame }">
+                  <StoryboardFramesEditor
+                    integrated :planning="planning" :can-refine-grid="canRefineGrid" :can-refine-frame="canRefineFrame"
+                    @refine="refineFrame"
+                    :key="`${version.id}-${panel.id}`"
+                    :panel="panel"
+                    :contact-sheet="sheetForPanel(panel)"
+                    :video-input-ready="videoReferenceReadiness([panel], videoReferenceInputStrategy, videoCapability?.maxImages || 9, version.contactSheets || []).ready"
+                    :video-input-error="videoReferenceReadiness([panel], videoReferenceInputStrategy, videoCapability?.maxImages || 9, version.contactSheets || []).error"
+                    @retry-sheet="retryContactSheet(panel.id)"
+                    :editable="editable && !gridBusy"
+                    :generatable="generatable && !gridBusy"
+                    :splitting="framePlanSubmitting || framePlanActive > 0"
+                    :tasks="batches.filter(b => b.type === 'image').flatMap(b => b.items).filter(item => item.panelId === panel!.id)"
+                    :video-generation-mode="videoGenerationMode"
+                    :active-frame-id="activeFrameId"
+                    :title="videoUsesStoryboardFrames ? '分镜画面 · 视频输入' : '分镜画面 · 仅用于预演'"
+                    show-video-action
+                    @change="updateFrames"
+                    @split="options => options?.force ? (modal = 'split') : run(splitPanel)"
+                    @settings-open="player?.stop()"
+                    @generate="(ids, force) => run(() => generateFrames([panel!.id], ids, force))"
+                    @video="videoPanelIds = [panel!.id]; modal = 'video'"
+                  />
+                </template>
+              </StoryboardGridTools>
             </template>
             <template v-else-if="inspector === 'issues'">
               <section v-if="edge" class="pv-ai-review">

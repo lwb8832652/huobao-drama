@@ -37,6 +37,114 @@ const draft = () => ({
 })
 const complete = () => ({ items: [{ id: 13, panelId: 7, status: 'completed' }], plans: [draft()] })
 
+function frameDetails(frame, extra = {}) {
+  const descriptor = parse(read('../app/components/previs/FrameSettingsDialog.vue')).descriptor
+  const script = compileScript(descriptor, { id: 'frame-details-test' })
+  const component = evaluate(script.content, {
+    vue: { ...vue, useId: () => 'details', onMounted() {}, onBeforeUnmount() {}, onUnmounted() {} },
+    'lucide-vue-next': {}, '~/composables/usePrevis': domain,
+  }).default
+  const changes = [], props = { panel: panel(), frame, editable: true, canRefineGrid: true, canRefineFrame: true, ...extra }
+  const setup = component.setup(props, { expose() {}, emit: (event, ...args) => changes.push({ event, args }) })
+  setup.form.value = { reportValidity: () => true }
+  return { setup, props, changes, descriptor, script }
+}
+
+test('frame details default to group continuity and emit a direct refinement with no planning write', () => {
+  for (const mode of ['grid_edit', 'frame_edit']) {
+    const h = frameDetails({ ...domain.makeFrame('two'), url: '/static/two.png' })
+    assert.equal(h.setup.refinementMode.value, 'grid_edit')
+    assert.equal(h.setup.planningOpen.value, false)
+    h.setup.refinementMode.value = mode; h.setup.refinementInstruction.value = '  右手放低  '
+    h.setup.refine()
+    assert.equal(h.changes.length, 1)
+    assert.equal(h.changes[0].event, 'refine')
+    assert.deepEqual(JSON.parse(JSON.stringify(h.changes[0].args[0])), { frameId: 'two', mode, instruction: '右手放低' })
+  }
+})
+
+test('saving planning retains existing image and references and never requests generation', () => {
+  const h = frameDetails({ ...domain.makeFrame('two'), url: '/static/two.png', referenceImages: ['/static/old-reference.png'] })
+  h.setup.draft.value.prompt = '抬头'; h.setup.draft.value.continuity = '服装沿用上一格'
+  h.setup.save(true)
+  assert.equal(h.changes.length, 1)
+  assert.equal(h.changes[0].event, 'frame')
+  assert.equal(h.changes[0].args[0].prompt, '抬头')
+  assert.equal(h.changes[0].args[0].continuity, '服装沿用上一格')
+  assert.equal(h.changes[0].args[0].url, undefined)
+  assert.equal(h.changes[0].args[0].referenceImages, undefined)
+  assert.equal(h.changes[0].args[1], false)
+  assert.doesNotMatch(h.descriptor.template.content, /保存并|toggleReference|settings-assets/)
+})
+
+test('missing images open planning and locked or unsupported details cannot refine or restore', () => {
+  const missing = frameDetails(domain.makeFrame('missing'))
+  assert.equal(missing.setup.planningOpen.value, true)
+  missing.setup.refinementInstruction.value = '改光线'; missing.setup.refine()
+  assert.equal(missing.changes.length, 0)
+  for (const extra of [{ editable: false }, { canRefineGrid: false, canRefineFrame: false }, { frame: { ...domain.makeFrame('locked'), locked: true, url: '/static/locked.png' } }]) {
+    const h = frameDetails({ ...domain.makeFrame('two'), url: '/static/two.png' }, extra)
+    h.setup.refinementInstruction.value = '改光线'; h.setup.refine()
+    assert.equal(h.changes.length, 0)
+    if (h.props.frame.locked || !h.props.editable) { h.setup.save(); assert.equal(h.changes.length, 0) }
+  }
+})
+
+test('using a historical version restores only the image provenance and leaves planning drafts unsaved', () => {
+  const h = frameDetails({ ...domain.makeFrame('two'), url: '/static/current.png', prompt: '原规划', history: [{ url: '/static/old.png', taskId: 2, source: { candidateId: 3, mode: 'generate' } }] })
+  h.setup.draft.value.prompt = '尚未确认的规划'; h.setup.draft.value.url = '/static/old.png'
+  h.setup.saveHistory()
+  assert.equal(h.changes[0].args[0].url, '/static/old.png')
+  assert.equal(h.changes[0].args[0].taskId, 2)
+  assert.equal(h.changes[0].args[0].source.candidateId, 3)
+  assert.equal(h.changes[0].args[0].prompt, undefined)
+  assert.match(h.descriptor.template.content, /<details\s+v-if="[^"]*" class="settings-history"/)
+})
+
+test('integrated overview stays on the sheet when details open and routes one guarded refinement', () => {
+  const descriptor = parse(read('../app/components/previs/StoryboardFramesEditor.vue')).descriptor
+  const component = evaluate(compileScript(descriptor, { id: 'integrated-details' }).content, {
+    vue, 'vue-sonner': { toast: {} }, 'lucide-vue-next': {},
+    '~/components/AppMenu.vue': {}, '~/components/AppMenuItem.vue': {}, './FrameSettingsDialog.vue': {},
+    './StoryboardContactSheet.vue': {}, '~/composables/useApi': { uploadAPI: {} },
+    '~/composables/usePrevis': { ...domain, ...contract },
+  }).default
+  const changes = [], target = panel(); target.frames = [{ ...domain.makeFrame('one'), url: '/static/current.png' }]
+  const props = { panel: target, editable: true, tasks: [], integrated: true, planning: false, canRefineGrid: true, canRefineFrame: true }
+  const setup = component.setup(props, { expose() {}, emit: (event, ...args) => changes.push({ event, args }) })
+  setup.selectSheetFrame('one', { currentTarget: {} })
+  assert.equal(setup.editing.value, false); assert.equal(setup.showPlanning.value, false)
+  setup.refineFrame({ frameId: 'one', mode: 'grid_edit', instruction: '调整视线' })
+  assert.equal(changes.filter(change => change.event === 'refine').length, 1)
+  assert.equal(setup.settings.value, undefined)
+  setup.selectSheetFrame('one', { currentTarget: {} }); target.frames[0].locked = true
+  setup.refineFrame({ frameId: 'one', mode: 'frame_edit', instruction: '调整视线' })
+  assert.equal(changes.filter(change => change.event === 'refine').length, 1)
+})
+
+test('single image uploads preserve the previous source and stop if the frame becomes locked', async () => {
+  const descriptor = parse(read('../app/components/previs/StoryboardFramesEditor.vue')).descriptor
+  let completeUpload
+  const component = evaluate(compileScript(descriptor, { id: 'upload-provenance' }).content, {
+    vue, 'vue-sonner': { toast: {} }, 'lucide-vue-next': {},
+    '~/components/AppMenu.vue': {}, '~/components/AppMenuItem.vue': {}, './FrameSettingsDialog.vue': {},
+    './StoryboardContactSheet.vue': {}, '~/composables/useApi': { uploadAPI: { image: () => new Promise(resolve => { completeUpload = resolve }) } },
+    '~/composables/usePrevis': { ...domain, ...contract },
+  }).default
+  for (const locked of [false, true]) {
+    const changes = [], target = panel(); target.frames = [{ ...domain.makeFrame('one'), url: '/static/current.png', taskId: 2, source: { candidateId: 3, mode: 'frame_edit' } }]
+    const setup = component.setup({ panel: target, editable: true, tasks: [] }, { expose() {}, emit: (event, ...args) => changes.push({ event, args }) })
+    setup.chooseUpload(target.frames[0]); const operation = setup.upload({ target: { files: [{}], value: 'selected' } })
+    target.frames[0].locked = locked; completeUpload({ path: '/static/upload.png' }); await operation
+    if (locked) assert.equal(changes.length, 0)
+    else {
+      const uploaded = changes[0].args[0][0]
+      assert.equal(uploaded.source, undefined)
+      assert.equal(uploaded.history.find(entry => entry.url === '/static/current.png').source.candidateId, 3)
+    }
+  }
+})
+
 function harness({ results = [complete()], saveResult = true, requestError } = {}) {
   const requests = [], notices = [], disposers = []
   const toast = Object.fromEntries(['error', 'success', 'info'].map(kind => [kind, message => notices.push({ kind, message })]))
