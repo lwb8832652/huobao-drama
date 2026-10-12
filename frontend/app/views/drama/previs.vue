@@ -422,7 +422,12 @@ const framePlanSubmitting = ref(false)
 async function submitFrameSplit(panelIds: number[], force = false, count?: number) {
   if (!version.value || !panelIds.length) { toast.error('没有可拆分的镜头，请先选中一个镜头'); return }
   if (version.value.status === 'locked') { toast.error('当前版本已锁定，请复制为新草稿后再拆分画面'); return }
-  if (!editable.value) { toast.error('正在处理其他操作或生成任务，请稍后再拆分'); return }
+  if (!editable.value) {
+    toast.error(working.value
+      ? '正在处理其他操作，请稍后再拆分'
+      : '关键帧生成任务进行中，请稍后再拆分')
+    return
+  }
   if (!await save() || !version.value) return
   const choice = modelChoice('text')
   framePlanSubmitting.value = true
@@ -846,6 +851,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
                 :key="`${version.id}-${panel.id}`"
                 :panel="panel"
                 :editable="editable"
+                :splitting="framePlanSubmitting || framePlanActive > 0"
                 :tasks="batches.filter(b => b.type === 'image').flatMap(b => b.items).filter(item => item.panelId === panel!.id)"
                 :video-generation-mode="videoGenerationMode"
                 :active-frame-id="activeFrameId"

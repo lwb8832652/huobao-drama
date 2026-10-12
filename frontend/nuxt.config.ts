@@ -49,5 +49,13 @@ export default defineNuxtConfig({
       },
     },
   },
+  // 生产构建（nuxt build）的 /api 转发：dev 用上面的 vite proxy，生产用 Nitro routeRules。
+  // 注意 nitro proxy 的 ** 只替换通配部分（不含前缀），需保留 /api、/static 前缀
+  nitro: {
+    routeRules: {
+      '/api/**': { proxy: 'http://localhost:5679/api/**' },
+      '/static/**': { proxy: 'http://localhost:5679/static/**' },
+    },
+  },
   compatibilityDate: '2025-05-15',
 })

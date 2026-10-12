@@ -4,6 +4,7 @@
  */
 import { db, getInsertId, schema } from '../db/index.js'
 import { and, eq, isNotNull } from 'drizzle-orm'
+import { Agent } from 'undici'
 import { getActiveConfig, getConfigById } from './ai.js'
 import { now } from '../utils/response.js'
 import { downloadFile, fetchImageAsCompressedDataUrl, generateImageThumb, readImageAsCompressedDataUrl, saveBase64Image } from '../utils/storage.js'
@@ -15,6 +16,13 @@ import { logTaskError, logTaskPayload, logTaskProgress, logTaskStart, logTaskSuc
 type TaskType = 'image' | 'video'
 
 const taskLabel = (type: TaskType) => (type === 'image' ? 'ImageTask' : 'VideoTask')
+
+// 生成类上游（同步工作流如 Nuwax）响应可达 5 分钟以上；Node 全局 fetch 底层默认
+// headersTimeout 仅 300s，会先于下方的 AbortSignal.timeout(600s) 掐断请求，
+// 表现为上游还在生成、任务却落 "fetch failed"（sys_task #25/#31 即此因）。
+// 挂 10 分钟 dispatcher 后，实际超时由 AbortSignal 统一控制。
+// 注意：需与 Node 内置 undici 同大版本（Node 22 = undici 6.x），跨大版本会报 invalid onRequestStart。
+const generationDispatcher = new Agent({ headersTimeout: 600_000, bodyTimeout: 600_000 })
 
 // 轮询节奏：图片 5s×120（上限 10 分钟）；视频 10s×300
 const POLL_PROFILES: Record<TaskType, { attempts: number; intervalMs: number; maxDurationMs: number | null }> = {
@@ -312,7 +320,8 @@ async function processTask(id: number, config: AIConfig) {
       headers,
       body: isMultipart ? (body as FormData) : JSON.stringify(body),
       signal: AbortSignal.timeout(600_000),
-    })
+      dispatcher: generationDispatcher,
+    } as RequestInit)
 
     if (!resp.ok) throw new Error(`API error ${resp.status}: ${await resp.text()}`)
     const result = await resp.json() as any
@@ -406,7 +415,8 @@ async function pollTask(record: SysTaskRecord, config: AIConfig, taskId: string)
         method,
         headers,
         signal: AbortSignal.timeout(remainingMs),
-      })
+        dispatcher: generationDispatcher,
+      } as RequestInit)
       if (!resp.ok) continue
       const result = await resp.json() as any
 

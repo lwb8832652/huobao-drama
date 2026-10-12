@@ -22,8 +22,10 @@ const props = withDefaults(defineProps<{
   videoGenerationMode?: 'direct' | 'storyboard_frames'
   activeFrameId?: string
   title?: string
+  /** 拆分任务提交中或排队中：与资产批量生成一致，按钮转圈显示“拆分中…” */
+  splitting?: boolean
 }>(), {
-  tasks: () => [], showVideoAction: false, videoGenerationMode: 'direct', activeFrameId: '', title: '分镜画面',
+  tasks: () => [], showVideoAction: false, videoGenerationMode: 'direct', activeFrameId: '', title: '分镜画面', splitting: false,
 })
 const emit = defineEmits<{
   change: [frames: Keyframe[], coverFrameId?: string]
@@ -179,8 +181,8 @@ watch(settingsFrame, frame => {
         @click="emit('generate', missingFrames.map(frameKey))"><Sparkles :size="13" />生成缺失<span v-if="missingVideoFrames">{{ missingVideoFrames }}</span></button>
       <AppMenu v-model:open="toolbarMenu" placement="bottom-end">
         <template #trigger><button type="button" class="btn btn-sm frame-icon" title="更多画面操作" aria-label="更多画面操作"><MoreHorizontal :size="16" /></button></template>
-        <AppMenuItem :disabled="!editable" @click="menuAction(() => emit('split'))"><Sparkles :size="13" />AI 拆分画面</AppMenuItem>
-        <AppMenuItem v-if="frames.length" :disabled="!editable" @click="menuAction(() => emit('split', { force: true }))">重新拆分画面（覆盖现有）</AppMenuItem>
+        <AppMenuItem :disabled="splitting" :title="splitting ? '拆分任务进行中' : (!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '')" @click="menuAction(() => emit('split'))"><Sparkles :size="13" />AI 拆分画面</AppMenuItem>
+        <AppMenuItem v-if="frames.length" :disabled="splitting" :title="splitting ? '拆分任务进行中' : (!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '')" @click="menuAction(() => emit('split', { force: true }))">重新拆分画面（覆盖现有）</AppMenuItem>
         <AppMenuItem :disabled="!editable" @click="plan">按镜头描述规划画面</AppMenuItem>
       </AppMenu>
     </div>
@@ -228,10 +230,10 @@ watch(settingsFrame, frame => {
       <p>用 AI 按镜头描述拆分画面，或手动添加。</p>
       <div class="frame-editor-empty-actions">
         <button
-          type="button" class="btn btn-sm btn-primary" :disabled="!editable"
+          type="button" class="btn btn-sm btn-primary" :disabled="splitting"
           :title="!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '提交后台拆分任务'"
           @click="emit('split')"
-        ><Sparkles :size="13" />AI 拆分画面</button>
+        ><Loader2 v-if="splitting" :size="13" class="frame-spin" /><Sparkles v-else :size="13" />{{ splitting ? '拆分中…' : 'AI 拆分画面' }}</button>
         <button type="button" class="btn btn-sm" :disabled="!editable" @click="plan">按描述规划</button>
       </div>
     </div>

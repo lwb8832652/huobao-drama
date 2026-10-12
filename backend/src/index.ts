@@ -39,8 +39,12 @@ const projectRoot = path.resolve(__dirname, '../..')
 const app = new Hono()
 
 // Middleware
+// CORS 白名单：不写死具体 IP（开发机 DHCP 地址会变）。放行 localhost 与所有内网网段
+// （192.168/10/172.16-31）的任意端口——局域网内其他电脑、frp 代理访问均覆盖。
+// 非内网 Origin 一律不放行（生产环境前端应同源访问，无需 CORS）。
+const LAN_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(:\d{1,5})?$/
 app.use('*', cors({
-  origin: ['http://localhost:3013', 'http://localhost:5679'],
+  origin: (origin) => (origin && LAN_ORIGIN_RE.test(origin) ? origin : undefined),
   credentials: true,
 }))
 app.use('*', requestLogger)
