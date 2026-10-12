@@ -5,6 +5,11 @@ import { getImageAdapter, getVideoAdapter } from './adapters/registry.js'
 import { generateImage, generateVideo, recoverPrevisTasks, startQueuedPrevisTask } from './generation.js'
 import { now } from '../utils/response.js'
 import { getDramaStylePrompt } from './style-preset.js'
+import { FRAME_COUNT_MAX } from './previs-frame-contract.js'
+import { scheduleContactSheets } from './previs-contact-sheets.js'
+import { buildVideoReferenceInput, videoReferenceMatchesSource } from './previs-video-reference.js'
+import { normalizeSnapshotImages } from './previs-video-reference-normalizer.js'
+import { videoReferenceLegend, videoReferenceFramesMatch, type VideoReferenceInputStrategy } from './previs-video-reference-domain.js'
 import {
   frameKey, normalizeTimeline, orderedFrames, groupPanels, panelImageFallback,
   type FrameType, type Timeline, type Panel, type VideoGenerationMode,
@@ -30,12 +35,15 @@ interface BatchOptions {
   frameIds?: string[]
   force?: boolean
   generationMode?: VideoGenerationMode
+  videoReferenceInputStrategy?: VideoReferenceInputStrategy
+  generationScope?: 'storyboard' | 'group'
 }
 export function videoInputs(
   t: Timeline,
   panels: Panel[],
   provider: string,
   generationMode: VideoGenerationMode = 'direct',
+  preparedReferenceUrls?: string[],
 ) {
   const cap = videoCapabilities[provider as keyof typeof videoCapabilities]
   if (!cap) throw new PrevisError('当前视频服务尚未声明预演生成能力')
@@ -52,7 +60,7 @@ export function videoInputs(
   if (missing.length) {
     throw new PrevisError(`「${panels[0].title}」还有 ${missing.length} 张分镜画面未完成，请全部生成或上传后再生成视频`)
   }
-  const availableReferences = [...new Set(generationMode === 'storyboard_frames'
+  const availableReferences = preparedReferenceUrls || [...new Set(generationMode === 'storyboard_frames'
     ? allFrames.map(frame => frame.url)
     : panels.flatMap(panel => panel.referenceImages).filter(Boolean))]
   if (generationMode === 'storyboard_frames' && availableReferences.length > cap.maxImages) {
@@ -76,6 +84,11 @@ export async function createBatch(versionId: number, options: BatchOptions) {
   if (row.revision !== options.revision) throw new PrevisError('版本已更新，请刷新后生成', 409)
   if (row.status === 'locked' && row.contentHash !== hashContent(raw)) throw new PrevisError('锁定版本内容校验失败', 409)
   if (options.type === 'image') requireEditable(versionId, options.revision)
+  if (options.type === 'video' && options.generationMode === 'storyboard_frames') {
+    const oversized = t.panels.find(panel => (!options.panelIds?.length || options.panelIds.includes(panel.id))
+      && panel.frames.length > FRAME_COUNT_MAX)
+    if (oversized) throw new PrevisError(`「${oversized.title}」共有 ${oversized.frames.length} 张分镜画面，最多支持 ${FRAME_COUNT_MAX} 张，请先删减画面再生成视频`)
+  }
   const configId = options.configId || (options.type === 'image' ? ep.imageConfigId : ep.videoConfigId) || await getActiveConfigId(options.type)
   const configRow = configId ? db.select().from(schema.aiServiceConfigs).where(eq(schema.aiServiceConfigs.id, configId)).get() : null
   if (!configRow?.isActive || configRow.serviceType !== options.type) throw new PrevisError(`请先在设置中启用${options.type === 'image' ? '图片' : '视频'}模型`)
@@ -89,11 +102,15 @@ export async function createBatch(versionId: number, options: BatchOptions) {
   const style = await getDramaStylePrompt(ep.dramaId)
   const items: { groupId: string; panelId: number | null; frameType: FrameType | null; requestJson: string }[] = []
   if (options.panelIds?.some(id => !t.panels.some(p => p.id === id))) throw new PrevisError('选择的分镜不属于当前版本')
-  for (const group of t.groups) {
+  const generationScope = options.type === 'video' ? options.generationScope || 'storyboard' : 'storyboard'
+  const generationTimeline = { ...t, strategy: { ...t.strategy, mode: generationScope } }
+  const selectedIds = t.groups.flatMap(group => group.panelIds).filter(id => !options.panelIds?.length || options.panelIds.includes(id))
+  const groups = generationScope === 'group' ? [{ id: `selection-${selectedIds.join('-')}`, title: '所选分镜', note: '', panelIds: selectedIds, entry: {}, exit: {} }] : t.groups
+  for (const group of groups) {
     const allPanels = groupPanels(t, group)
     const selected = allPanels.filter(p => !options.panelIds?.length || options.panelIds.includes(p.id))
     // A group job always represents the complete group, including its timing and endpoints.
-    const panels = options.type === 'video' && t.strategy.mode === 'group' && selected.length ? allPanels : selected
+    const panels = options.type === 'video' && generationScope === 'group' && selected.length ? allPanels : selected
     if (options.type === 'image') {
       getImageAdapter(config.provider)
       for (const panel of panels) {
@@ -132,8 +149,14 @@ export async function createBatch(versionId: number, options: BatchOptions) {
         }
       }
     } else {
-      for (const unit of t.strategy.mode === 'group' ? (panels.length ? [panels] : []) : panels.map(p => [p])) {
-        const inputs = videoInputs(t, unit, config.provider, generationMode)
+      for (const unit of generationScope === 'group' ? (panels.length ? [panels] : []) : panels.map(p => [p])) {
+        const cap = videoCapabilities[config.provider as keyof typeof videoCapabilities]
+        if (!cap) throw new PrevisError('当前视频服务尚未声明预演生成能力')
+        const referenceInput = generationMode === 'storyboard_frames'
+          ? await buildVideoReferenceInput(versionId, unit, options.videoReferenceInputStrategy || 'auto', cap.maxImages, generationScope) : undefined
+        // Decode and enforce the transport budget for every unit before any jobs exist.
+        const validatedImages = referenceInput ? await normalizeSnapshotImages(referenceInput) : undefined
+        const inputs = videoInputs(generationTimeline, unit, config.provider, generationMode, referenceInput?.imageUrls)
         const referenceLegend = generationMode === 'storyboard_frames'
           ? unit.flatMap(p => orderedFrames(p).map((frame, i) => {
             const index = inputs.referenceImageUrls.indexOf(frame.url)
@@ -143,7 +166,7 @@ export async function createBatch(versionId: number, options: BatchOptions) {
             const index = inputs.referenceImageUrls.indexOf(url)
             return index < 0 ? '' : `@图片${index + 1}：${p.referenceLabels?.[i] || '绑定素材'}`
           })).filter(Boolean)
-        const prompt = [style, ...new Set(referenceLegend), ...unit.map(p => {
+        const prompt = [style, ...(referenceInput ? [videoReferenceLegend(referenceInput, unit)] : [...new Set(referenceLegend)]), ...unit.map(p => {
           let text = (p.videoPrompt || [p.description, p.atmosphere].filter(Boolean).join('\n')).replace(/@图片(\d+)/g, (_, n) => {
             const index = inputs.referenceImageUrls.indexOf(p.referenceImages[Number(n) - 1])
             return index < 0 ? (p.referenceLabels?.[Number(n) - 1] || '') : `@图片${index + 1}`
@@ -160,15 +183,17 @@ export async function createBatch(versionId: number, options: BatchOptions) {
           }
           return `[${p.durationMs / 1000}秒] ${text}`
         })].filter(Boolean).join('\n')
-        const request = { ...inputs, storyboardId: t.strategy.mode === 'storyboard' ? unit[0].id : undefined,
-          panelIds: unit.map(p => p.id), inputHash: videoFingerprint(t, unit, generationMode),
+        if (referenceInput && prompt.length > 20_000) throw new PrevisError('视频提示词超过 20000 字符，请缩短描述后重试；本批次未提交')
+        const request = { ...inputs, generationScope, storyboardId: generationScope === 'storyboard' ? unit[0].id : undefined,
+          panelIds: unit.map(p => p.id), inputHash: videoFingerprint(generationTimeline, unit, generationMode, referenceInput),
+          referenceInput, videoReferenceInputStrategy: referenceInput?.requested,
           dramaId: ep.dramaId, prompt, model, configId, aspectRatio: drama?.aspectRatio || '16:9', resolution: ep.resolution || '720p' }
         // Validate the contract before persisting any jobs or making a paid call.
         // Static images are converted to data URLs by generation.ts; use web URLs for contract validation only.
         const validationUrl = (url?: string) => url && /^\/?static\//.test(url) ? `https://local.invalid/${url}` : url
         getVideoAdapter(config.provider).buildGenerateRequest(config, {
           ...request, id: 0, firstFrameUrl: validationUrl(request.firstFrameUrl), lastFrameUrl: validationUrl(request.lastFrameUrl),
-          referenceImageUrls: JSON.stringify(request.referenceImageUrls.map(validationUrl)),
+          referenceImageUrls: JSON.stringify(validatedImages || request.referenceImageUrls.map(validationUrl)),
         })
         items.push({ groupId: group.id, panelId: request.storyboardId || null, frameType: null, requestJson: JSON.stringify(request) })
       }
@@ -187,7 +212,11 @@ export async function createBatch(versionId: number, options: BatchOptions) {
   db.transaction(tx => {
     // Config lookup above is asynchronous; recheck revision and locks inside the write transaction.
     if (options.type === 'image') requireEditable(versionId, options.revision)
-    else if (versionRow(versionId).revision !== options.revision) throw new PrevisError('版本已更新，请刷新后生成', 409)
+    else {
+      if (versionRow(versionId).revision !== options.revision) throw new PrevisError('版本已更新，请刷新后生成', 409)
+      const currentDrama = tx.select().from(schema.dramas).where(eq(schema.dramas.id, ep.dramaId)).get()
+      if ((currentDrama?.aspectRatio || '16:9') !== (drama?.aspectRatio || '16:9')) throw new PrevisError('项目画布比例已更新，请刷新后生成', 409)
+    }
     if (tx.select().from(schema.batchRuns).where(and(eq(schema.batchRuns.versionId, versionId), eq(schema.batchRuns.requestHash, requestHash))).get()) return
     const batchId = Number(tx.insert(schema.batchRuns).values({
       versionId, type: options.type, requestHash, configId: configRow.id, model, createdAt: now(),
@@ -293,8 +322,8 @@ function reconcile() {
                 const r = JSON.parse(i.requestJson)
                 return i.id > item.id && (r.panelIds || (i.panelId ? [i.panelId] : [])).includes(panel.id)
               })
-              if (!newer && (!request.inputHash || request.inputHash === videoFingerprint(
-                timeline, [panel], request.generationMode || 'storyboard_frames',
+              if (!newer && (!request.referenceInput || videoReferenceMatchesSource(row.id, request.referenceInput, [panel])) && (!request.inputHash || request.inputHash === videoFingerprint(
+                timeline, [panel], request.generationMode || 'storyboard_frames', request.referenceInput,
               ))) {
                 if (row.status !== 'locked') { panel.videoUrl = url; changed = true }
                 if (isCurrentVersion(row.id)) tx.update(schema.storyboards).set({ videoUrl: url, updatedAt: now() })
@@ -313,6 +342,7 @@ function reconcile() {
                   updatedAt: now(),
                 }).where(eq(schema.storyboards.id, panel.id)).run()
               }
+              if (batch.type === 'image') scheduleContactSheets(row.id)
             }
           }
         }

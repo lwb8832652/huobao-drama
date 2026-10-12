@@ -1,8 +1,12 @@
 import { createHash } from 'node:crypto'
+import { readContactSheets, scheduleContactSheets } from './previs-contact-sheets.js'
+import { videoReferenceFramesMatch, type VideoReferenceInput } from './previs-video-reference-domain.js'
+import { videoReferenceMatchesSource } from './previs-video-reference.js'
 import { z } from 'zod'
 import { and, desc, eq, inArray, isNull } from 'drizzle-orm'
 import { db, schema } from '../db/index.js'
 import { now } from '../utils/response.js'
+import { FRAME_COUNT_MAX, frameCountChangeAllowed } from './previs-frame-contract.js'
 import {
   autoGroup, checkContinuity, defaultStrategy, rebuildTransitions, normalizeTimeline, frameKey, retimeBoundAudio,
   timelineSegments, panelImageFallback, type Timeline, type Panel, type AnimaticVersion, type BatchRun,
@@ -18,6 +22,14 @@ const ms = z.number().int().min(0).max(86_400_000)
 const url = z.string().max(4000).refine(v => !v || /^(\/?static\/[^?#]+|https?:\/\/)/.test(v), '媒体地址必须为 static 路径或 HTTP(S) URL')
 const state = z.record(z.string().max(80), z.string().max(2000))
 const constraint = z.enum(['auto', 'first_last', 'first', 'reference', 'text'])
+const referenceInputSchema = z.object({
+  generationScope: z.enum(['storyboard', 'group']).optional(),
+  version: z.literal(1), requested: z.enum(['auto', 'individual', 'contact_sheet']), effective: z.enum(['individual', 'contact_sheet']),
+  aspectRatio: z.string().max(30), imageUrls: z.array(url).max(1000), imageDigests: z.array(z.string().length(64)).max(1000),
+  panels: z.array(z.object({ panelId: id, durationMs: ms, sheetId: id.nullable(), sheetHash: z.string().max(64).nullable(),
+    frames: z.array(z.object({ frameId: z.string().max(100), imageIndex: id, gridIndex: id.nullable(), offsetMs: ms, sourceUrl: url })).max(9),
+  })).max(1000),
+})
 export const timelineSchema = z.object({
   schemaVersion: z.union([z.literal(1), z.literal(2)]),
   groups: z.array(z.object({
@@ -56,6 +68,8 @@ export const timelineSchema = z.object({
   inheritedOutputs: z.array(z.object({
     key: z.string(), panelIds: z.array(id), url, taskId: id.optional(),
     generationMode: z.enum(['direct', 'storyboard_frames']).optional(), stale: z.boolean(),
+    referenceInput: referenceInputSchema.optional(),
+    generationScope: z.enum(['storyboard', 'group']).optional(),
   })).optional(),
 })
 
@@ -80,6 +94,10 @@ export function validateTimeline(input: unknown, original?: Timeline): Timeline 
   if (t.strategy.minDurationMs > t.strategy.maxDurationMs) throw new PrevisError('最短组时长不能超过最长组时长')
   if (new Set(t.audio.map(a => a.id)).size !== t.audio.length) throw new PrevisError('音频片段 ID 重复')
   for (const p of t.panels) {
+    const before = original?.panels.find(panel => panel.id === p.id)
+    if (original && !frameCountChangeAllowed(p.frames, before?.frames)) {
+      throw new PrevisError(`每个镜头最多 ${FRAME_COUNT_MAX} 张画面；旧方案超限时只能保留或删除已有画面`)
+    }
     if (new Set(p.frames.map(frameKey)).size !== p.frames.length) throw new PrevisError('同一分镜的画面 ID 不能重复')
     if (p.frames.some(f => (f.offsetMs || 0) >= p.durationMs)) throw new PrevisError('画面时间点必须在分镜时长以内')
     if (p.frames.some(f => f.referenceImages?.some(url => !p.referenceImages.includes(url)))) {
@@ -102,10 +120,11 @@ export function frameFingerprint(frame: Keyframe, panel?: Panel) {
     movement: panel?.movement, composition: frame.composition,
   })
 }
-export function videoFingerprint(t: Timeline, panels: Panel[], generationMode: VideoGenerationMode = 'storyboard_frames') {
+export function videoFingerprint(t: Timeline, panels: Panel[], generationMode: VideoGenerationMode = 'storyboard_frames', referenceInput?: VideoReferenceInput) {
   return hashContent({
-    mode: t.strategy.mode,
+    mode: referenceInput?.generationScope || t.strategy.mode,
     generationMode,
+    ...(referenceInput ? { referenceInput } : {}),
     panels: panels.map(p => ({
       id: p.id, description: p.description, atmosphere: p.atmosphere, prompt: p.videoPrompt, durationMs: p.durationMs,
       references: generationMode === 'direct' ? p.referenceImages : undefined,
@@ -322,7 +341,7 @@ export function readBatches(versionId: number): BatchRun[] {
         status: item.status, taskId: item.taskId, error: item.error, frameId: request.frameId,
         localPath: task?.localPath, resultUrl: task?.resultUrl,
         actualStrategy: request.actualStrategy, generationMode: request.generationMode,
-        panelIds: request.panelIds, inputHash: request.inputHash,
+        panelIds: request.panelIds, inputHash: request.inputHash, referenceInput: request.referenceInput, generationScope: request.generationScope,
       }
     }),
   }))
@@ -336,7 +355,7 @@ export function getVersion(versionId: number): AnimaticVersion {
   const batches = readBatches(versionId)
   return { ...row, status: row.status as AnimaticVersion['status'], timeline, issues: checkContinuity(timeline),
     isCurrent: isCurrentVersion(versionId), outputs: resolveVideoOutputs(versionId, timeline, batches),
-    busy: isBusy(versionId, batches), batches }
+    busy: isBusy(versionId, batches), batches, contactSheets: readContactSheets(versionId) }
 }
 export function resolveVideoOutputs(
   versionId: number,
@@ -354,20 +373,25 @@ export function resolveVideoOutputs(
     if (!url) continue
     trackedUrls.add(url)
     const panels = ids.map(id => timeline.panels.find(p => p.id === id)!)
-    const stale = !!item.inputHash && item.inputHash !== videoFingerprint(
-      timeline, panels, item.generationMode || 'storyboard_frames',
-    )
+    const sourceOrder = timelineSegments(timeline).map(segment => segment.panel.id).filter(id => ids.includes(id))
+    const orderChanged = item.generationScope === 'group' && sourceOrder.some((id, i) => id !== ids[i])
+    const inputTimeline = item.generationScope ? { ...timeline, strategy: { ...timeline.strategy, mode: item.generationScope } } : timeline
+    const stale = (!!item.inputHash && item.inputHash !== videoFingerprint(
+      inputTimeline, panels, item.generationMode || 'storyboard_frames', item.referenceInput,
+    )) || orderChanged || (!!item.referenceInput && !videoReferenceMatchesSource(versionId, item.referenceInput, panels))
     results.push({
       key: `task-${item.taskId}`, panelIds: ids, url, taskId: item.taskId,
-      generationMode: item.generationMode, stale,
+      generationMode: item.generationMode, generationScope: item.generationScope, referenceInput: item.referenceInput, stale,
     })
     if (!stale) ids.forEach(id => claimed.add(id))
   }
   for (const output of timeline.inheritedOutputs || []) {
     trackedUrls.add(output.url)
     if (output.panelIds.some(id => claimed.has(id) || !timeline.panels.some(p => p.id === id))) continue
-    results.push(output)
-    if (!output.stale) output.panelIds.forEach(id => claimed.add(id))
+    const order = timelineSegments(timeline).map(segment => segment.panel.id).filter(id => output.panelIds.includes(id))
+    const stale = output.stale || (output.generationScope === 'group' && order.some((id, i) => id !== output.panelIds[i])) || (!!output.referenceInput && !videoReferenceMatchesSource(versionId, output.referenceInput, output.panelIds.map(id => timeline.panels.find(p => p.id === id)!)))
+    results.push({ ...output, stale })
+    if (!stale) output.panelIds.forEach(id => claimed.add(id))
   }
   for (const p of timeline.panels) if (!claimed.has(p.id) && p.videoUrl && !trackedUrls.has(p.videoUrl)) {
     results.push({ key: `import-${p.id}`, panelIds: [p.id], url: p.videoUrl, stale: false })
@@ -412,6 +436,7 @@ function versionState(
     batches,
     outputs: resolveVideoOutputs(row.id, timeline, batches),
     framePlans: framePlanSummary(row.id),
+    contactSheets: readContactSheets(row.id),
   }
 }
 
@@ -488,9 +513,9 @@ export function saveTimeline(versionId: number, revision: number, input: unknown
     const timeline = validateTimeline(input, original)
     timeline.inheritedOutputs = original.inheritedOutputs?.map(o => ({
       ...o, stale: o.stale || videoFingerprint(
-        original, original.panels.filter(p => o.panelIds.includes(p.id)), o.generationMode || 'storyboard_frames',
+        original, original.panels.filter(p => o.panelIds.includes(p.id)), o.generationMode || 'storyboard_frames', o.referenceInput,
       ) !== videoFingerprint(
-        timeline, timeline.panels.filter(p => o.panelIds.includes(p.id)), o.generationMode || 'storyboard_frames',
+        timeline, timeline.panels.filter(p => o.panelIds.includes(p.id)), o.generationMode || 'storyboard_frames', o.referenceInput,
       ),
     }))
     // Metadata baselines are server-owned; keep optimistic concurrency across the two pages.
@@ -514,6 +539,7 @@ export function saveTimeline(versionId: number, revision: number, input: unknown
     }).where(and(eq(schema.animaticVersions.id, versionId), eq(schema.animaticVersions.revision, revision))).run()
     mirrorCurrent(versionId, timeline)
   })
+  scheduleContactSheets(versionId)
   return getVersion(versionId)
 }
 export function checkOrLock(versionId: number, revision: number, lock: boolean) {

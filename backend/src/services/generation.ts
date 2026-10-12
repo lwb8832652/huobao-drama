@@ -46,6 +46,7 @@ interface GenerateImageParams {
 }
 
 interface GenerateVideoParams {
+  referenceInput?: import('./previs-video-reference-domain.js').VideoReferenceInput
   previs?: { versionId: number; itemKey: string }
   storyboardId?: number
   dramaId?: number
@@ -132,6 +133,7 @@ export async function generateVideo(params: GenerateVideoParams): Promise<number
     firstFrameUrl: params.firstFrameUrl,
     lastFrameUrl: params.lastFrameUrl,
     referenceImageUrls: params.referenceImageUrls,
+    referenceInput: params.referenceInput,
     referenceVideoUrls: params.referenceVideoUrls,
     referenceAudioUrls: params.referenceAudioUrls,
     referenceFileUrl: params.referenceFileUrl,
@@ -267,10 +269,12 @@ async function processTask(id: number, config: AIConfig) {
       const resolvedImageUrl = await normalizeVideoReferenceUrl(params.imageUrl)
       const resolvedFirstFrameUrl = await normalizeVideoReferenceUrl(params.firstFrameUrl)
       const resolvedLastFrameUrl = await normalizeVideoReferenceUrl(params.lastFrameUrl)
-      const resolvedReferenceImageUrls = await normalizeVideoReferenceUrls(params.referenceImageUrls)
+      const resolvedReferenceImageUrls = params.referenceInput
+        ? await (await import('./previs-video-reference-normalizer.js')).normalizeSnapshotImages(params.referenceInput)
+        : await normalizeVideoReferenceUrls(params.referenceImageUrls)
       if (record.animaticVersionId && ((params.firstFrameUrl && !resolvedFirstFrameUrl)
         || (params.lastFrameUrl && !resolvedLastFrameUrl)
-        || resolvedReferenceImageUrls.length !== new Set(params.referenceImageUrls || []).size)) {
+        || resolvedReferenceImageUrls.length !== (params.referenceInput ? params.referenceInput.imageUrls.length : new Set(params.referenceImageUrls || []).size))) {
         throw new Error('选用的分镜画面无法读取，请重新上传或重新选择；本次未提交视频生成')
       }
       // 参考视频/音频文件较大，不适合 dataURL 内联，需解析为公网可访问 URL

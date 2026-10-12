@@ -69,6 +69,25 @@ export const framePlans = sqliteTable('frame_plans', {
   uniqueIndex('idx_frame_plan_input').on(table.versionId, table.panelId, table.inputHash),
 ])
 
+export const frameContactSheets = sqliteTable('frame_contact_sheets', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  versionId: integer('version_id').notNull(),
+  panelId: integer('panel_id').notNull(),
+  inputHash: text('input_hash').notNull(),
+  descriptorJson: text('descriptor_json').notNull(),
+  sourceDigestsJson: text('source_digests_json'),
+  renderHash: text('render_hash'),
+  status: text('status').notNull().default('pending'),
+  annotatedUrl: text('annotated_url'),
+  cleanUrl: text('clean_url'),
+  thumbnailUrl: text('thumbnail_url'),
+  error: text('error'),
+  attempt: integer('attempt').notNull().default(0),
+  startedAt: text('started_at'),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, table => [uniqueIndex('idx_sheet_input').on(table.versionId, table.panelId, table.inputHash)])
+
 export function initPrevisSchema(sqlite: Database.Database) {
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS animatic_versions (
@@ -113,6 +132,16 @@ export function initPrevisSchema(sqlite: Database.Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_frame_plan_version ON frame_plans(version_id);
     CREATE INDEX IF NOT EXISTS idx_frame_plan_status ON frame_plans(status);
+    CREATE TABLE IF NOT EXISTS frame_contact_sheets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, version_id INTEGER NOT NULL, panel_id INTEGER NOT NULL,
+      input_hash TEXT NOT NULL, descriptor_json TEXT NOT NULL, source_digests_json TEXT, render_hash TEXT,
+      status TEXT NOT NULL DEFAULT 'pending', annotated_url TEXT, clean_url TEXT, thumbnail_url TEXT,
+      error TEXT, attempt INTEGER NOT NULL DEFAULT 0, started_at TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      UNIQUE(version_id, panel_id, input_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sheet_status ON frame_contact_sheets(status);
+    CREATE INDEX IF NOT EXISTS idx_sheet_version ON frame_contact_sheets(version_id);
   `)
   const planColumns = sqlite.prepare('PRAGMA table_info(frame_plans)').all() as { name: string }[]
   for (const [name, type] of [['count', 'INTEGER NOT NULL DEFAULT 0'], ['status', "TEXT NOT NULL DEFAULT 'pending'"], ['result_json', "TEXT NOT NULL DEFAULT ''"], ['error', 'TEXT']]) {

@@ -1,3 +1,5 @@
+import type { ContactSheetView } from './previs-contact-sheet-domain.js'
+import type { VideoReferenceInput } from './previs-video-reference-domain.js'
 /** Version-owned production data. Times are integer milliseconds throughout. */
 export type FrameType = 'start' | 'middle' | 'end' | 'beat'
 export type VideoGenerationMode = 'direct' | 'storyboard_frames'
@@ -144,8 +146,11 @@ export interface AnimaticVersion {
   batches: BatchRun[]
   isCurrent: boolean
   outputs: VideoOutput[]
+  contactSheets?: ContactSheetView[]
 }
 export interface VideoOutput {
+  generationScope?: 'storyboard' | 'group'
+  referenceInput?: VideoReferenceInput
   key: string
   panelIds: number[]
   url: string
@@ -154,6 +159,8 @@ export interface VideoOutput {
   stale: boolean
 }
 export interface BatchItem {
+  generationScope?: 'storyboard' | 'group'
+  referenceInput?: VideoReferenceInput
   id: number
   groupId: string
   panelId: number | null

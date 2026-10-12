@@ -7,12 +7,14 @@ import {
 } from '../services/previs.js'
 import { createBatch, updateBatch, videoCapabilities } from '../services/previs-batch.js'
 import { listContinuityReviews, reviewContinuity } from '../services/continuity-review.js'
-import { FRAME_COUNT_MAX, startFramePlan, listFramePlans, retryFramePlans } from '../services/previs-frames.js'
+import { scheduleContactSheets, readContactSheets, tickContactSheets } from '../services/previs-contact-sheets.js'
+import { startFramePlan, listFramePlans, retryFramePlans } from '../services/previs-frames.js'
+import { FRAME_COUNT_MIN, FRAME_COUNT_MAX } from '../services/previs-frame-contract.js'
 
 const app = new Hono()
 const positiveId = z.number().int().positive()
 const revision = z.number().int().positive()
-const frameCount = z.number().int().min(2).max(FRAME_COUNT_MAX)
+const frameCount = z.number().int().min(FRAME_COUNT_MIN).max(FRAME_COUNT_MAX)
 app.onError((err, c) => {
   const status = err instanceof PrevisError ? err.status : 400
   const message = err instanceof z.ZodError ? `请求数据无效：${err.issues[0]?.message}` : err.message
@@ -29,6 +31,23 @@ app.post('/episodes/:id/animatic-versions', async c => {
 })
 app.get('/animatic-versions/:id/timeline', c => success(c, getVersion(Number(c.req.param('id')))))
 app.get('/animatic-versions/:id/state', c => success(c, getVersionState(Number(c.req.param('id')))))
+app.get('/animatic-versions/:id/contact-sheets', c => success(c, { items: readContactSheets(Number(c.req.param('id'))) }))
+app.post('/animatic-versions/:id/contact-sheets', async c => {
+  const body = z.object({ revision, panelIds: z.array(positiveId).max(200).optional(), force: z.boolean().optional() }).parse(await c.req.json())
+  const id = Number(c.req.param('id')), version = getVersion(id)
+  if (version.revision !== body.revision) throw new PrevisError('版本已更新，请先刷新', 409)
+  scheduleContactSheets(id, body.panelIds, body.force)
+  void tickContactSheets()
+  return success(c, { items: readContactSheets(id) })
+})
+app.post('/animatic-versions/:id/contact-sheets/:panelId/retry', async c => {
+  const body = z.object({ revision }).parse(await c.req.json())
+  const id = Number(c.req.param('id')), version = getVersion(id)
+  if (version.revision !== body.revision) throw new PrevisError('版本已更新，请先刷新', 409)
+  scheduleContactSheets(id, [Number(c.req.param('panelId'))], true)
+  void tickContactSheets()
+  return success(c, { items: readContactSheets(id) })
+})
 app.get('/animatic-versions/:id/continuity-reviews', c =>
   success(c, listContinuityReviews(Number(c.req.param('id')))))
 app.put('/animatic-versions/:id/timeline', async c => {
@@ -75,6 +94,8 @@ app.post('/animatic-versions/:id/batch-runs', async c => {
     frameTypes: z.array(z.enum(['start', 'middle', 'end', 'beat'])).min(1).max(4).optional(),
     frameIds: z.array(z.string().min(1).max(100)).min(1).max(1000).optional(), force: z.boolean().optional(),
     generationMode: z.enum(['direct', 'storyboard_frames']).optional(),
+    videoReferenceInputStrategy: z.enum(['auto', 'individual', 'contact_sheet']).optional(),
+    generationScope: z.enum(['storyboard', 'group']).optional(),
   }).parse(await c.req.json())
   if (process.env.PREVIS_ENABLED === 'false') throw new PrevisError('动态故事版功能已关闭')
   return created(c, await createBatch(Number(c.req.param('id')), body))
