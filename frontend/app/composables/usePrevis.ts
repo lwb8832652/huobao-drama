@@ -100,6 +100,9 @@ export function usePrevis() {
   const working = ref(false), dirty = ref(false), saveError = ref(''), pollError = ref('')
   const undoStack = ref<Timeline[]>([]), redoStack = ref<Timeline[]>([])
   const editable = computed(() => !!version.value && version.value.status !== 'locked' && !version.value.busy && !working.value)
+  // 生成提交只依赖版本未锁定：后台任务完成写回会把 revision 推高，但 createBatch 的事务内
+  // 校验能挡住过期提交，所以一个画面生成中不应连带禁用其他画面的生成入口（与资产制作一致）。
+  const generatable = computed(() => !!version.value && version.value.status !== 'locked')
   const timeline = computed(() => version.value?.timeline)
   let episodeId = 0, polling: ReturnType<typeof setInterval> | undefined
   let autosave: ReturnType<typeof setTimeout> | undefined
@@ -224,13 +227,37 @@ export function usePrevis() {
     configId?: number; model?: string; panelIds?: number[]; frameTypes?: FrameType[]; frameIds?: string[]; force?: boolean;
     generationMode?: 'direct' | 'storyboard_frames';
   } = {}) {
-    if (!await save() || !version.value) return
+    if (!version.value) return
     working.value = true
     try {
-      await previsRequest(`/animatic-versions/${version.value.id}/batch-runs`, 'POST',
-        { revision: version.value.revision, type, ...options })
-      accept(await previsRequest(`/animatic-versions/${version.value.id}/timeline`), true)
-      toast.success('任务已加入队列，可在任务面板查看进度')
+      // 后台任务完成写回会推高 revision，本地旧 revision 会被 409 拒绝（表现为"点了没反应"）。
+      let stale = false
+      const submit = async () => {
+        if (!version.value) return false
+        if (dirty.value && !await save()) {
+          stale ||= /版本已更新/.test(saveError.value)
+          return false
+        }
+        if (!version.value) return false
+        try {
+          await previsRequest(`/animatic-versions/${version.value.id}/batch-runs`, 'POST',
+            { revision: version.value.revision, type, ...options })
+          return true
+        } catch (error: any) {
+          if (/版本已更新/.test(error?.message || '')) { stale = true; return false }
+          throw error
+        }
+      }
+      let queued = await submit()
+      // 同步最新版本后用新 revision 重试一次；未保存的本地修改以服务端版本为准。
+      if (!queued && stale && version.value) {
+        accept(await previsRequest(`/animatic-versions/${version.value.id}/timeline`), true)
+        queued = await submit()
+      }
+      if (queued) {
+        accept(await previsRequest(`/animatic-versions/${version.value.id}/timeline`), true)
+        toast.success(stale ? '已同步最新版本，任务已加入队列' : '任务已加入队列，可在任务面板查看进度')
+      }
     } finally { working.value = false }
   }
   async function batchAction(id: number, action: 'retry' | 'cancel', itemIds?: number[]) {
@@ -243,7 +270,7 @@ export function usePrevis() {
   }
   onUnmounted(() => { disposed = true; clearInterval(polling); clearTimeout(autosave) })
   return {
-    version, versions, timeline, editable, dirty, working, saveError, pollError, undoStack, redoStack,
+    version, versions, timeline, editable, generatable, dirty, working, saveError, pollError, undoStack, redoStack,
     framePlans, initialize, open, create, edit, history, save, check, generate, batchAction,
   }
 }

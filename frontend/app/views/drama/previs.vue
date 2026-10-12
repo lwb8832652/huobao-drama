@@ -31,7 +31,7 @@ const route = useRoute()
 const dramaId = Number(route.params.id), episodeNumber = Number(route.params.episodeNumber)
 const episodePath = `/drama/${dramaId}/episode/${episodeNumber}`
 const {
-  version, timeline, editable, dirty, working, saveError, pollError, undoStack, redoStack,
+  version, timeline, editable, generatable, dirty, working, saveError, pollError, undoStack, redoStack,
   framePlans: framePlansSummary,
   initialize, open, create, edit, history, save, check, generate, batchAction,
 } = usePrevis()
@@ -851,6 +851,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
                 :key="`${version.id}-${panel.id}`"
                 :panel="panel"
                 :editable="editable"
+                :generatable="generatable"
                 :splitting="framePlanSubmitting || framePlanActive > 0"
                 :tasks="batches.filter(b => b.type === 'image').flatMap(b => b.items).filter(item => item.panelId === panel!.id)"
                 :video-generation-mode="videoGenerationMode"

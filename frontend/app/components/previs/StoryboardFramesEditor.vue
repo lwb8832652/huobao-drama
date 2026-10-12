@@ -17,6 +17,8 @@ import {
 const props = withDefaults(defineProps<{
   panel: Panel
   editable: boolean
+  /** 版本可提交生成（未锁定即可）：与 editable 解耦，一个画面生成中不禁用其他画面的生成入口。 */
+  generatable?: boolean
   tasks?: BatchItem[]
   showVideoAction?: boolean
   videoGenerationMode?: 'direct' | 'storyboard_frames'
@@ -25,7 +27,7 @@ const props = withDefaults(defineProps<{
   /** 拆分任务提交中或排队中：与资产批量生成一致，按钮转圈显示“拆分中…” */
   splitting?: boolean
 }>(), {
-  tasks: () => [], showVideoAction: false, videoGenerationMode: 'direct', activeFrameId: '', title: '分镜画面', splitting: false,
+  generatable: true, tasks: () => [], showVideoAction: false, videoGenerationMode: 'direct', activeFrameId: '', title: '分镜画面', splitting: false,
 })
 const emit = defineEmits<{
   change: [frames: Keyframe[], coverFrameId?: string]
@@ -49,8 +51,8 @@ const settingsFrame = computed(() => settings.value?.newFrame
 const missingVideoFrames = computed(() => frames.value.filter(frame => !frame.url).length)
 const videoReady = computed(() => !usesStoryboardFrames.value || (frames.value.length > 0 && missingVideoFrames.value === 0))
 const missingFrames = computed(() => frames.value.filter(frame => !frame.url))
-const canGenerateMissing = computed(() => props.editable && missingFrames.value.length > 0
-  && missingFrames.value.every(canGenerate))
+const canGenerateMissing = computed(() => props.generatable && missingFrames.value.length > 0
+  && missingFrames.value.every(frame => canGenerate(frame)))
 
 function task(frame: Keyframe) {
   return props.tasks.find(item => item.frameId === frameKey(frame) || (!item.frameId && item.frameType === frame.type))
@@ -62,7 +64,11 @@ function frameHistoryCount(frame: Keyframe) {
     .filter((entry, index, all) => entry.url && all.findIndex(item => item.url === entry.url) === index).length
 }
 function canEdit(frame: Keyframe) { return props.editable && !inProgress(frame) && uploading.value !== frameKey(frame) }
-function canGenerate(frame: Keyframe) { return canEdit(frame) && frameReferenceUrls(frame).length > 0 }
+// 生成入口不看 editable：busy（其他画面生成中）时仍可提交本画面，仅本画面有任务在跑或上传中时禁用。
+function canGenerate(frame: Keyframe) {
+  return props.generatable && !inProgress(frame) && uploading.value !== frameKey(frame)
+    && frameReferenceUrls(frame).length > 0
+}
 function status(frame: Keyframe) {
   if (uploading.value === frameKey(frame)) return { label: '上传中', kind: 'busy' }
   if (inProgress(frame)) return { label: task(frame)?.status === 'pending' ? '排队中' : '生成中', kind: 'busy' }

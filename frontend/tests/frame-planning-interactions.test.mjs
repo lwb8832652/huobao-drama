@@ -98,6 +98,88 @@ test('description planning works without crypto.randomUUID on HTTP and preserves
   assert.equal(new Set(frames.map(frame => frame.id)).size, 2)
 })
 
+test('frame generation stays available while another frame is generating', () => {
+  const descriptor = parse(read('../app/components/previs/StoryboardFramesEditor.vue')).descriptor
+  const component = evaluate(compileScript(descriptor, { id: 'frame-generate-test' }).content, {
+    vue, 'vue-sonner': { toast: {} },
+    'lucide-vue-next': {}, '~/components/AppMenu.vue': {}, '~/components/AppMenuItem.vue': {},
+    './FrameSettingsDialog.vue': {}, '~/composables/useApi': { uploadAPI: {} },
+    '~/composables/usePrevis': { ...domain },
+  }).default
+  const target = panel()
+  target.referenceImages = ['/static/role.png']
+  target.frames = [
+    { ...domain.makeFrame('busy-frame'), type: 'start', url: '' },
+    { ...domain.makeFrame('idle-frame'), type: 'end', url: '' },
+  ]
+  const running = [{ id: 1, frameId: 'busy-frame', frameType: 'start', panelId: 7, status: 'processing' }]
+  // 后台任务在跑时 editable=false（busy），但 generatable 仍为真：其他画面的生成入口必须保留。
+  const setup = component.setup(
+    { panel: target, editable: false, generatable: true, tasks: running },
+    { expose() {}, emit() {} },
+  )
+  assert.equal(setup.canGenerate(target.frames[1]), true)
+  assert.equal(setup.canGenerateMissing.value, false)
+  // 本帧已有任务在跑时禁用，避免对同一画面重复提交。
+  assert.equal(setup.canGenerate(target.frames[0]), false)
+  const idle = component.setup(
+    { panel: target, editable: false, generatable: true, tasks: [] },
+    { expose() {}, emit() {} },
+  )
+  assert.equal(idle.canGenerateMissing.value, true)
+  // 锁定版本（generatable=false）一律禁止生成。
+  const locked = component.setup(
+    { panel: target, editable: false, generatable: false, tasks: [] },
+    { expose() {}, emit() {} },
+  )
+  assert.equal(locked.canGenerate(target.frames[1]), false)
+  // 缺参考素材仍禁用（面板级回退也为空时）。
+  const bare = panel()
+  bare.frames = [{ ...domain.makeFrame('bare-frame'), type: 'end', url: '' }]
+  const noRefs = component.setup(
+    { panel: bare, editable: true, generatable: true, tasks: [] },
+    { expose() {}, emit() {} },
+  )
+  assert.equal(noRefs.canGenerate(bare.frames[0]), false)
+})
+
+test('generate resubmits with the refreshed revision after the service rejects a stale one', async () => {
+  const notices = []
+  const toast = Object.fromEntries(['error', 'success', 'info'].map(kind => [kind, message => notices.push({ kind, message })]))
+  const submitted = []
+  let serverRevision = 2
+  const versionPayload = () => ({
+    id: 4, revision: serverRevision, status: 'draft', busy: false, isCurrent: true, timeline: { panels: [panel()] },
+  })
+  const api = evaluate(read('../app/composables/usePrevis.ts'), {
+    vue, 'vue-sonner': { toast }, '../../../backend/src/services/previs-domain': domain,
+  }, {
+    fetch: async (url, options) => {
+      const method = options?.method || 'GET'
+      if (url.endsWith('/batch-runs')) {
+        const body = JSON.parse(options.body)
+        submitted.push(body.revision)
+        const accepted = body.revision === serverRevision
+        return {
+          ok: accepted, status: accepted ? 200 : 409,
+          json: async () => (accepted ? { data: {} } : { message: '版本已更新，请先刷新；本地修改可复制后重新应用。' }),
+        }
+      }
+      return { ok: true, json: async () => ({ data: versionPayload() }) }
+    },
+    setTimeout: callback => { queueMicrotask(callback); return 1 },
+  })
+  const previs = api.usePrevis()
+  await previs.open(4)
+  assert.equal(previs.version.value.revision, 2)
+  // 后台任务完成写回把服务端 revision 推到 3，本地仍持 2。
+  serverRevision = 3
+  await previs.generate('image', { panelIds: [7], frameIds: ['frame-1'] })
+  assert.deepEqual(submitted, [2, 3])
+  assert.equal(previs.version.value.revision, 3)
+  assert.ok(notices.some(notice => notice.kind === 'success' && /已同步最新版本/.test(notice.message)))
+})
+
 test('AI split opens progress immediately, uses the saved revision and selected model, then shows the plan', async () => {
   const h = harness({ results: [
     { items: [{ id: 13, panelId: 7, status: 'processing' }], plans: [] }, complete(),
