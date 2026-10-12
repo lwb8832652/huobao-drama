@@ -117,7 +117,7 @@ onUnmounted(() => {
             </div>
             <div class="settings-preview-meta"><b>{{ draft.title || '未命名画面' }}</b><span>{{ seconds || 0 }} 秒 / {{ panel.durationMs / 1000 }} 秒</span></div>
             <p class="settings-hint">参考素材仅用于生成这张画面。视频会使用镜头内的全部分镜画面。</p>
-            <div v-if="historyImages.length > 1" class="settings-history">
+            <div v-if="historyImages.length > 1 || (!frame.url && historyImages.length)" class="settings-history">
               <h3>历史图片 <span>{{ historyImages.length }}</span></h3>
               <div>
                 <button

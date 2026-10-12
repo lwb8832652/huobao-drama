@@ -26,6 +26,7 @@ export interface FramePlanDraft {
   type: FrameType
 }
 export interface PanelFramePlan {
+  taskId: number
   panelId: number
   panelTitle: string
   count: number
@@ -145,7 +146,7 @@ async function aiFrames(row: PlanRow, panel: Panel): Promise<FramePlanDraft[] | 
 }
 
 /** 提交拆分任务：写入/复用 frame_plans 记录后立即返回，不等待模型。 */
-export async function startFramePlan(versionId: number, options: PlanFramesOptions): Promise<{ queued: number }> {
+export async function startFramePlan(versionId: number, options: PlanFramesOptions): Promise<{ queued: number; taskIds: number[] }> {
   const row = requireEditable(versionId, options.revision)
   const timeline = normalizeTimeline(JSON.parse(row.timelineJson))
   const panels = timeline.panels.filter(panel => options.panelIds.includes(panel.id))
@@ -160,6 +161,7 @@ export async function startFramePlan(versionId: number, options: PlanFramesOptio
   const model = options.model || config?.model || ''
   const ts = new Date().toISOString()
   let queued = 0
+  const taskIds: number[] = []
 
   for (const panel of targets) {
     const inputHash = planInputHash(panel)
@@ -170,20 +172,22 @@ export async function startFramePlan(versionId: number, options: PlanFramesOptio
         eq(schema.framePlans.panelId, panel.id),
         eq(schema.framePlans.inputHash, inputHash),
       )).get()
+    if (existing) taskIds.push(existing.id)
     if (existing?.status === 'completed' && !options.force) continue
     if (existing) {
       db.update(schema.framePlans).set({ status: 'pending', error: null, count, configId, model, createdAt: ts })
         .where(eq(schema.framePlans.id, existing.id)).run()
     } else {
-      db.insert(schema.framePlans).values({
+      const inserted = db.insert(schema.framePlans).values({
         versionId, panelId: panel.id, inputHash, configId, model, count,
         status: 'pending', resultJson: '', createdAt: ts,
       }).run()
+      taskIds.push(Number(inserted.lastInsertRowid))
     }
     queued++
   }
   void tickFramePlans().catch(err => console.error('Frame plan worker:', err?.message))
-  return { queued }
+  return { queued, taskIds }
 }
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -255,7 +259,7 @@ export function listFramePlans(versionId: number) {
     if (item.status !== 'completed') continue
     try {
       const parsed = JSON.parse(item.resultJson) as { source: 'ai' | 'rule'; frames: FramePlanDraft[] }
-      plans.push({ panelId: item.panelId, panelTitle: titleOf(item.panelId), count: parsed.frames.length, source: parsed.source, frames: parsed.frames })
+      plans.push({ taskId: item.id, panelId: item.panelId, panelTitle: titleOf(item.panelId), count: parsed.frames.length, source: parsed.source, frames: parsed.frames })
     } catch { /* 忽略损坏结果 */ }
   }
   const count = (status: string) => rows.filter(item => item.status === status).length

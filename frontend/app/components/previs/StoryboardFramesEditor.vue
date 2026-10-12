@@ -10,7 +10,7 @@ import AppMenuItem from '~/components/AppMenuItem.vue'
 import FrameSettingsDialog from './FrameSettingsDialog.vue'
 import { uploadAPI } from '~/composables/useApi'
 import {
-  frameKey, makeFrame, mediaUrl, orderedFrames, panelImageFallback, planFrames,
+  createFrameId, frameKey, makeFrame, mediaUrl, orderedFrames, panelImageFallback, planFrames,
   type BatchItem, type Keyframe, type Panel,
 } from '~/composables/usePrevis'
 
@@ -84,7 +84,7 @@ function add(event: Event) {
   settingsTrigger.value = event.currentTarget as HTMLElement
   const lastOffset = frames.value.at(-1)?.offsetMs || 0
   const offset = frames.value.length ? Math.min(props.panel.durationMs - 1, Math.round((lastOffset + props.panel.durationMs) / 2)) : 0
-  settings.value = { panelId: props.panel.id, newFrame: makeFrame(crypto.randomUUID(), offset, `画面 ${frames.value.length + 1}`) }
+  settings.value = { panelId: props.panel.id, newFrame: makeFrame(createFrameId(), offset, `画面 ${frames.value.length + 1}`) }
   emit('settings-open')
 }
 async function saveSettings(changes: Partial<Keyframe>, generate: boolean) {
@@ -105,7 +105,7 @@ async function saveSettings(changes: Partial<Keyframe>, generate: boolean) {
 function plan() {
   toolbarMenu.value = false
   if (!props.editable) return
-  const planned = planFrames(props.panel, crypto.randomUUID())
+  const planned = planFrames(props.panel, createFrameId())
   const existing = frames.value
   const next = planned.map((frame, index) => {
     const old = existing[index]
@@ -113,6 +113,7 @@ function plan() {
   })
   // Planning keeps existing extra images while updating matching planned slots.
   changed([...next, ...existing.slice(planned.length)])
+  toast.success(`已按描述规划 ${planned.length} 张画面`)
 }
 function menuAction(action: () => void) { menuId.value = ''; action() }
 function move(frame: Keyframe, direction: number) {

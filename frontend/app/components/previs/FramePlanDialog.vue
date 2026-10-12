@@ -127,24 +127,25 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
   max-height: min(84vh, 900px);
   display: flex;
   flex-direction: column;
+  margin: auto;
   padding: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: var(--surface);
+  background: var(--surface-raised);
   color: var(--text-0);
   overflow: hidden;
 }
 .frame-plan-dialog::backdrop { background: rgb(0 0 0 / 55%); }
-.plan-header { display: flex; align-items: flex-start; gap: 10px; padding: 14px 14px 12px; border-bottom: 1px solid var(--border); }
+.plan-header { display: flex; flex-shrink: 0; align-items: flex-start; gap: 10px; padding: 14px 14px 12px; border-bottom: 1px solid var(--border); }
 .plan-icon { display: flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: var(--radius-sm); background: var(--bg-active); color: var(--accent-text); }
 .plan-header > div { flex: 1; min-width: 0; }
 .plan-header h2 { margin: 0; font-size: 15px; }
 .plan-header p { margin: 2px 0 0; color: var(--text-2); font-size: 11px; }
-.plan-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--surface-soft); }
+.plan-toolbar { display: flex; flex-shrink: 0; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--surface-soft); }
 .plan-toolbar label { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-1); }
 .plan-toolbar select { min-height: 28px; padding: 0 6px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-0); font-size: 11px; }
 .plan-hint { color: var(--text-2); font-size: 11px; }
-.plan-body { flex: 1; overflow: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
+.plan-body { flex: 1; min-height: 0; overflow: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
 .plan-busy { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--accent-text); font-size: 11px; }
 .plan-loading { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 46px 12px; color: var(--text-2); }
 .plan-loading strong { color: var(--text-0); font-size: 13px; }
@@ -165,7 +166,7 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
 .plan-remove:hover:not(:disabled) { background: var(--bg-hover); color: var(--error); }
 .plan-frame textarea { width: 100%; margin-top: 6px; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-0); font-size: 11px; line-height: 1.6; resize: vertical; }
 .plan-empty { margin: 0; padding: 10px; color: var(--text-2); font-size: 11px; }
-.plan-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 10px 14px; border-top: 1px solid var(--border); background: var(--surface-soft); }
+.plan-footer { display: flex; flex-shrink: 0; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 10px 14px; border-top: 1px solid var(--border); background: var(--surface-soft); }
 .plan-tip { color: var(--text-2); font-size: 11px; }
 .plan-actions { display: flex; align-items: center; gap: 6px; }
 .plan-spin { animation: plan-spin 1s linear infinite; }

@@ -20,6 +20,7 @@ uncommitted-summary.md
 # Tests
 *.test.ts
 *.test.mjs
+!frontend/tests/frame-planning-interactions.test.mjs
 
 
 # Environment

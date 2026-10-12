@@ -705,12 +705,13 @@
                     </div>
                     <StoryboardFramesEditor
                       :panel="productionPanel"
-                      :editable="productionEditable"
+                      :editable="productionEditable && !productionFramePlanBusy"
                       :tasks="productionImageTasks"
                       :video-generation-mode="videoGenerationMode"
                       :title="videoUsesStoryboardFrames ? '2 · 分镜画面' : '分镜画面 · 仅用于预演'"
                       @change="updateProductionFrames"
                       @generate="generateProductionFrames"
+                      @split="splitProductionFrames"
                     />
                   </section>
                   <button
@@ -1489,6 +1490,17 @@
         </div>
       </div>
 
+      <FramePlanDialog
+        v-if="productionFramePlanOpen"
+        :plans="productionFramePlans"
+        :count="productionFramePlanCount"
+        :busy="productionFramePlanBusy"
+        :editable="productionEditable"
+        @close="closeProductionFramePlan"
+        @apply="applyProductionFramePlan"
+        @recount="recountProductionFramePlan"
+      />
+
       <ConfirmDialog
         :open="assetDelete.open"
         :title="t('episode.delete.title', { type: assetDeleteTypeLabel })"
@@ -1515,7 +1527,8 @@ import { useAgent } from '~/composables/useAgent'
 import { toastError, mapError, MODERATION_RE } from '~/composables/useToast'
 import LocaleSwitcher from '~/components/LocaleSwitcher.vue'
 import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.vue'
-import { mediaUrl, usePrevis, useVideoGenerationMode } from '~/composables/usePrevis'
+import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
+import { mediaUrl, useFramePlanner, usePrevis, useVideoGenerationMode } from '~/composables/usePrevis'
 
 definePageMeta({ layout: 'studio' })
 
@@ -1531,6 +1544,14 @@ const {
   working: productionWorking, initialize: initializeProduction, create: createProduction,
   edit: editProduction, save: saveProduction, generate: generateProduction,
 } = usePrevis()
+const {
+  open: productionFramePlanOpen, busy: productionFramePlanBusy,
+  plans: productionFramePlans, count: productionFramePlanCount,
+  close: closeProductionFramePlan, split: planProductionFrames,
+  apply: applyProductionFramePlan, recount: recountProductionFramePlan,
+} = useFramePlanner({
+  version: productionVersion, editable: productionEditable, save: saveProduction, edit: editProduction,
+}, () => ({ configId: chatConfigId(), model: chatModelOverride() }))
 const videoGenerationMode = useVideoGenerationMode()
 const videoUsesStoryboardFrames = computed(() => videoGenerationMode.value === 'storyboard_frames')
 const videoGenerationModeLabel = computed(() =>
@@ -2804,6 +2825,9 @@ async function generateProductionFrames(frameIds, force = false) {
   await generateProduction('image', {
     panelIds: [target.id], frameIds, force, configId: option.configId, model: option.model,
   })
+}
+async function splitProductionFrames(options) {
+  if (productionPanel.value) await planProductionFrames(productionPanel.value.id, options)
 }
 const selectedVideoTaskNumber = computed(() => {
   const index = videoTaskRows.value.findIndex(task => String(task.id) === String(selectedSb.value?.id))

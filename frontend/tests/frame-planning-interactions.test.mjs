@@ -1,0 +1,255 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { test } from 'node:test'
+import { runInNewContext } from 'node:vm'
+import { compileScript, compileTemplate, parse } from '@vue/compiler-sfc'
+import ts from 'typescript'
+import * as vue from 'vue'
+
+const read = path => readFileSync(new URL(path, import.meta.url), 'utf8')
+function evaluate(source, dependencies = {}, globals = {}) {
+  const module = { exports: {} }
+  const output = ts.transpileModule(source.replaceAll('import.meta.client', 'false'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText
+  runInNewContext(output, {
+    module, exports: module.exports,
+    require: name => {
+      assert.ok(name in dependencies, `Unexpected dependency: ${name}`)
+      return dependencies[name]
+    },
+    crypto: {}, setTimeout, clearTimeout, setInterval, clearInterval, ...globals,
+  })
+  return module.exports
+}
+const domain = evaluate(read('../../backend/src/services/previs-domain.ts'))
+const panel = () => ({
+  id: 7, title: '开门', description: '【镜头1】走到门前。【镜头2】推开门。',
+  atmosphere: '安静', imagePrompt: '', durationMs: 6000, frames: [], referenceImages: [],
+})
+const draft = () => ({
+  taskId: 13, panelId: 7, panelTitle: '开门', count: 2, source: 'ai', frames: [
+    { title: '门前', prompt: '走到门前', offsetMs: 0, type: 'start' },
+    { title: '开门', prompt: '推开门', offsetMs: 3000, type: 'end' },
+  ],
+})
+const complete = () => ({ items: [{ id: 13, panelId: 7, status: 'completed' }], plans: [draft()] })
+
+function harness({ results = [complete()], saveResult = true, requestError } = {}) {
+  const requests = [], notices = [], disposers = []
+  const toast = Object.fromEntries(['error', 'success', 'info'].map(kind => [kind, message => notices.push({ kind, message })]))
+  const api = evaluate(read('../app/composables/usePrevis.ts'), {
+    vue: { ...vue, onUnmounted: fn => disposers.push(fn) },
+    'vue-sonner': { toast },
+    '../../../backend/src/services/previs-domain': domain,
+  }, {
+    fetch: async (url, options) => {
+      requests.push({ url, method: options.method, body: options.body && JSON.parse(options.body) })
+      if (requestError) throw requestError
+      const data = options.method === 'POST' ? { queued: 1, taskIds: [13] } : results.shift()
+      assert.ok(data, 'Unexpected polling request')
+      return { ok: true, json: async () => ({ data }) }
+    },
+    setTimeout: callback => { queueMicrotask(callback); return 1 },
+  })
+  const workspace = {
+    version: vue.ref({ id: 4, revision: 2, timeline: { panels: [panel()] } }),
+    editable: vue.ref(true),
+    save: async () => { workspace.version.value.revision++; return saveResult },
+    edit: action => action(workspace.version.value.timeline),
+  }
+  assert.equal(typeof api.useFramePlanner, 'function', 'The workbench needs a connected frame planner')
+  const planner = api.useFramePlanner(workspace, () => ({ configId: 9, model: 'selected-text-model' }))
+  return { api, workspace, planner, requests, notices, disposers }
+}
+
+test('workbench connects the AI split event and the plan dialog', () => {
+  const source = read('../app/views/drama/episode.vue')
+  const editor = source.match(/<StoryboardFramesEditor\b[\s\S]*?\/>/)[0]
+  assert.match(editor, /@split=/, 'AI split clicks must reach a workbench handler')
+  assert.match(source, /<FramePlanDialog\b[\s\S]*?@apply=/, 'Completed plans must be reviewable and applicable')
+})
+
+test('description planning works without crypto.randomUUID on HTTP and preserves existing images', () => {
+  const notices = [], changes = []
+  const api = evaluate(read('../app/composables/usePrevis.ts'), {
+    vue, 'vue-sonner': { toast: {} }, '../../../backend/src/services/previs-domain': domain,
+  })
+  const descriptor = parse(read('../app/components/previs/StoryboardFramesEditor.vue')).descriptor
+  const component = evaluate(compileScript(descriptor, { id: 'frame-editor-test' }).content, {
+    vue, 'vue-sonner': { toast: { success: message => notices.push(message) } },
+    'lucide-vue-next': {}, '~/components/AppMenu.vue': {}, '~/components/AppMenuItem.vue': {},
+    './FrameSettingsDialog.vue': {}, '~/composables/useApi': { uploadAPI: {} },
+    '~/composables/usePrevis': { ...domain, ...api },
+  }).default
+  const target = panel()
+  target.frames = [domain.makeFrame('existing')]
+  target.frames[0].url = '/static/existing.png'
+  const setup = component.setup({ panel: target, editable: true, tasks: [] }, {
+    expose() {}, emit: (event, ...args) => changes.push({ event, args }),
+  })
+  setup.plan()
+  assert.equal(changes.length, 1)
+  assert.equal(changes[0].event, 'change')
+  const frames = changes[0].args[0]
+  assert.equal(frames.length, 2)
+  assert.equal(frames[0].url, '/static/existing.png')
+  assert.match(frames[1].prompt, /推开门/)
+  assert.equal(new Set(frames.map(frame => frame.id)).size, 2)
+})
+
+test('AI split opens progress immediately, uses the saved revision and selected model, then shows the plan', async () => {
+  const h = harness({ results: [
+    { items: [{ id: 13, panelId: 7, status: 'processing' }], plans: [] }, complete(),
+  ] })
+  const operation = h.planner.split(7)
+  assert.equal(h.planner.open.value, true)
+  assert.equal(h.planner.busy.value, true)
+  await operation
+  assert.equal(h.requests[0].method, 'POST')
+  assert.equal(h.requests[0].body.revision, 3)
+  assert.deepEqual(h.requests[0].body.panelIds, [7])
+  assert.equal(h.requests[0].body.configId, 9)
+  assert.equal(h.requests[0].body.model, 'selected-text-model')
+  assert.equal(h.planner.plans.value[0].frames.length, 2)
+  assert.equal(h.planner.busy.value, false)
+  assert.equal(h.workspace.version.value.timeline.panels[0].frames.length, 0)
+})
+
+test('applying a plan writes to its original panel, retains image history, and saves', async () => {
+  const h = harness()
+  const target = h.workspace.version.value.timeline.panels[0]
+  target.frames = [{ ...domain.makeFrame('old'), url: '/static/old.png' }]
+  await h.planner.split(7, { force: true })
+  h.workspace.version.value.timeline.panels.push({ ...panel(), id: 8 })
+  await h.planner.apply(h.planner.plans.value)
+  assert.equal(target.frames.length, 2)
+  assert.equal(target.frames[0].prompt, '走到门前')
+  assert.equal(target.frames[0].url, '')
+  assert.equal(target.frames[0].history[0].url, '/static/old.png')
+  assert.equal(h.workspace.version.value.timeline.panels[1].frames.length, 0)
+  assert.equal(h.planner.open.value, false)
+  assert.equal(h.workspace.version.value.revision, 4)
+})
+
+test('changing the requested frame count submits a new forced plan', async () => {
+  const h = harness({ results: [complete(), complete()] })
+  await h.planner.split(7)
+  await h.planner.recount(4)
+  const submission = h.requests.filter(request => request.method === 'POST')[1]
+  assert.equal(submission.body.count, 4)
+  assert.equal(submission.body.force, true)
+})
+
+test('save failure prevents task submission and duplicate clicks do not submit twice', async () => {
+  const failure = harness({ saveResult: false })
+  await failure.planner.split(7)
+  assert.equal(failure.requests.length, 0)
+  assert.equal(failure.planner.open.value, false)
+  const h = harness()
+  await Promise.all([h.planner.split(7), h.planner.split(7)])
+  assert.equal(h.requests.filter(request => request.method === 'POST').length, 1)
+})
+
+test('failed or unreachable split tasks show an error and release the busy state', async () => {
+  for (const options of [
+    { results: [{ items: [{ id: 13, panelId: 7, status: 'failed', error: '拆分失败' }], plans: [] }] },
+    { requestError: new Error('网络不可用') },
+  ]) {
+    const h = harness(options)
+    await h.planner.split(7)
+    assert.equal(h.planner.busy.value, false)
+    assert.equal(h.planner.open.value, false)
+    assert.equal(h.notices.at(-1).kind, 'error')
+  }
+})
+
+test('closing the dialog or leaving the page discards pending results', async () => {
+  for (const dispose of [false, true]) {
+    const h = harness()
+    const operation = h.planner.split(7)
+    if (dispose) h.disposers.forEach(fn => fn())
+    else h.planner.close()
+    await operation
+    assert.equal(h.planner.open.value, false)
+    assert.equal(h.planner.busy.value, false)
+    assert.equal(h.planner.plans.value.length, 0)
+    assert.equal(h.requests.length, 0)
+  }
+})
+
+test('polling follows the submitted task when another description has a newer cached row', async () => {
+  const stale = { ...draft(), taskId: 19, frames: [{ title: '旧方案', prompt: '另一段描述', offsetMs: 0, type: 'start' }] }
+  const h = harness({ results: [
+    { items: [{ id: 19, panelId: 7, status: 'completed' }, { id: 13, panelId: 7, status: 'processing' }], plans: [stale] },
+    { items: [{ id: 19, panelId: 7, status: 'completed' }, { id: 13, panelId: 7, status: 'completed' }], plans: [stale, draft()] },
+  ] })
+  await h.planner.split(7)
+  assert.equal(h.planner.plans.value[0].frames[0].prompt, '走到门前')
+})
+
+test('a retained single historical image can be selected and restored before generating another image', () => {
+  const descriptor = parse(read('../app/components/previs/FrameSettingsDialog.vue')).descriptor
+  const script = compileScript(descriptor, { id: 'history-test' })
+  const component = evaluate(script.content, {
+    vue: { ...vue, useId: () => 'history-test', onMounted() {}, onBeforeUnmount() {}, onUnmounted() {} },
+    'lucide-vue-next': Object.fromEntries(['Check', 'ImagePlus', 'RotateCcw', 'SlidersHorizontal', 'Sparkles', 'X'].map(name => [name, 'svg'])),
+    '~/composables/usePrevis': domain,
+  }).default
+  const props = { panel: panel(), frame: { ...domain.makeFrame('new'), history: [{ url: '/static/old.png' }] }, editable: true }
+  const changes = []
+  const setup = component.setup(props, { expose() {}, emit: (event, ...args) => changes.push({ event, args }) })
+  const template = compileTemplate({ source: descriptor.template.content, filename: 'FrameSettingsDialog.vue', id: 'history-test', compilerOptions: { bindingMetadata: script.bindings } })
+  assert.deepEqual(template.errors, [])
+  const { render } = evaluate(template.code, { vue: { ...vue, withDirectives: vnode => vnode } })
+  const tree = render({}, [], props, vue.proxyRefs(setup), {}, {})
+  function findHistoryButton(node) {
+    if (node?.props?.['aria-label'] === '使用历史图片 1') return node
+    for (const child of Array.isArray(node?.children) ? node.children : []) {
+      const found = findHistoryButton(child)
+      if (found) return found
+    }
+  }
+  const button = findHistoryButton(tree)
+  assert.ok(button, 'Retained image history must remain accessible')
+  button.props.onClick()
+  setup.form.value = { reportValidity: () => true }
+  setup.save()
+  assert.equal(changes[0].args[0].url, '/static/old.png')
+})
+
+test('split submission identifies both new tasks and cached tasks, and results keep that identity', async () => {
+  const source = read('../../backend/src/services/previs-frames.ts')
+  const ast = ts.createSourceFile('previs-frames.ts', source, ts.ScriptTarget.Latest, true)
+  const names = ['startFramePlan', 'listFramePlans', 'clampCount', 'suggestedFrameCount']
+  const functions = ast.statements.filter(statement => ts.isFunctionDeclaration(statement) && names.includes(statement.name?.text))
+    .map(statement => statement.getText(ast)).join('\n')
+  for (const status of [null, 'pending', 'completed']) {
+    let row = status && { id: 13, panelId: 7, status, resultJson: JSON.stringify({ source: 'ai', frames: draft().frames }) }
+    const builder = {
+      from() { return this }, where() { return this }, orderBy() { return this },
+      get: () => row, all: () => [row],
+      set(values) { Object.assign(row, values); return this },
+      values(values) { row = { id: 22, ...values }; return this },
+      run: () => ({ lastInsertRowid: 22 }),
+    }
+    const db = { select: () => builder, update: () => builder, insert: () => builder }
+    const target = { ...panel(), characterIds: [], propIds: [] }
+    const timeline = { schemaVersion: 2, panels: [target], groups: [], transitions: [], audio: [], strategy: { ...domain.defaultStrategy } }
+    const api = evaluate(functions, {}, {
+      db, schema: { framePlans: {} }, FRAME_COUNT_MIN: 2, FRAME_COUNT_MAX: 6,
+      and() {}, eq() {}, desc() {},
+      requireEditable: () => ({ timelineJson: JSON.stringify(timeline) }),
+      versionRow: () => ({ timelineJson: JSON.stringify(timeline) }),
+      normalizeTimeline: domain.normalizeTimeline,
+      getConfigById: async () => ({ model: 'selected-text-model' }),
+      planInputHash: () => 'current-description', tickFramePlans: async () => {},
+    })
+    const result = await api.startFramePlan(4, { revision: 2, panelIds: [7], configId: 9 })
+    assert.equal(result.queued, status === 'completed' ? 0 : 1)
+    assert.equal(result.taskIds[0], status ? 13 : 22)
+    row.status = 'completed'
+    row.resultJson = JSON.stringify({ source: 'ai', frames: draft().frames })
+    assert.equal(api.listFramePlans(4).plans[0].taskId, result.taskIds[0])
+  }
+})

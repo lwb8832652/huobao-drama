@@ -1,7 +1,7 @@
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { toast } from 'vue-sonner'
 import type { AnimaticVersion, Timeline, FrameType } from '../../../backend/src/services/previs-domain'
-import { retimeBoundAudio } from '../../../backend/src/services/previs-domain'
+import { makeFrame, orderedFrames, retimeBoundAudio } from '../../../backend/src/services/previs-domain'
 export {
   autoGroup, checkContinuity, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl,
   orderedFrames, panelImageFallback, planFrames, rebuildTransitions, timelineSegments,
@@ -29,6 +29,7 @@ export interface FramePlanDraft {
   type: FrameType
 }
 export interface PanelFramePlan {
+  taskId: number
   panelId: number
   panelTitle: string
   count: number
@@ -56,7 +57,7 @@ export interface FramePlansResult {
 }
 /** 提交拆分任务：立即返回，进度经轮询 state.framePlans 获取。 */
 export async function submitFramePlan(versionId: number, payload: FramePlanPayload) {
-  return previsRequest<{ queued: number }>(`/animatic-versions/${versionId}/frames/plan`, 'POST', payload)
+  return previsRequest<{ queued: number; taskIds: number[] }>(`/animatic-versions/${versionId}/frames/plan`, 'POST', payload)
 }
 /** 查询拆分任务状态与已完成方案。 */
 export async function fetchFramePlans(versionId: number) {
@@ -64,6 +65,13 @@ export async function fetchFramePlans(versionId: number) {
 }
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value))
 const VIDEO_GENERATION_MODE_KEY = 'huobao:video-generation-mode'
+let frameIdSequence = 0
+
+/** Frame IDs only need uniqueness; randomUUID is unavailable on ordinary HTTP origins. */
+export function createFrameId() {
+  return globalThis.crypto?.randomUUID?.()
+    ?? `frame-${Date.now().toString(36)}-${(++frameIdSequence).toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
 
 export function useVideoGenerationMode() {
   type Mode = 'direct' | 'storyboard_frames'
@@ -234,4 +242,94 @@ export function usePrevis() {
     version, versions, timeline, editable, dirty, working, saveError, pollError, undoStack, redoStack,
     framePlans, initialize, open, create, edit, history, save, check, generate, batchAction,
   }
+}
+
+/** Review an asynchronous split before applying it to the version that requested it. */
+export function useFramePlanner(
+  workspace: Pick<ReturnType<typeof usePrevis>, 'version' | 'editable' | 'save' | 'edit'>,
+  modelChoice: () => { configId?: number; model?: string },
+) {
+  const open = ref(false), busy = ref(false), count = ref(3)
+  const plans = ref<PanelFramePlan[]>([])
+  let requestToken = 0, targetPanelId = 0, targetVersionId = 0
+  function close() {
+    requestToken++
+    open.value = false; busy.value = false; plans.value = []
+  }
+  async function split(panelId: number, options: { force?: boolean; count?: number } = {}) {
+    if (busy.value) return
+    if (!workspace.editable.value || !workspace.version.value) {
+      toast.error('当前工作版不可编辑，请稍后重试或复制为新草稿')
+      return
+    }
+    targetPanelId = panelId; targetVersionId = workspace.version.value.id
+    const token = ++requestToken, versionId = targetVersionId
+    const active = () => token === requestToken && open.value && workspace.version.value?.id === versionId
+    count.value = options.count ?? count.value
+    plans.value = []; open.value = true; busy.value = true
+    try {
+      const saved = await workspace.save()
+      if (!active()) return
+      if (!saved) { close(); return }
+      const { taskIds } = await submitFramePlan(versionId, {
+        revision: workspace.version.value!.revision,
+        panelIds: [panelId], count: count.value, force: options.force,
+        ...modelChoice(),
+      })
+      const taskId = taskIds[0]
+      if (!taskId) throw new Error('未找到拆分任务，请重试')
+      while (active()) {
+        const result = await fetchFramePlans(versionId)
+        if (!active()) return
+        const item = result.items.find(item => item.id === taskId)
+        if (!item) throw new Error('未找到拆分任务，请重试')
+        if (item.status === 'failed') throw new Error(item.error || '画面拆分失败，请重试')
+        const plan = result.plans.find(plan => plan.taskId === taskId)
+        if (item.status === 'completed' && plan) {
+          plans.value = [plan]; count.value = plan.count
+          return
+        }
+        await new Promise(resolve => setTimeout(resolve, 1500))
+      }
+    } catch (cause: any) {
+      if (active()) { close(); toast.error(cause.message || '画面拆分失败，请重试') }
+    } finally {
+      if (token === requestToken) busy.value = false
+    }
+  }
+  async function apply(drafts: PanelFramePlan[]) {
+    if (!open.value || busy.value || !workspace.editable.value || workspace.version.value?.id !== targetVersionId) return
+    const plan = drafts.find(plan => plan.panelId === targetPanelId)
+    const target = workspace.version.value.timeline.panels.find(panel => panel.id === targetPanelId)
+    if (!plan?.frames.length || !target) return
+    busy.value = true
+    const token = requestToken
+    try {
+      workspace.edit(timeline => {
+        const panel = timeline.panels.find(panel => panel.id === plan.panelId)!
+        const previous = orderedFrames(panel)
+        panel.frames = plan.frames.map((frame, index) => {
+          const old = previous[index]
+          const history = [...(old?.history || []), ...(old?.url ? [{ url: old.url, taskId: old.taskId }] : [])]
+            .filter((entry, index, all) => all.findIndex(item => item.url === entry.url) === index)
+          return {
+            ...makeFrame(createFrameId(), Math.max(0, Math.min(frame.offsetMs, panel.durationMs - 1)), frame.title),
+            type: frame.type, prompt: frame.prompt, history,
+          }
+        })
+        panel.coverFrameId = panel.frames[0]?.id
+      })
+      if (await workspace.save() && token === requestToken) {
+        close()
+        toast.success(`已写入 ${plan.frames.length} 张画面，可点击「生成缺失」出图`)
+      }
+    } catch (cause: any) {
+      if (token === requestToken) toast.error(cause.message || '应用拆分方案失败，请重试')
+    } finally {
+      if (token === requestToken) busy.value = false
+    }
+  }
+  watch(() => workspace.version.value?.id, close)
+  onUnmounted(close)
+  return { open, busy, count, plans, close, split, apply, recount: (value: number) => split(targetPanelId, { force: true, count: value }) }
 }

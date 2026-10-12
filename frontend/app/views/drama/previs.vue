@@ -16,7 +16,7 @@ import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.v
 import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
 import { uploadAPI } from '~/composables/useApi'
 import {
-  checkContinuity, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl, orderedFrames,
+  checkContinuity, createFrameId, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl, orderedFrames,
   planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode,
   type AudioClip, type ContinuityIssue, type ContinuityReview, type FrameType, type Keyframe,
   type Panel, type PanelFramePlan, type Timeline,
@@ -412,7 +412,7 @@ async function planAndGenerate(ids?: number[]) {
   const selected = ids?.length ? ids : timeline.value?.panels.map(p => p.id) || []
   edit(t => {
     for (const p of t.panels.filter(p => selected.includes(p.id))) {
-      if (!p.frames.length) p.frames = planFrames(p, crypto.randomUUID())
+      if (!p.frames.length) p.frames = planFrames(p, createFrameId())
     }
   })
   await generateFrames(selected)
@@ -480,7 +480,7 @@ function applyFramePlan(plans: PanelFramePlan[]) {
       const target = t.panels.find(p => p.id === plan.panelId)
       if (!target) continue
       target.frames = plan.frames.map(frame => ({
-        ...makeFrame(crypto.randomUUID(), Math.min(frame.offsetMs, Math.max(0, target.durationMs - 1)), frame.title),
+        ...makeFrame(createFrameId(), Math.min(frame.offsetMs, Math.max(0, target.durationMs - 1)), frame.title),
         type: frame.type,
         prompt: frame.prompt,
       }))
@@ -495,7 +495,7 @@ const audioDraft = ref<AudioClip>()
 function showAudio(id?: string) {
   const clip = timeline.value?.audio.find(a => a.id === id)
   audioDraft.value = clip ? JSON.parse(JSON.stringify(clip)) : {
-    id: crypto.randomUUID(), type: 'dialogue', panelId: panel.value?.id || null, character: '', text: '', url: '',
+    id: createFrameId(), type: 'dialogue', panelId: panel.value?.id || null, character: '', text: '', url: '',
     startMs: Math.round(currentMs.value / 100) * 100, durationMs: panel.value?.durationMs || 3000,
   }
   modal.value = 'audio'
