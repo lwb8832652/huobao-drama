@@ -10,7 +10,7 @@ import AppMenuItem from '~/components/AppMenuItem.vue'
 import FrameSettingsDialog from './FrameSettingsDialog.vue'
 import { uploadAPI } from '~/composables/useApi'
 import {
-  createFrameId, frameKey, makeFrame, mediaUrl, orderedFrames, panelImageFallback, planFrames,
+  FRAME_COUNT_MAX, frameCountChangeAllowed, createFrameId, frameKey, makeFrame, mediaUrl, orderedFrames, panelImageFallback, planFrames,
   type BatchItem, type Keyframe, type Panel,
 } from '~/composables/usePrevis'
 
@@ -45,6 +45,7 @@ const menuId = ref('')
 const toolbarMenu = ref(false)
 const settings = ref<{ panelId: number; frameId?: string; newFrame?: Keyframe }>()
 const frames = computed(() => orderedFrames(props.panel))
+const canAdd = computed(() => props.editable && frames.value.length < FRAME_COUNT_MAX)
 const usesStoryboardFrames = computed(() => props.videoGenerationMode === 'storyboard_frames')
 const settingsFrame = computed(() => settings.value?.newFrame
   || props.panel.frames.find(frame => frameKey(frame) === settings.value?.frameId))
@@ -76,8 +77,13 @@ function status(frame: Keyframe) {
   return frame.url ? { label: '已就绪', kind: 'ready' } : { label: '待生成', kind: 'empty' }
 }
 function changed(next: Keyframe[], cover = props.panel.coverFrameId) {
-  if (!props.editable) return
+  if (!props.editable) return false
+  if (!frameCountChangeAllowed(next, props.panel.frames)) {
+    toast.error(`每个镜头最多 ${FRAME_COUNT_MAX} 张画面；旧方案超限时只能保留或删除已有画面`)
+    return false
+  }
   emit('change', next, cover && next.some(frame => frameKey(frame) === cover) ? cover : next.find(frame => frame.url)?.id)
+  return true
 }
 function patch(id: string, value: Partial<Keyframe>) {
   changed(props.panel.frames.map(frame => frameKey(frame) === id ? { ...frame, ...value } : frame))
@@ -88,7 +94,7 @@ function openSettings(frame: Keyframe, event: Event) {
   emit('settings-open')
 }
 function add(event: Event) {
-  if (!props.editable) return
+  if (!canAdd.value) return
   settingsTrigger.value = event.currentTarget as HTMLElement
   const lastOffset = frames.value.at(-1)?.offsetMs || 0
   const offset = frames.value.length ? Math.min(props.panel.durationMs - 1, Math.round((lastOffset + props.panel.durationMs) / 2)) : 0
@@ -100,7 +106,9 @@ async function saveSettings(changes: Partial<Keyframe>, generate: boolean) {
   const frame = settingsFrame.value
   if (!context || context.panelId !== props.panel.id || !frame || !canEdit(frame)) return
   const updated = { ...frame, ...changes }
-  if (context.newFrame) changed([...props.panel.frames, updated])
+  if (context.newFrame) {
+    if (!changed([...props.panel.frames, updated])) return
+  }
   else if (Object.keys(changes).length) patch(frameKey(frame), changes)
   settings.value = undefined
   // Parent change listeners update the shared timeline synchronously; generation reads it after render.
@@ -120,8 +128,7 @@ function plan() {
     return old ? { ...old, title: frame.title, offsetMs: frame.offsetMs, prompt: frame.prompt } : frame
   })
   // Planning keeps existing extra images while updating matching planned slots.
-  changed([...next, ...existing.slice(planned.length)])
-  toast.success(`已按描述规划 ${planned.length} 张画面`)
+  if (changed([...next, ...existing.slice(planned.length)])) toast.success(`已按描述规划 ${planned.length} 张画面`)
 }
 function menuAction(action: () => void) { menuId.value = ''; action() }
 function move(frame: Keyframe, direction: number) {
@@ -179,7 +186,7 @@ watch(settingsFrame, frame => {
   <section class="frame-editor">
     <header class="frame-editor-head">
       <div><strong>{{ title }}</strong><span>{{ frames.length - missingVideoFrames }} / {{ frames.length }} 张已就绪</span></div>
-      <button type="button" class="btn btn-sm" :disabled="!editable" @click="add"><ImagePlus :size="14" />添加画面</button>
+      <button type="button" class="btn btn-sm" :disabled="!canAdd" :title="`每个镜头最多 ${FRAME_COUNT_MAX} 张画面`" @click="add"><ImagePlus :size="14" />添加画面</button>
     </header>
     <div class="frame-editor-tools">
       <button type="button" class="btn btn-sm frame-fill" :disabled="!canGenerateMissing"

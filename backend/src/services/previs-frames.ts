@@ -14,9 +14,9 @@ import { db, schema } from '../db/index.js'
 import { getActiveConfigId, getConfigById } from './ai.js'
 import { normalizeTimeline, panelImageFallback, type FrameType, type Panel } from './previs-domain.js'
 import { hashContent, PrevisError, episodeForPrevis, requireEditable, versionRow } from './previs.js'
+import { FRAME_COUNT_MIN, FRAME_COUNT_MAX } from './previs-frame-contract.js'
 
-export const FRAME_COUNT_MIN = 2
-export const FRAME_COUNT_MAX = 6
+export { FRAME_COUNT_MIN, FRAME_COUNT_MAX, FRAME_COUNT_OPTIONS } from './previs-frame-contract.js'
 const FRAME_PLAN_LEASE_MS = 30 * 60 * 1000
 
 export interface FramePlanDraft {
@@ -79,6 +79,7 @@ export function clampCount(value: number | undefined, fallback: number) {
   return Math.min(FRAME_COUNT_MAX, Math.max(FRAME_COUNT_MIN, next))
 }
 function frameTypeAt(index: number, total: number): FrameType {
+  if (total === 1) return 'beat'
   if (index === 0) return 'start'
   if (index === total - 1 && total > 1) return 'end'
   if (total === 3 && index === 1) return 'middle'
@@ -117,15 +118,15 @@ export function ruleFrames(panel: Panel, count: number): FramePlanDraft[] {
   const beats = source.split(/(?<=[。！？；!?;])|\n+/).map(part => part.trim()).filter(Boolean)
   const atmosphere = panel.atmosphere?.trim()
   const items = Array.from({ length: count }, (_, index) => {
-    const beat = beats.length >= count
+    const beat = count === 1 ? source : beats.length >= count
       ? beats[Math.floor(index * beats.length / count)]
       : beats[index] || (beats.length ? beats[beats.length - 1] : source)
-    const lead = index === 0 ? '开场：' : index === count - 1 ? '结束：' : `第 ${index + 1} 个瞬间：`
+    const lead = count === 1 ? '关键状态：' : index === 0 ? '开场：' : index === count - 1 ? '结束：' : `第 ${index + 1} 个瞬间：`
     // 景别不再拼进 prompt：它由 frame.shotType 承载，生图模板会单独成句，
     // 两处都写会让提示词出现「景别 中景 … 景别：中景」这种重复矛盾描述。
     const prompt = [beat, atmosphere].filter(Boolean).join('；')
     return {
-      title: index === 0 ? '开场画面' : index === count - 1 ? '结束画面' : `画面 ${index + 1}`,
+      title: count === 1 ? '关键画面' : index === 0 ? '开场画面' : index === count - 1 ? '结束画面' : `画面 ${index + 1}`,
       prompt: `${lead}${prompt}`,
       // 规则兜底没有逐帧判断能力，直接继承面板级参数（生图模板本就会回退到面板值，
       // 这里显式写出只是让确认弹窗能看到可编辑的取值）。

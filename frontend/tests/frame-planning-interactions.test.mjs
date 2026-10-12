@@ -23,6 +23,7 @@ function evaluate(source, dependencies = {}, globals = {}) {
   return module.exports
 }
 const domain = evaluate(read('../../backend/src/services/previs-domain.ts'))
+const contract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
 const panel = () => ({
   id: 7, title: '开门', description: '【镜头1】走到门前。【镜头2】推开门。',
   atmosphere: '安静', imagePrompt: '', durationMs: 6000, frames: [], referenceImages: [],
@@ -42,6 +43,7 @@ function harness({ results = [complete()], saveResult = true, requestError } = {
     vue: { ...vue, onUnmounted: fn => disposers.push(fn) },
     'vue-sonner': { toast },
     '../../../backend/src/services/previs-domain': domain,
+    '../../../backend/src/services/previs-frame-contract': contract,
   }, {
     fetch: async (url, options) => {
       requests.push({ url, method: options.method, body: options.body && JSON.parse(options.body) })
@@ -74,6 +76,7 @@ test('description planning works without crypto.randomUUID on HTTP and preserves
   const notices = [], changes = []
   const api = evaluate(read('../app/composables/usePrevis.ts'), {
     vue, 'vue-sonner': { toast: {} }, '../../../backend/src/services/previs-domain': domain,
+    '../../../backend/src/services/previs-frame-contract': contract,
   })
   const descriptor = parse(read('../app/components/previs/StoryboardFramesEditor.vue')).descriptor
   const component = evaluate(compileScript(descriptor, { id: 'frame-editor-test' }).content, {
@@ -104,7 +107,7 @@ test('frame generation stays available while another frame is generating', () =>
     vue, 'vue-sonner': { toast: {} },
     'lucide-vue-next': {}, '~/components/AppMenu.vue': {}, '~/components/AppMenuItem.vue': {},
     './FrameSettingsDialog.vue': {}, '~/composables/useApi': { uploadAPI: {} },
-    '~/composables/usePrevis': { ...domain },
+    '~/composables/usePrevis': { ...domain, ...contract },
   }).default
   const target = panel()
   target.referenceImages = ['/static/role.png']
@@ -153,6 +156,7 @@ test('generate resubmits with the refreshed revision after the service rejects a
   })
   const api = evaluate(read('../app/composables/usePrevis.ts'), {
     vue, 'vue-sonner': { toast }, '../../../backend/src/services/previs-domain': domain,
+    '../../../backend/src/services/previs-frame-contract': contract,
   }, {
     fetch: async (url, options) => {
       const method = options?.method || 'GET'
@@ -319,7 +323,7 @@ test('split submission identifies both new tasks and cached tasks, and results k
     const target = { ...panel(), characterIds: [], propIds: [] }
     const timeline = { schemaVersion: 2, panels: [target], groups: [], transitions: [], audio: [], strategy: { ...domain.defaultStrategy } }
     const api = evaluate(functions, {}, {
-      db, schema: { framePlans: {} }, FRAME_COUNT_MIN: 2, FRAME_COUNT_MAX: 6,
+      db, schema: { framePlans: {} }, ...contract,
       and() {}, eq() {}, desc() {},
       requireEditable: () => ({ timelineJson: JSON.stringify(timeline) }),
       versionRow: () => ({ timelineJson: JSON.stringify(timeline) }),

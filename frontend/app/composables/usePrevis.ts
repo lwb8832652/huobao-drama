@@ -2,6 +2,8 @@ import { computed, onUnmounted, ref, watch } from 'vue'
 import { toast } from 'vue-sonner'
 import type { AnimaticVersion, Timeline, FrameType } from '../../../backend/src/services/previs-domain'
 import { makeFrame, orderedFrames, retimeBoundAudio } from '../../../backend/src/services/previs-domain'
+import { FRAME_COUNT_MAX } from '../../../backend/src/services/previs-frame-contract'
+export { FRAME_COUNT_MIN, FRAME_COUNT_MAX, FRAME_COUNT_OPTIONS, frameCountChangeAllowed } from '../../../backend/src/services/previs-frame-contract'
 export {
   autoGroup, checkContinuity, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl,
   orderedFrames, panelImageFallback, planFrames, rebuildTransitions, timelineSegments,
@@ -333,6 +335,10 @@ export function useFramePlanner(
     const plan = drafts.find(plan => plan.panelId === targetPanelId)
     const target = workspace.version.value.timeline.panels.find(panel => panel.id === targetPanelId)
     if (!plan?.frames.length || !target) return
+    if (plan.frames.length > FRAME_COUNT_MAX) {
+      toast.error(`每个镜头最多 ${FRAME_COUNT_MAX} 张画面，请先删减拆分方案`)
+      return
+    }
     busy.value = true
     const token = requestToken
     try {

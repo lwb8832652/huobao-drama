@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, useId, watch } from 'vue'
 import { Loader2, Scissors, Sparkles, Trash2, X } from 'lucide-vue-next'
-import { type PanelFramePlan } from '~/composables/usePrevis'
+import { FRAME_COUNT_OPTIONS, type PanelFramePlan } from '~/composables/usePrevis'
 
 const props = defineProps<{
   plans: PanelFramePlan[]
@@ -15,7 +15,6 @@ const emit = defineEmits<{
   apply: [plans: PanelFramePlan[]]
   recount: [count: number]
 }>()
-const COUNT_OPTIONS = [2, 3, 4, 5, 6, 7, 8, 9]
 /** 景别/机位用固定枚举而非自由输入：生图模型对枚举外的词（如「中近景」）解析不稳定。 */
 const SHOT_TYPE_OPTIONS = ['', '远景', '全景', '中景', '近景', '特写']
 const ANGLE_OPTIONS = ['', '平视', '俯拍', '仰拍', '侧拍', '过肩']
@@ -77,7 +76,7 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
         <label>
           <span>每个镜头的画面数</span>
           <select :value="count" :disabled="busy" @change="emit('recount', Number(($event.target as HTMLSelectElement).value))">
-            <option v-for="option in COUNT_OPTIONS" :key="option" :value="option">{{ option }} 张</option>
+            <option v-for="option in FRAME_COUNT_OPTIONS" :key="option" :value="option">{{ option }} 张</option>
           </select>
         </label>
         <span class="plan-hint">调整后会按新数量重新拆分；确认前可自由修改标题、提示词与镜头参数。</span>

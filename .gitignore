@@ -1,5 +1,7 @@
 # Dependencies
 node_modules/
+/backend/node_modules
+/frontend/node_modules
 
 # Build output
 dist/
@@ -21,6 +23,8 @@ uncommitted-summary.md
 *.test.ts
 *.test.mjs
 !frontend/tests/frame-planning-interactions.test.mjs
+!backend/tests/storyboard-*.test.ts
+!frontend/tests/storyboard-*.test.mjs
 
 
 # Environment

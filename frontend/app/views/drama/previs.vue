@@ -16,7 +16,7 @@ import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.v
 import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
 import { uploadAPI } from '~/composables/useApi'
 import {
-  checkContinuity, createFrameId, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl, orderedFrames,
+  FRAME_COUNT_MAX, frameCountChangeAllowed, checkContinuity, createFrameId, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl, orderedFrames,
   planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode,
   type AudioClip, type ContinuityIssue, type ContinuityReview, type FrameType, type Keyframe,
   type Panel, type PanelFramePlan, type Timeline,
@@ -410,9 +410,19 @@ async function generateFrames(ids?: number[], frameIds?: string[], force = false
 }
 async function planAndGenerate(ids?: number[]) {
   const selected = ids?.length ? ids : timeline.value?.panels.map(p => p.id) || []
+  const planned = new Map<number, Keyframe[]>()
+  for (const p of timeline.value?.panels.filter(p => selected.includes(p.id) && !p.frames.length) || []) {
+    const next = planFrames(p, createFrameId())
+    if (!frameCountChangeAllowed(next, p.frames)) {
+      toast.error(`「${p.title}」规划结果超过 ${FRAME_COUNT_MAX} 张画面，请先调整镜头描述`)
+      return
+    }
+    planned.set(p.id, next)
+  }
   edit(t => {
-    for (const p of t.panels.filter(p => selected.includes(p.id))) {
-      if (!p.frames.length) p.frames = planFrames(p, createFrameId())
+    for (const p of t.panels) {
+      const frames = planned.get(p.id)
+      if (!p.frames.length && frames) p.frames = frames
     }
   })
   await generateFrames(selected)
@@ -480,6 +490,10 @@ async function recountFramePlan(count: number) {
 function applyFramePlan(plans: PanelFramePlan[]) {
   const total = plans.reduce((sum, plan) => sum + plan.frames.length, 0)
   if (!total) return
+  if (plans.some(plan => plan.frames.length > FRAME_COUNT_MAX)) {
+    toast.error(`每个镜头最多 ${FRAME_COUNT_MAX} 张画面，请先删减拆分方案`)
+    return
+  }
   edit(t => {
     for (const plan of plans) {
       const target = t.panels.find(p => p.id === plan.panelId)
