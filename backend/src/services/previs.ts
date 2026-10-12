@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { readContactSheets, scheduleContactSheets } from './previs-contact-sheets.js'
-import { videoReferenceFramesMatch, type VideoReferenceInput } from './previs-video-reference-domain.js'
+import type { VideoReferenceInput } from './previs-video-reference-domain.js'
 import { videoReferenceMatchesSource } from './previs-video-reference.js'
 import { z } from 'zod'
 import { and, desc, eq, inArray, isNull } from 'drizzle-orm'

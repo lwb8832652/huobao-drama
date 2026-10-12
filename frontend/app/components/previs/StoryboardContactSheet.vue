@@ -52,7 +52,7 @@ function select(frameId: string, event: Event) { emit('select', frameId, event) 
 .storyboard-sheet { min-width: 0; width: 100%; }
 .sheet-image { position: relative; overflow: hidden; border-radius: var(--radius-sm); background: var(--surface-soft); }
 .sheet-image img { display: block; width: 100%; height: auto; object-fit: contain; }
-.sheet-cell { position: absolute; appearance: none; border: 1px solid transparent; background: transparent; cursor: pointer; }
+.sheet-cell { position: absolute; appearance: none; border: 1px solid transparent; border-radius: 0; background: transparent; cursor: pointer; }
 .sheet-cell:hover, .sheet-cell.active { border: 2px solid var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .sheet-cell:focus-visible { outline: 3px solid var(--border-focus); outline-offset: -4px; }
 .sheet-placeholder { min-height: 150px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; padding: 14px; border: 1px dashed var(--border); border-radius: var(--radius-sm); background: var(--surface-soft); color: var(--text-2); text-align: center; }

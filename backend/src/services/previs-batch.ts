@@ -9,7 +9,7 @@ import { FRAME_COUNT_MAX } from './previs-frame-contract.js'
 import { scheduleContactSheets } from './previs-contact-sheets.js'
 import { buildVideoReferenceInput, videoReferenceMatchesSource } from './previs-video-reference.js'
 import { normalizeSnapshotImages } from './previs-video-reference-normalizer.js'
-import { videoReferenceLegend, videoReferenceFramesMatch, type VideoReferenceInputStrategy } from './previs-video-reference-domain.js'
+import { videoReferenceLegend, type VideoReferenceInputStrategy } from './previs-video-reference-domain.js'
 import {
   frameKey, normalizeTimeline, orderedFrames, groupPanels, panelImageFallback,
   type FrameType, type Timeline, type Panel, type VideoGenerationMode,
