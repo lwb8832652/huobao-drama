@@ -112,6 +112,9 @@ export async function createBatch(versionId: number, options: BatchOptions) {
           })
           const prompt = [
             style, ...referenceLegend, frame.prompt || panelImageFallback(panel),
+            // 氛围只在面板级存在（帧级无此字段）。此前模板里没有它的位置，
+            // 只要 frame.prompt 非空就完全不会进入提示词，画面与项目氛围脱节。
+            panel.atmosphere ? `氛围：${panel.atmosphere}` : '',
             `场景：${panel.scene}。景别：${frame.shotType || panel.shotType}。机位：${frame.angle || panel.angle}。运镜：${panel.movement}。构图：${frame.composition || '遵循画面描述'}。`,
             `画面：${frame.title || '分镜画面'}，位于本段 ${(frame.offsetMs || 0) / 1000} 秒。`,
             '只绘制一张完整的电影分镜画面，不要拼图、文字、水印。保持参考素材的人物身份、服装、道具与场景一致。',

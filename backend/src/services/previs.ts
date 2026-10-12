@@ -111,7 +111,12 @@ export function videoFingerprint(t: Timeline, panels: Panel[], generationMode: V
       references: generationMode === 'direct' ? p.referenceImages : undefined,
       referenceLabels: generationMode === 'direct' ? p.referenceLabels : undefined,
       frames: generationMode === 'storyboard_frames'
-        ? p.frames.map(f => ({ id: frameKey(f), url: f.url, offsetMs: f.offsetMs, type: f.type }))
+        // 帧级镜头参数必须参与指纹：改了某帧的景别/机位/构图，批次去重要能识别到变化，
+        // 否则 inputHash 不变会命中旧批次，用户拿到的是按旧参数生成的视频。
+        ? p.frames.map(f => ({
+          id: frameKey(f), url: f.url, offsetMs: f.offsetMs, type: f.type,
+          shotType: f.shotType, angle: f.angle, composition: f.composition,
+        }))
         : undefined,
     })),
   })

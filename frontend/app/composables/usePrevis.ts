@@ -27,6 +27,10 @@ export interface FramePlanDraft {
   prompt: string
   offsetMs: number
   type: FrameType
+  /** 帧级镜头参数；AI 未给出时留空，由生图模板回退面板级取值。 */
+  shotType?: string
+  angle?: string
+  composition?: string
 }
 export interface PanelFramePlan {
   taskId: number
@@ -315,6 +319,10 @@ export function useFramePlanner(
           return {
             ...makeFrame(createFrameId(), Math.max(0, Math.min(frame.offsetMs, panel.durationMs - 1)), frame.title),
             type: frame.type, prompt: frame.prompt, history,
+            // 未指定的参数不写入 key，避免空串盖掉生图模板里的面板级回退。
+            ...(frame.shotType ? { shotType: frame.shotType } : {}),
+            ...(frame.angle ? { angle: frame.angle } : {}),
+            ...(frame.composition ? { composition: frame.composition } : {}),
           }
         })
         panel.coverFrameId = panel.frames[0]?.id

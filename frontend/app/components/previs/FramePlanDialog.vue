@@ -15,7 +15,10 @@ const emit = defineEmits<{
   apply: [plans: PanelFramePlan[]]
   recount: [count: number]
 }>()
-const COUNT_OPTIONS = [2, 3, 4, 5, 6]
+const COUNT_OPTIONS = [2, 3, 4, 5, 6, 7, 8, 9]
+/** 景别/机位用固定枚举而非自由输入：生图模型对枚举外的词（如「中近景」）解析不稳定。 */
+const SHOT_TYPE_OPTIONS = ['', '远景', '全景', '中景', '近景', '特写']
+const ANGLE_OPTIONS = ['', '平视', '俯拍', '仰拍', '侧拍', '过肩']
 const drafts = ref<PanelFramePlan[]>(JSON.parse(JSON.stringify(props.plans)))
 // 窗口先开、结果后到：结果到达时必须刷新草稿，否则一直停在"应用 0 张画面"。
 watch(() => props.plans, plans => { drafts.value = JSON.parse(JSON.stringify(plans)) })
@@ -77,7 +80,7 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
             <option v-for="option in COUNT_OPTIONS" :key="option" :value="option">{{ option }} 张</option>
           </select>
         </label>
-        <span class="plan-hint">调整后会按新数量重新拆分；确认前可自由修改标题与提示词。</span>
+        <span class="plan-hint">调整后会按新数量重新拆分；确认前可自由修改标题、提示词与镜头参数。</span>
       </div>
 
       <div class="plan-body">
@@ -105,13 +108,39 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
               ><Trash2 :size="13" /></button>
             </div>
             <textarea v-model="frame.prompt" rows="3" maxlength="4000" aria-label="画面提示词" :disabled="!editable || busy" />
+            <div class="plan-camera">
+              <label>
+                <span>景别</span>
+                <select v-model="frame.shotType" aria-label="画面景别" :disabled="!editable || busy">
+                  <option v-for="option in SHOT_TYPE_OPTIONS" :key="option || 'unset'" :value="option">
+                    {{ option || '沿用镜头默认' }}
+                  </option>
+                </select>
+              </label>
+              <label>
+                <span>机位</span>
+                <select v-model="frame.angle" aria-label="画面机位" :disabled="!editable || busy">
+                  <option v-for="option in ANGLE_OPTIONS" :key="option || 'unset'" :value="option">
+                    {{ option || '沿用镜头默认' }}
+                  </option>
+                </select>
+              </label>
+              <label class="plan-composition">
+                <span>构图</span>
+                <input
+                  v-model="frame.composition" type="text" maxlength="500"
+                  placeholder="主体位置、前景遮挡、引导线（可留空）" aria-label="画面构图"
+                  :disabled="!editable || busy"
+                >
+              </label>
+            </div>
           </article>
           <p v-if="!plan.frames.length" class="plan-empty">这个镜头没有可用的拆分结果，可取消后单独处理。</p>
         </section>
       </div>
 
       <footer class="plan-footer">
-        <span class="plan-tip">应用后只写入画面（标题/提示词/时间点），不会立即生成图片。</span>
+        <span class="plan-tip">应用后只写入画面（标题/提示词/时间点/景别/机位/构图），不会立即生成图片。</span>
         <div class="plan-actions">
           <button type="button" class="btn" :disabled="busy" @click="emit('close')">取消</button>
           <button type="button" class="btn btn-primary" :disabled="!canApply" @click="apply">应用 {{ totalFrames }} 张画面</button>
@@ -165,6 +194,13 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
 .plan-remove { width: 28px; min-height: 28px; padding: 0; background: transparent; box-shadow: none; color: var(--text-2); }
 .plan-remove:hover:not(:disabled) { background: var(--bg-hover); color: var(--error); }
 .plan-frame textarea { width: 100%; margin-top: 6px; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-0); font-size: 11px; line-height: 1.6; resize: vertical; }
+.plan-camera { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 6px; }
+.plan-camera label { display: flex; align-items: center; gap: 5px; min-width: 0; font-size: 11px; color: var(--text-2); }
+.plan-camera label > span { flex-shrink: 0; }
+.plan-camera select { min-height: 26px; padding: 0 6px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-0); font-size: 11px; }
+.plan-composition { flex: 1; min-width: 200px; }
+.plan-composition input { flex: 1; min-width: 0; min-height: 26px; padding: 0 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-0); font-size: 11px; }
+.plan-composition input::placeholder { color: var(--text-3); }
 .plan-empty { margin: 0; padding: 10px; color: var(--text-2); font-size: 11px; }
 .plan-footer { display: flex; flex-shrink: 0; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 10px 14px; border-top: 1px solid var(--border); background: var(--surface-soft); }
 .plan-tip { color: var(--text-2); font-size: 11px; }

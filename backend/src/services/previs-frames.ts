@@ -24,6 +24,10 @@ export interface FramePlanDraft {
   prompt: string
   offsetMs: number
   type: FrameType
+  /** 帧级镜头参数：AI 拆分时逐帧判断，缺省则回退面板值（生图模板已做 `frame.x || panel.x` 兜底）。 */
+  shotType?: string
+  angle?: string
+  composition?: string
 }
 export interface PanelFramePlan {
   taskId: number
@@ -53,6 +57,11 @@ export interface FramePlanStatus {
 const planItemSchema = z.object({
   title: z.string().trim().min(1).max(200),
   prompt: z.string().trim().min(1).max(4000),
+  // 三个镜头参数用 nullish 而非 optional：提示词要求「未变化时填 null」，
+  // 而 optional 会把 null 判为非法、导致整批解析失败并回退规则拆分。
+  shotType: z.string().trim().max(50).nullish(),
+  angle: z.string().trim().max(50).nullish(),
+  composition: z.string().trim().max(500).nullish(),
 })
 const planResultSchema = z.object({ frames: z.array(planItemSchema).min(1).max(FRAME_COUNT_MAX) })
 
@@ -75,16 +84,30 @@ function frameTypeAt(index: number, total: number): FrameType {
   if (total === 3 && index === 1) return 'middle'
   return 'beat'
 }
+/**
+ * 画面时间点按等距铺满整个镜头：首帧 0、末帧 durationMs-1。
+ * 除数必须是 count-1，用 count 会让末帧停在 durationMs * (count-1)/count，
+ * 结束画面与镜头结束之间留出一整段空白（10s/5 张时末帧落在 8s 而非 9.999s）。
+ */
 function offsetAt(index: number, count: number, durationMs: number) {
   const span = Math.max(1, durationMs - 1)
-  return Math.round(index * span / Math.max(1, count))
+  if (count <= 1) return 0
+  return Math.round(index * span / (count - 1))
 }
-function draftFrames(count: number, durationMs: number, source: { title: string; prompt: string }[]): FramePlanDraft[] {
+/** 空串按「未指定」处理，避免用空值覆盖生图模板里的面板级回退。 */
+function optionalText(value: unknown): string | undefined {
+  const text = String(value ?? '').trim()
+  return text || undefined
+}
+function draftFrames(count: number, durationMs: number, source: { title: string; prompt: string; shotType?: string | null; angle?: string | null; composition?: string | null }[]): FramePlanDraft[] {
   return source.slice(0, count).map((item, index) => ({
     title: item.title.trim() || (index === 0 ? '开场画面' : index === count - 1 ? '结束画面' : `画面 ${index + 1}`),
     prompt: item.prompt.trim(),
     offsetMs: offsetAt(index, count, durationMs),
     type: frameTypeAt(index, count),
+    shotType: optionalText(item.shotType),
+    angle: optionalText(item.angle),
+    composition: optionalText(item.composition),
   })).filter(frame => frame.prompt)
 }
 
@@ -98,8 +121,17 @@ export function ruleFrames(panel: Panel, count: number): FramePlanDraft[] {
       ? beats[Math.floor(index * beats.length / count)]
       : beats[index] || (beats.length ? beats[beats.length - 1] : source)
     const lead = index === 0 ? '开场：' : index === count - 1 ? '结束：' : `第 ${index + 1} 个瞬间：`
-    const prompt = [beat, atmosphere, panel.shotType ? `景别 ${panel.shotType}` : ''].filter(Boolean).join('；')
-    return { title: index === 0 ? '开场画面' : index === count - 1 ? '结束画面' : `画面 ${index + 1}`, prompt: `${lead}${prompt}` }
+    // 景别不再拼进 prompt：它由 frame.shotType 承载，生图模板会单独成句，
+    // 两处都写会让提示词出现「景别 中景 … 景别：中景」这种重复矛盾描述。
+    const prompt = [beat, atmosphere].filter(Boolean).join('；')
+    return {
+      title: index === 0 ? '开场画面' : index === count - 1 ? '结束画面' : `画面 ${index + 1}`,
+      prompt: `${lead}${prompt}`,
+      // 规则兜底没有逐帧判断能力，直接继承面板级参数（生图模板本就会回退到面板值，
+      // 这里显式写出只是让确认弹窗能看到可编辑的取值）。
+      shotType: panel.shotType,
+      angle: panel.angle,
+    }
   })
   return draftFrames(count, panel.durationMs, items)
 }
