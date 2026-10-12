@@ -1469,17 +1469,21 @@
           <div class="dialog-body batch-video-body">
             <div class="batch-video-row"><span>{{ t('episode.vid.confirmShots') }}</span><strong>{{ t('episode.vid.confirmShotsValue', { n: batchVideoConfirm.targets.length }) }}</strong></div>
             <div class="batch-video-row"><span>{{ t('episode.vid.confirmTotal') }}</span><strong>{{ t('episode.vid.confirmApprox', { n: batchVideoTotalDuration }) }}</strong></div>
+            <label class="batch-video-row"><span>生成范围</span><select v-model="batchVideoGenerationScope"><option value="storyboard">按分镜</option><option value="group">所选分镜合为一组</option></select></label>
+            <div class="batch-video-row"><span>生成任务</span><strong>{{ batchVideoGenerationScope === 'group' ? 1 : batchVideoConfirm.targets.length }} 个{{ batchVideoGenerationScope === 'group' ? ` · 整组 ${batchVideoTotalDuration} 秒` : '' }}</strong></div>
             <div class="batch-video-row"><span>{{ t('episode.vid.confirmModel') }}</span><strong>{{ effectiveVideoModelLabel || t('episode.vid.defaultModel') }}</strong></div>
             <div class="batch-video-row"><span>{{ t('episode.vid.confirmResolution') }}</span><strong>{{ episodeResolutionLabel }}</strong></div>
             <div class="batch-video-row"><span>生成模式</span><strong>{{ videoGenerationModeLabel }}</strong></div>
             <label v-if="videoUsesStoryboardFrames" class="batch-video-row"><span>画面参考</span><select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
             <p class="batch-video-note">{{ videoGenerationMode === 'direct'
-              ? '每个镜头将使用视频提示词与已绑定素材直接生成，不检查分镜画面。'
-              : '每个镜头将按时间顺序使用全部分镜画面；未完成的画面会阻止提交。' }}</p>
+              ? '使用视频提示词与已绑定素材直接生成，不检查分镜画面。'
+              : '分镜画面按时间顺序作为视频参考；未完成的画面会阻止提交。' }}</p>
+            <p class="batch-video-note">{{ batchVideoGenerationScope === 'group' ? '所选分镜按时间线顺序生成一个视频，计为一次生成任务。' : '每个所选分镜各生成一个视频，分别计为生成任务。' }}</p>
+            <p v-if="!batchVideoReferenceState.ready" class="batch-video-note">{{ batchVideoReferenceState.error }}</p>
           </div>
           <footer class="dialog-foot">
             <button class="btn" @click="batchVideoConfirm.open = false">{{ t('common.cancel') }}</button>
-            <button class="btn btn-primary" @click="confirmBatchVideos">{{ t('episode.vid.confirmStart', { n: batchVideoConfirm.targets.length }) }}</button>
+            <button class="btn btn-primary" :disabled="!batchVideoReferenceState.ready" @click="confirmBatchVideos">开始生成 {{ batchVideoGenerationScope === 'group' ? 1 : batchVideoConfirm.targets.length }} 个视频</button>
           </footer>
         </div>
       </div>
@@ -1523,7 +1527,7 @@ import LocaleSwitcher from '~/components/LocaleSwitcher.vue'
 import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.vue'
 import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
 import StoryboardContactSheet from '~/components/previs/StoryboardContactSheet.vue'
-import { contactSheetForPanel, videoReferenceReadiness, previsRequest, mediaUrl, useFramePlanner, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy } from '~/composables/usePrevis'
+import { contactSheetForPanel, videoReferenceReadiness, videoGenerationScopeError, previsRequest, mediaUrl, useFramePlanner, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy } from '~/composables/usePrevis'
 
 definePageMeta({ layout: 'studio' })
 
@@ -2226,6 +2230,7 @@ function toggleVideoFilter(state) {
 const videoSelectMode = ref(false)
 const selectedVideoSbIds = ref([])
 const batchVideoConfirm = ref({ open: false, targets: [] })
+const batchVideoGenerationScope = ref('storyboard')
 
 function isVideoSbSelected(id) { return selectedVideoSbIds.value.includes(id) }
 function toggleVideoSbSelect(id) {
@@ -2329,8 +2334,10 @@ function hasMultiConfigs(options) {
 const textModelOptions = computed(() => collectModelOptions(textConfigs.value))
 const imageModelOptions = computed(() => collectModelOptions(imageConfigs.value))
 const videoModelOptions = computed(() => collectModelOptions(videoConfigs.value))
+const videoGenerationOption = computed(() =>
+  videoModelOptions.value.find(option => option.key === videoModel.value) || videoModelOptions.value[0])
 const selectedVideoConfig = computed(() => {
-  const selected = videoModelOptions.value.find(option => option.key === videoModel.value)
+  const selected = videoGenerationOption.value
   if (selected) return videoConfigs.value.find(config => config.id === selected.configId)
   const locked = videoConfigs.value.find(config => config.id === lockedVideoConfigId.value && config.is_active)
   if (locked) return locked
@@ -2354,7 +2361,18 @@ const episodeResolutionShort = computed(() =>
   RESOLUTION_DISPLAY[resolutionProvider.value][episodeResolution.value] || episodeResolution.value)
 const effectiveVideoDuration = computed(() => Number(selectedSb.value?.duration || 10))
 const batchVideoTotalDuration = computed(() =>
-  batchVideoConfirm.value.targets.reduce((sum, sb) => sum + (Number(sb.duration) || 5), 0))
+  batchVideoConfirm.value.targets.reduce((sum, sb) => sum + (productionPanelById(sb.id)?.durationMs / 1000 || Number(sb.duration) || 5), 0))
+const batchVideoReferenceState = computed(() => {
+  const panels = batchVideoConfirm.value.targets.map(sb => productionPanelById(sb.id)).filter(Boolean)
+  const capability = videoCapabilities.value[selectedVideoConfig.value?.provider]
+  const error = videoGenerationScopeError(panels, batchVideoGenerationScope.value, capability)
+  if (error) return { ready: false, error }
+  if (!videoUsesStoryboardFrames.value) return { ready: true, error: '' }
+  const units = batchVideoGenerationScope.value === 'group' ? [panels] : panels.map(panel => [panel])
+  const states = units.map(unit => videoReferenceReadiness(unit, videoReferenceInputStrategy.value,
+    capability?.maxImages || 9, productionVersion.value?.contactSheets || [], batchVideoGenerationScope.value))
+  return states.find(state => !state.ready) || { ready: true, error: '' }
+})
 
 function openBatchVideoConfirm(pool) {
   const targets = pool.filter(s => !isPendingVideo(s.id))
@@ -2368,6 +2386,7 @@ function openBatchVideoConfirm(pool) {
     return
   }
   batchVideoConfirm.value = { open: true, targets }
+  batchVideoGenerationScope.value = 'storyboard'
 }
 function batchVideos() {
   // 选择模式且有勾选 → 仅所选（允许重出已完成镜头）；否则全部未完成（待生成+失败）
@@ -2382,20 +2401,21 @@ function retryFailedVideos() {
 }
 async function confirmBatchVideos() {
   const targets = [...batchVideoConfirm.value.targets]
-  batchVideoConfirm.value = { open: false, targets: [] }
   if (!targets.length) return
   const ids = targets.map(s => s.id)
-  const option = videoModelOptions.value.find(item => item.key === videoModel.value) || videoModelOptions.value[0]
+  const generationScope = batchVideoGenerationScope.value
+  const option = videoGenerationOption.value
   if (!productionVersion.value || !option) { toast.error('请先启用视频模型并载入当前工作版'); return }
-  const blocked = videoUsesStoryboardFrames.value && ids.find(id => !productionReferenceState(id).ready)
-  if (blocked) { toast.error(productionReferenceState(blocked).error); return }
+  if (!batchVideoReferenceState.value.ready) { toast.error(batchVideoReferenceState.value.error); return }
+  batchVideoConfirm.value = { open: false, targets: [] }
   try {
     await generateProduction('video', {
       panelIds: ids, configId: option.configId, model: option.model,
       generationMode: videoGenerationMode.value,
+      generationScope,
       videoReferenceInputStrategy: videoUsesStoryboardFrames.value ? videoReferenceInputStrategy.value : undefined,
     })
-    toast.success(t('episode.vid.batchStarted', { n: ids.length }))
+    toast.success(`已提交 ${generationScope === 'group' ? 1 : ids.length} 个视频生成任务`)
     if (videoSelectMode.value) toggleVideoSelectMode()
   } catch (e) { toastError(e, { fallback: 'episode.vid.genFailed' }) }
 }
@@ -3606,7 +3626,7 @@ function uploadAssetImage(kind, id) {
 }
 
 async function genVid(sb, opts = {}) {
-  const option = videoModelOptions.value.find(item => item.key === videoModel.value) || videoModelOptions.value[0]
+  const option = videoGenerationOption.value
   if (!productionVersion.value || !productionPanelById(sb.id)) { toast.error('当前工作版尚未就绪'); return }
   if (!videoCanGenerate(sb.id)) { toast.error(productionReferenceState(sb.id).error); return }
   if (!option) { toast.error('请先启用视频模型'); return }

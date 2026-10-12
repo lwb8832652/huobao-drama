@@ -77,6 +77,77 @@ test('individual and automatic references work after composition failure, while 
   assert.equal(fn([target], 'individual', 9, [failed]).ready, false)
 })
 
+test('automatic group generation requires a ready sheet even for one selected panel', () => {
+  const fn = api().videoReferenceReadiness
+  const target = panel(), failed = { ...sheet(target), status: 'failed', cleanUrl: null }
+  assert.equal(fn([target], 'auto', 9, [failed], 'storyboard').ready, true)
+  const blocked = fn([target], 'auto', 9, [failed], 'group')
+  assert.equal(blocked.effective, 'contact_sheet')
+  assert.equal(blocked.ready, false)
+  assert.match(blocked.error, /宫格尚未就绪/)
+  assert.equal(fn([target], 'auto', 9, [sheet(target)], 'group').ready, true)
+  assert.equal(fn([target], 'individual', 9, [failed], 'group').ready, true)
+})
+
+test('group scope checks provider support and the total integer duration as one task', () => {
+  const fn = api().videoGenerationScopeError
+  assert.equal(typeof fn, 'function')
+  const first = panel(), second = { ...panel(), id: 8, durationMs: 7000 }
+  const cap = { group: true, minSeconds: 2, maxSeconds: 12 }
+  assert.equal(fn([first], 'group', cap), '')
+  assert.equal(fn([first, second], 'storyboard', cap), '')
+  assert.match(fn([first, second], 'group', cap), /13.*2–12/)
+  assert.match(fn([first], 'group', { ...cap, group: false }), /不支持按组/)
+  assert.match(fn([{ ...first, durationMs: 6500 }], 'group', cap), /整数秒/)
+})
+
+test('standalone readiness uses the selected scope instead of the legacy timeline strategy', () => {
+  const path = '../app/views/drama/previs.vue'
+  const ast = ts.createSourceFile(path, parse(read(path)).descriptor.scriptSetup.content, ts.ScriptTarget.Latest, true)
+  const declaration = ast.statements.flatMap(node => ts.isVariableStatement(node) ? Array.from(node.declarationList.declarations) : [])
+    .find(node => node.name.getText(ast) === 'videoReferenceState')
+  const first = panel(), second = { ...panel(), id: 8 }
+  const scope = vue.ref('storyboard')
+  const h = evaluate(`export const ${declaration.getText(ast)}`, {}, {
+    computed: vue.computed, timeline: vue.ref({ strategy: { mode: 'group' } }), videoGenerationScope: scope,
+    videoTargetPanels: vue.ref([first, second]), videoUsesStoryboardFrames: vue.ref(true),
+    videoReferenceInputStrategy: vue.ref('auto'), videoCapability: vue.ref({ group: true, minSeconds: 2, maxSeconds: 12, maxImages: 1 }),
+    version: vue.ref({ contactSheets: [sheet(first), sheet(second)] }),
+    videoReferenceReadiness: api().videoReferenceReadiness, videoGenerationScopeError: api().videoGenerationScopeError,
+  })
+  assert.equal(h.videoReferenceState.value.ready, true)
+  scope.value = 'group'
+  assert.equal(h.videoReferenceState.value.ready, false)
+  assert.match(h.videoReferenceState.value.error, /当前输入 2 张/)
+})
+
+test('batch readiness uses the provider that default-model submission actually selects', () => {
+  const path = '../app/views/drama/episode.vue'
+  const ast = ts.createSourceFile(path, parse(read(path)).descriptor.scriptSetup.content, ts.ScriptTarget.Latest, true)
+  const names = ['videoGenerationOption', 'selectedVideoConfig', 'batchVideoReferenceState']
+  const declarations = ast.statements.flatMap(node => ts.isVariableStatement(node) ? Array.from(node.declarationList.declarations) : [])
+    .filter(node => names.includes(node.name.getText(ast))).map(node => `export const ${node.getText(ast)}`).join('\n')
+  const target = panel()
+  for (const [defaultProvider, lockedProvider, ready] of [['aliyun', 'nuwax', true], ['minimax', 'aliyun', false]]) {
+    const options = [{ key: `${defaultProvider}/default`, provider: defaultProvider, configId: 9, model: 'default' },
+      { key: `${lockedProvider}/locked`, provider: lockedProvider, configId: 10, model: 'locked' }]
+    const h = evaluate(declarations, {}, {
+      computed: vue.computed, videoModel: vue.ref(''), videoModelOptions: vue.ref(options),
+      videoConfigs: vue.ref(options.map(option => ({ ...option, id: option.configId, is_active: true, priority: option.configId === 9 ? 2 : 1 }))),
+      lockedVideoConfigId: vue.ref(10), videoUsesStoryboardFrames: vue.ref(true),
+      batchVideoGenerationScope: vue.ref('group'), batchVideoConfirm: vue.ref({ targets: [{ id: 7 }] }),
+      productionPanelById: () => target, productionVersion: vue.ref({ contactSheets: [sheet(target)] }),
+      videoReferenceInputStrategy: vue.ref('auto'),
+      videoCapabilities: vue.ref({ aliyun: { group: true, minSeconds: 2, maxSeconds: 30, maxImages: 9 },
+        nuwax: { group: false, minSeconds: 2, maxSeconds: 30, maxImages: 9 }, minimax: { group: true, minSeconds: 2, maxSeconds: 5, maxImages: 9 } }),
+      videoReferenceReadiness: api().videoReferenceReadiness, videoGenerationScopeError: api().videoGenerationScopeError,
+    })
+    assert.equal(h.selectedVideoConfig.value.provider, defaultProvider)
+    assert.equal(h.batchVideoReferenceState.value.ready, ready)
+    if (!ready) assert.match(h.batchVideoReferenceState.value.error, /6.*2–5/)
+  }
+})
+
 test('reference strategy is restored and persisted across both workspaces', async () => {
   const saved = new Map([['huobao:video-reference-input-strategy', 'contact_sheet']])
   const fn = api({ localStorage: { getItem: key => saved.get(key), setItem: (key, value) => saved.set(key, value) } }).useVideoReferenceInputStrategy
@@ -156,14 +227,17 @@ test('workbench and standalone handlers submit the chosen strategy and block una
   for (const [path, names] of [['../app/views/drama/episode.vue', ['genVid', 'confirmBatchVideos']], ['../app/views/drama/previs.vue', ['startVideo']]]) {
     const ast = ts.createSourceFile(path, parse(read(path)).descriptor.scriptSetup.content, ts.ScriptTarget.Latest, true)
     const functions = ast.statements.filter(node => ts.isFunctionDeclaration(node) && names.includes(node.name?.text)).map(node => `export ${node.getText(ast)}`).join('\n')
-    for (const name of names) for (const ready of [true, false]) {
+    for (const name of names) for (const ready of [true, false]) for (const scope of ['storyboard', 'group']) {
       const submissions = [], errors = []
       const submit = async (type, payload) => submissions.push({ type, payload })
       const model = { key: 'provider/model', configId: 9, model: 'model' }
       const state = { ready, error: '宫格尚未就绪', effective: 'contact_sheet' }
       const h = evaluate(functions, {}, {
         videoReferenceInputStrategy: vue.ref('contact_sheet'), videoUsesStoryboardFrames: vue.ref(true),
+        batchVideoGenerationScope: vue.ref(scope), videoGenerationScope: vue.ref(scope),
+        batchVideoReferenceState: vue.ref(state),
         videoGenerationMode: vue.ref('storyboard_frames'), videoModel: vue.ref(model.key),
+        videoGenerationOption: vue.ref(model),
         videoModelOptions: vue.ref([model]), productionVersion: vue.ref({ id: 4 }),
         productionPanelById: () => panel(), videoCanGenerate: () => ready, productionReferenceState: () => state,
         generateProduction: submit, generate: submit, toast: { success() {}, error: message => errors.push(message) },
@@ -179,6 +253,8 @@ test('workbench and standalone handlers submit the chosen strategy and block una
         assert.equal(submissions[0].type, 'video')
         assert.equal(submissions[0].payload.videoReferenceInputStrategy, 'contact_sheet')
         assert.deepEqual(Array.from(submissions[0].payload.panelIds), [7])
+        if (name !== 'genVid') assert.equal(submissions[0].payload.generationScope, scope)
+        else assert.notEqual(submissions[0].payload.generationScope, 'group')
       } else assert.match(errors[0], /宫格尚未就绪/)
     }
   }

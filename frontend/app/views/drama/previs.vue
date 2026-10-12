@@ -18,9 +18,9 @@ import StoryboardContactSheet from '~/components/previs/StoryboardContactSheet.v
 import { uploadAPI } from '~/composables/useApi'
 import {
   FRAME_COUNT_MAX, frameCountChangeAllowed, checkContinuity, createFrameId, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl, orderedFrames,
-  contactSheetForPanel, videoReferenceReadiness, planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy,
+  contactSheetForPanel, videoReferenceReadiness, videoGenerationScopeError, planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy,
   type AudioClip, type ContinuityIssue, type ContinuityReview, type FrameType, type Keyframe,
-  type Panel, type PanelFramePlan, type Timeline,
+  type Panel, type PanelFramePlan, type Timeline, type VideoGenerationScope,
 } from '~/composables/usePrevis'
 import '~/assets/css/previs.css'
 
@@ -38,6 +38,7 @@ const {
 } = usePrevis()
 const videoGenerationMode = useVideoGenerationMode()
 const videoReferenceInputStrategy = useVideoReferenceInputStrategy()
+const videoGenerationScope = ref<VideoGenerationScope>('storyboard')
 const videoUsesStoryboardFrames = computed(() => videoGenerationMode.value === 'storyboard_frames')
 const drama = ref<any>(), episode = ref<any>(), error = ref(''), loading = ref(true), enabled = ref(true)
 const groupId = ref(''), panelId = ref(0), currentMs = ref(0)
@@ -283,6 +284,7 @@ const videoTargetPanels = computed(() => {
   if (!videoPanelIds.value.length) return timeline.value.panels
   return timeline.value.panels.filter(p => videoPanelIds.value.includes(p.id))
 })
+const videoTargetDuration = computed(() => videoTargetPanels.value.reduce((sum, panel) => sum + panel.durationMs, 0) / 1000)
 const incompleteVideoPanels = computed(() => videoTargetPanels.value.filter(p => !p.frames.length || p.frames.some(frame => !frame.url)))
 const emptyFramePanels = computed(() => timeline.value?.panels.filter(p => !p.frames.length) || [])
 function groupDuration(id: string) { return segments.value.filter(s => s.groupId === id).reduce((n, s) => n + s.panel.durationMs, 0) }
@@ -293,8 +295,11 @@ function sheetForPanel(target: Panel) {
   return contactSheetForPanel(target, version.value?.contactSheets?.find(sheet => sheet.panelId === target.id))
 }
 const videoReferenceState = computed(() => {
-  const units = timeline.value?.strategy.mode === 'group' ? [videoTargetPanels.value] : videoTargetPanels.value.map(panel => [panel])
-  const states = units.map(panels => videoReferenceReadiness(panels, videoReferenceInputStrategy.value, videoCapability.value?.maxImages || 9, version.value?.contactSheets || []))
+  const error = videoGenerationScopeError(videoTargetPanels.value, videoGenerationScope.value, videoCapability.value)
+  if (error) return { ready: false, error, effective: undefined }
+  if (!videoUsesStoryboardFrames.value) return { ready: true, error: '', effective: undefined }
+  const units = videoGenerationScope.value === 'group' ? [videoTargetPanels.value] : videoTargetPanels.value.map(panel => [panel])
+  const states = units.map(panels => videoReferenceReadiness(panels, videoReferenceInputStrategy.value, videoCapability.value?.maxImages || 9, version.value?.contactSheets || [], videoGenerationScope.value))
   return states.find(state => !state.ready) || { ready: true, error: '', effective: states[0]?.effective }
 })
 function groupScene(id: string) {
@@ -558,10 +563,11 @@ async function startVideo() {
     toast.error(`请先完成 ${incompleteVideoPanels.value.length} 个镜头的全部分镜画面`)
     return
   }
-  if (videoUsesStoryboardFrames.value && !videoReferenceState.value.ready) { toast.error(videoReferenceState.value.error); return }
+  if (!videoReferenceState.value.ready) { toast.error(videoReferenceState.value.error); return }
   await generate('video', { configId: choice.configId, model: choice.model,
     panelIds: videoPanelIds.value.length ? videoPanelIds.value : undefined,
     generationMode: videoGenerationMode.value,
+    generationScope: videoGenerationScope.value,
     videoReferenceInputStrategy: videoUsesStoryboardFrames.value ? videoReferenceInputStrategy.value : undefined })
   modal.value = ''; inspector.value = 'tasks'
 }
@@ -984,20 +990,22 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
           <label>视频模型<select v-model="videoModel"><option value="" disabled>选择视频模型</option><option v-for="o in modelOptions('video')" :key="o.key" :value="o.key">{{ o.label }}</option></select></label>
           <label>视频生成模式<div class="seg pv-dialog-mode"><button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'direct' }" @click="videoGenerationMode = 'direct'">直接生成</button><button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'storyboard_frames' }" @click="videoGenerationMode = 'storyboard_frames'">依赖分镜画面</button></div></label>
           <NuxtLink v-if="!modelOptions('image').length || !modelOptions('video').length" to="/settings">前往设置启用生成模型 →</NuxtLink>
-          <p v-if="videoCapability" class="pv-help">当前视频服务支持 {{ videoCapability.minSeconds }}–{{ videoCapability.maxSeconds }} 整数秒、每个镜头最多 {{ videoCapability.maxImages }} 张分镜画面。视频始终按单镜头生成。</p>
+          <p v-if="videoCapability" class="pv-help">当前视频服务支持 {{ videoCapability.minSeconds }}–{{ videoCapability.maxSeconds }} 整数秒、每次生成最多 {{ videoCapability.maxImages }} 张参考图。{{ videoCapability.group ? '支持将所选分镜合为一组生成。' : '支持按分镜生成。' }}</p>
           <footer><button class="btn btn-primary" @click="modal = ''">完成</button></footer>
         </div>
         <div v-else-if="modal === 'audio' && audioDraft" class="pv-form"><div class="pv-form-pair"><label>类型<select v-model="audioDraft.type" :disabled="!editable"><option value="dialogue">对白</option><option value="narration">旁白</option><option value="sound">环境声 / 音乐</option></select></label><label>角色<input v-model="audioDraft.character" :disabled="!editable"></label></div><label>关联分镜<select v-model="audioDraft.panelId" :disabled="!editable"><option :value="null">跨镜头音轨</option><option v-for="p in timeline?.panels" :key="p.id" :value="p.id">{{ p.title }}</option></select></label><label>文本<textarea v-model="audioDraft.text" :disabled="!editable" rows="3" /></label><div class="pv-form-pair"><label>起点 / 秒<input type="number" min="0" step=".1" :value="audioDraft.startMs / 1000" :disabled="!editable" @change="audioDraft.startMs = Math.max(0, Math.round(Number(valueOf($event)) * 1000))"></label><label>时长 / 秒<input type="number" min=".1" step=".1" :value="audioDraft.durationMs / 1000" :disabled="!editable" @change="audioDraft.durationMs = Math.max(100, Math.round(Number(valueOf($event)) * 1000))"></label></div><label>音频地址<input v-model="audioDraft.url" :disabled="!editable" placeholder="上传音频或填写 https:// 地址"></label><label class="pv-upload" :class="{ disabled: !editable || uploading }"><Upload :size="14" />{{ uploading ? '上传中…' : '上传配音 / 音效' }}<input type="file" accept="audio/*" :disabled="!editable || uploading" @change="run(() => uploadAudio($event))"></label><audio v-if="audioDraft.url" :src="mediaUrl(audioDraft.url)" controls /><p class="pv-help">未上传音频时，可在播放器开启浏览器临时配音。对白超出所属分镜会阻止锁定。</p><footer><button class="btn btn-danger" :disabled="!editable" @click="saveAudio(true)">删除片段</button><button class="btn btn-primary" :disabled="!editable || uploading" @click="saveAudio()">保存音轨</button></footer></div>
         <div v-else-if="modal === 'waiver'" class="pv-form"><p>{{ waiverIssue?.message }}</p><label>确认原因<textarea v-model="waiverReason" rows="4" maxlength="2000" placeholder="说明这是有意的叙事变化，或已人工确认…" autofocus /></label><footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="!waiverReason.trim() || !editable" @click="applyWaiver">记录并确认</button></footer></div>
         <div v-else-if="modal === 'video'" class="pv-form">
           <p>将使用当前工作版 V{{ version?.versionNo }} 生成{{ videoPanelIds.length ? '当前镜头' : '全部镜头' }}。</p>
+          <label>生成范围<select v-model="videoGenerationScope"><option value="storyboard">按分镜</option><option value="group">所选分镜合为一组</option></select></label>
+          <p class="pv-help">{{ videoGenerationScope === 'group' ? `所选 ${videoTargetPanels.length} 个分镜按时间线顺序合为一个视频，整组 ${videoTargetDuration} 秒，计为一次生成任务。` : `${videoTargetPanels.length} 个分镜各生成一个视频，共 ${videoTargetPanels.length} 次生成任务；总时长 ${videoTargetDuration} 秒。` }}</p>
           <label>生成模式<div class="seg pv-dialog-mode"><button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'direct' }" @click="videoGenerationMode = 'direct'">直接生成</button><button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'storyboard_frames' }" @click="videoGenerationMode = 'storyboard_frames'">依赖分镜画面</button></div></label>
           <label v-if="videoUsesStoryboardFrames">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
           <label>视频模型<select v-model="videoModel"><option value="" disabled>选择模型</option><option v-for="o in modelOptions('video')" :key="o.key" :value="o.key">{{ o.label }}</option></select></label>
           <p class="pv-help">{{ videoGenerationMode === 'direct' ? '使用视频提示词与已绑定素材直接生成，不依赖分镜画面。' : '全部分镜画面将按时间顺序作为视频参考。' }}</p>
-          <p v-if="videoUsesStoryboardFrames && !videoReferenceState.ready" class="pv-frame-error">{{ videoReferenceState.error }}</p>
+          <p v-if="!videoReferenceState.ready" class="pv-frame-error">{{ videoReferenceState.error }}</p>
           <p v-if="videoUsesStoryboardFrames && incompleteVideoPanels.length" class="pv-frame-error">还有 {{ incompleteVideoPanels.length }} 个镜头存在未完成画面，请先生成或上传全部画面。</p>
-          <footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="working || !videoModel || (videoUsesStoryboardFrames && !videoReferenceState.ready)" @click="run(startVideo)"><Film :size="14" />提交生成</button></footer>
+          <footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="working || !videoModel || !videoReferenceState.ready" @click="run(startVideo)"><Film :size="14" />提交生成</button></footer>
         </div>
         <div v-else-if="modal === 'split'" class="pv-form"><p>重新拆分会按新方案重写「{{ panel?.title }}」的全部分镜画面，已生成的图片会保留在画面历史中。</p><footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="framePlanSubmitting || !editable" @click="run(async () => { modal = ''; await splitPanel(true) })">重新拆分</button></footer></div>
         <div v-else class="pv-form"><p>{{ ({ lock: '锁定后时间线和分镜画面不可修改；后续编辑需复制为新草稿。', sync: '读取视频制作中的最新分镜并建立新草稿，当前版本将保留。', reload: '载入远端最新版本。尚未保存的本地修改将被替换，建议先下载本地草稿。' } as Record<string, string>)[modal] }}</p><footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="working" @click="run(async () => { if (modal === 'lock') await check(true); else if (modal === 'sync') await create(); else if (modal === 'reload') { dirty = false; await open(version!.id) } modal = '' })">确认{{ modal === 'lock' ? '锁定' : modal === 'sync' ? '同步' : '' }}</button></footer></div>

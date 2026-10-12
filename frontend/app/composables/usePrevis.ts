@@ -94,9 +94,19 @@ export function contactSheetForPanel(panel: Panel, sheet?: ContactSheetView): Co
   return matches ? sheet : { ...sheet, status: 'stale', annotatedUrl: null, cleanUrl: null, thumbnailUrl: null,
     readyFrames: frames.filter(frame => frame.url).length, totalFrames: frames.length }
 }
-export function videoReferenceReadiness(panels: Panel[], requested: VideoReferenceInputStrategy, maxImages: number, sheets: ContactSheetView[] = []) {
+export type VideoGenerationScope = 'storyboard' | 'group'
+export function videoGenerationScopeError(panels: Panel[], scope: VideoGenerationScope, capability?: { group: boolean; minSeconds: number; maxSeconds: number }) {
+  if (scope !== 'group') return ''
+  if (!capability?.group) return '当前服务不支持按组生成，请改用按分镜生成'
+  const seconds = panels.reduce((sum, panel) => sum + panel.durationMs, 0) / 1000
+  if (!Number.isInteger(seconds) || seconds < capability.minSeconds || seconds > capability.maxSeconds) {
+    return `整组时长 ${seconds} 秒；当前模型要求 ${capability.minSeconds}–${capability.maxSeconds} 的整数秒，请调整范围或时长`
+  }
+  return ''
+}
+export function videoReferenceReadiness(panels: Panel[], requested: VideoReferenceInputStrategy, maxImages: number, sheets: ContactSheetView[] = [], generationScope: VideoGenerationScope = 'storyboard') {
   try {
-    const effective = selectVideoReferenceStrategy(panels, requested, maxImages)
+    const effective = selectVideoReferenceStrategy(panels, requested, maxImages, generationScope)
     if (effective === 'contact_sheet') {
       const unavailable = panels.find(panel => {
         const sheet = contactSheetForPanel(panel, sheets.find(sheet => sheet.panelId === panel.id))
@@ -305,6 +315,7 @@ export function usePrevis() {
   async function generate(type: 'image' | 'video', options: {
     configId?: number; model?: string; panelIds?: number[]; frameTypes?: FrameType[]; frameIds?: string[]; force?: boolean;
     generationMode?: 'direct' | 'storyboard_frames';
+    generationScope?: VideoGenerationScope;
     videoReferenceInputStrategy?: VideoReferenceInputStrategy;
   } = {}) {
     if (!version.value) return
