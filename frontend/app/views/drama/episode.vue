@@ -5035,10 +5035,10 @@ onMounted(() => setTimeout(() => autoTour('episode', EPISODE_TOUR, t), 900))
 .video-reference-select { display: flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 11px; }
 .video-reference-select select, .batch-video-row select { min-height: 28px; padding: 0 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-raised); color: var(--text-0); font-size: 11px; }
 .production-frames-section {
-  padding: 12px;
+  padding: 14px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: var(--surface-muted);
+  background: var(--surface-raised);
 }
 .direct-frames-entry {
   appearance: none; width: 100%; min-height: 56px; display: flex; align-items: center; gap: 10px;
@@ -5057,8 +5057,8 @@ onMounted(() => setTimeout(() => autoTour('episode', EPISODE_TOUR, t), 900))
 .direct-frames-copy strong { color: var(--text-0); font-size: 12px; font-weight: 700; }
 .direct-frames-copy small { color: var(--text-2); font-size: 10px; line-height: 1.5; white-space: normal; }
 .direct-frames-context {
-  display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 6px 8px;
-  border-radius: var(--radius-sm); background: var(--info-bg); color: var(--info);
+  display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 6px 8px;
+  border: 1px solid var(--border); border-radius: 7px; background: var(--surface-soft); color: var(--text-2);
 }
 .direct-frames-context > svg { flex-shrink: 0; }
 .direct-frames-context > div { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 1px; }

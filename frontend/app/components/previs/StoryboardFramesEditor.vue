@@ -198,11 +198,11 @@ watch(settingsFrame, frame => {
 <template>
   <section class="frame-editor">
     <header class="frame-editor-head">
-      <div><strong>{{ title }}</strong><span>{{ frames.length - missingVideoFrames }} / {{ frames.length }} 张已就绪</span></div>
-      <button type="button" class="btn btn-sm" :disabled="!canAdd" :title="`每个镜头最多 ${FRAME_COUNT_MAX} 张画面`" @click="add"><ImagePlus :size="14" />添加画面</button>
+      <div><strong>{{ title }}</strong><span class="frame-count" :class="{ complete: frames.length > 0 && !missingVideoFrames }"><i />{{ frames.length - missingVideoFrames }} / {{ frames.length }} 张已就绪</span></div>
+      <button type="button" class="btn btn-sm frame-add" :disabled="!canAdd" :title="`每个镜头最多 ${FRAME_COUNT_MAX} 张画面`" @click="add"><ImagePlus :size="13" />添加画面</button>
     </header>
     <div class="frame-editor-tools">
-      <button v-if="frames.length" type="button" class="btn btn-sm" :aria-pressed="editing" @click="editing = !editing">{{ editing ? '返回宫格' : '编辑画面' }}</button>
+      <button v-if="frames.length" type="button" class="btn btn-sm frame-view-toggle" :aria-pressed="editing" @click="editing = !editing"><SlidersHorizontal :size="12" />{{ editing ? '返回宫格' : '编辑画面' }}</button>
       <button type="button" class="btn btn-sm frame-fill" :disabled="!canGenerateMissing"
         :title="missingFrames.some(frame => !frameReferenceUrls(frame).length) ? '请先在生成设置中选择参考素材' : '生成所有缺失画面'"
         @click="emit('generate', missingFrames.map(frameKey))"><Sparkles :size="13" />生成缺失<span v-if="missingVideoFrames">{{ missingVideoFrames }}</span></button>
@@ -266,7 +266,7 @@ watch(settingsFrame, frame => {
         <button type="button" class="btn btn-sm" :disabled="!editable" @click="plan">按描述规划</button>
       </div>
     </div>
-    <footer class="frame-editor-video">
+    <footer v-if="usesStoryboardFrames || showVideoAction" class="frame-editor-video">
       <div><Film :size="14" /><span>{{ usesStoryboardFrames ? (videoReady ? `全部 ${frames.length} 张画面已就绪` : videoInputError || (frames.length ? `还需完成 ${missingVideoFrames} 张画面` : '先添加分镜画面')) : '当前为直接生成模式' }}<small>{{ usesStoryboardFrames ? '视频按时间顺序使用全部画面' : '这些画面仅用于预演和审核，不作为当前视频输入' }}</small></span></div>
       <button v-if="showVideoAction" type="button" class="btn btn-primary btn-sm" :disabled="!videoReady" @click="emit('video')"><Film :size="13" />生成视频</button>
     </footer>
@@ -285,15 +285,24 @@ watch(settingsFrame, frame => {
 </template>
 
 <style scoped>
-.frame-editor { min-width: 0; display: flex; flex-direction: column; gap: 10px; container-type: inline-size; }
+.frame-editor { min-width: 0; display: flex; flex-direction: column; gap: 12px; container-type: inline-size; }
 .frame-editor-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.frame-editor-head > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.frame-editor-head > div { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; min-width: 0; }
 .frame-editor-head strong { color: var(--text-0); font-size: 13px; }
 .frame-editor-head span { color: var(--text-2); font-size: 11px; }
-.frame-editor .btn { font-size: 11px; padding: 0 10px; min-height: 28px; }
+.frame-editor-head .frame-count { display: inline-flex; align-items: center; gap: 5px; padding: 3px 6px; border-radius: 5px; background: var(--surface-muted); font-size: 10px; line-height: 1.2; }
+.frame-count i { width: 5px; height: 5px; border-radius: 50%; background: var(--text-3); }
+.frame-editor-head .frame-count.complete { color: var(--success); background: var(--success-bg); }
+.frame-count.complete i { background: currentColor; }
+.frame-editor .btn { font-size: 11px; padding: 0 10px; min-height: 30px; border-radius: 7px; }
+.frame-editor .frame-add { flex-shrink: 0; background: var(--surface-raised); border: 1px solid var(--border); color: var(--text-2); box-shadow: none; }
+.frame-editor .frame-add:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text-0); }
 .frame-editor-tools { display: flex; align-items: center; gap: 6px; }
-.frame-editor .frame-fill { flex: 1; justify-content: center; }
-.frame-fill span { min-width: 16px; border-radius: 4px; padding: 1px 4px; background: var(--bg-active); font: 10px var(--font-mono); }
+.frame-editor .frame-view-toggle { border: 1px solid var(--border); background: var(--surface-raised); color: var(--text-1); box-shadow: none; }
+.frame-editor .frame-view-toggle:hover:not(:disabled) { background: var(--surface-muted); }
+.frame-editor .frame-fill { margin-left: auto; flex: 0 1 auto; justify-content: center; border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border)); background: var(--accent-bg); color: var(--accent-text); box-shadow: none; }
+.frame-editor .frame-fill:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 18%, var(--surface-raised)); border-color: var(--accent); }
+.frame-fill span { display: inline-flex; align-items: center; justify-content: center; min-width: 17px; height: 17px; border-radius: 4px; padding: 0 4px; background: color-mix(in srgb, var(--accent) 13%, transparent); font: 10px var(--font-mono); }
 .frame-editor .frame-icon { width: 28px; min-height: 28px; padding: 0; background: transparent; box-shadow: none; color: var(--text-2); }
 .frame-editor .frame-icon:hover { background: var(--bg-hover); color: var(--text-0); }
 .frame-upload-input { display: none; }
