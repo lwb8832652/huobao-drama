@@ -32,18 +32,34 @@ function translate(key, params) {
   return value.replace(/\{(\w+)\}/g, (_, name) => (name in params ? String(params[name]) : `{${name}}`))
 }
 const i18nStub = { global: { t: translate } }
+// usePrevis.ts 依赖 useApi.ts 的 withNetworkRetry。useApi 自身无 import，直接跑真模块，
+// 这样测试覆盖的是真实的重试语义而不是替身。useToast.ts 也从 useApi 取陈旧 chunk 的
+// 识别与自愈函数，必须先求值出来再注入它的依赖表。
+// reloadStaleBundle 读 sessionStorage 冷却键、调 window.location.reload()：给一套共享的
+// 可变假件（测试里 reset/预设），组件与 useToast 两个实例因此看到同一份冷却状态。
+const sessionStore = new Map()
+const reloads = []
+// TypeError/Error 必须显式注入：isStaleChunkError 用 `cause instanceof TypeError` 分流，
+// vm 是独立 realm，不注入的话测试（宿主）new 出来的错误会 instanceof 失败、静默走错分支。
+const useApi = evaluate(read('../app/composables/useApi.ts'), {}, {
+  TypeError, Error,
+  console: { warn: () => {}, log: () => {}, error: () => {} },
+  sessionStorage: {
+    getItem: key => (sessionStore.has(key) ? sessionStore.get(key) : null),
+    setItem: (key, value) => sessionStore.set(key, String(value)),
+  },
+  window: { location: { reload: () => reloads.push(1) } },
+})
 // mapError 内部用 `err instanceof TypeError / SyntaxError` 分流。模块跑在 vm 的独立 realm
 // 里，它的 TypeError 与测试文件（宿主 realm）的不是同一个构造器，宿主 new 出来的错误会
 // instanceof 失败、悄悄走到兜底分支。把内置构造器显式注入，保证分流按真实语义执行。
 const useToast = evaluate(read('../app/composables/useToast.ts'), {
   'vue-sonner': { toast: { error: () => {}, success: () => {} } },
   '~/composables/i18n': { i18n: i18nStub },
+  '~/composables/useApi': useApi,
 }, { TypeError, SyntaxError, Error })
 const UNKNOWN_ERROR_TEXT = translate('errors.unknown')
 
-// usePrevis.ts 依赖 useApi.ts 的 withNetworkRetry。useApi 自身无 import，直接跑真模块，
-// 这样测试覆盖的是真实的重试语义而不是替身。
-const useApi = evaluate(read('../app/composables/useApi.ts'))
 const candidate = (extra = {}) => ({ id: 20, versionId: 4, panelId: 7, mode: 'generate', status: 'ready', batchNo: 1,
   previewUrl: '/static/grid.png', rawUrl: '/static/raw.png', baseUrl: '/static/before.png',
   width: 2048, height: 1152, cellWidth: 1024, cellHeight: 576,
@@ -72,7 +88,7 @@ function harness({ items = [], save = async () => ({ versionId: 4, revision: 9 }
   const component = evaluate(script.content, {
     vue: { ...vue, onMounted: fn => mounted.push(fn), onBeforeUnmount: fn => disposers.push(fn), onUnmounted: fn => disposers.push(fn), useId: () => 'grid-dialog' },
     'lucide-vue-next': {}, 'vue-sonner': { toast: { success: message => toasts.push(message) } },
-    '~/composables/useApi': { uploadAPI: { image: async () => ({ path: '/static/upload.png' }) } },
+    '~/composables/useApi': { ...useApi, uploadAPI: { image: async () => ({ path: '/static/upload.png' }) } },
     '~/composables/usePrevis': { previsRequest: api, mediaUrl: url => url, orderedFrames: panel => panel.frames, frameKey: frame => frame.id, FRAME_COUNT_MAX: 9, gridLayoutForCount: frameContract.gridLayoutForCount },
     '~/composables/useToast': { mapError: useToast.mapError },
     '~/composables/i18n': { i18n: i18nStub },
@@ -333,18 +349,55 @@ test('locked and failed candidates cannot submit or adopt, but remain reviewable
   assert.equal(h.setup.review.value.status, 'failed'); h.dispose()
 })
 
-test('a raw network failure surfaces as friendly copy, never the English browser string', async () => {
+test('a raw network failure surfaces as friendly copy with the endpoint, never the English browser string', async () => {
   // 回归：曾经把 err.message 直接塞进 error.value，界面上就出现裸的
   // 「Failed to fetch」——用户看到的正是这行英文。现在必须映射为中文文案，
-  // 原始错误只进 DevTools，并带上出错的接口路径便于定位。
-  const h = harness({ request: (path, method) => { if (method === 'GET') throw new TypeError('Failed to fetch') } })
+  // 原始错误只进 DevTools；同时把出错接口的路径带进可见文案，省得为定位开 DevTools。
+  // 只让第一条挂掉：loadContext 用 Promise.allSettled，后一个 rejection 会覆盖前一个，
+  // 两条全挂时最终只显示后一条的端点，这里固定成单条以便确定断言。
+  const h = harness({ request: path => { if (path.includes('grid-capabilities')) throw new TypeError('Failed to fetch') } })
   await h.start()
-  assert.equal(h.setup.error.value, translate('errors.network'))
+  assert.equal(h.setup.error.value, `${translate('errors.network')}（/previs/grid-capabilities）`)
   assert.doesNotMatch(h.setup.error.value, /failed to fetch/i)
+  // 完整端点（含 query）只进 DevTools
   const logged = h.logged.map(args => args[0]).join('\n')
   assert.match(logged, /\[grid\]/)
-  assert.match(logged, /\/previs\/grid-capabilities/)
+  assert.match(logged, /\/previs\/grid-capabilities\?/)
   assert.equal(h.setup.loading.value, false); h.dispose()
+})
+
+test('a stale-chunk failure self-heals with one reload and shows no inline error', async () => {
+  // 回归：部署后停留在旧页面的用户，动态 import 的 chunk 已被新构建删除，浏览器抛
+  // `TypeError: Failed to fetch dynamically imported module: …/_nuxt/<旧哈希>.js`。
+  // message 含 "Failed to fetch"，曾被 mapError 误报成「无法连接服务器」——服务端其实是好的。
+  // 现在必须整页重载自愈（与 chunk-reload 插件共用同一把冷却锁），自愈期间不展示错误文案。
+  sessionStore.clear(); reloads.length = 0
+  const h = harness({
+    request: path => { if (path.includes('grid-capabilities')) throw new TypeError('Failed to fetch dynamically imported module: https://host/_nuxt/CNNR5FoL.js') },
+  })
+  await h.start()
+  assert.equal(reloads.length, 1, '陈旧 bundle 触发一次整页重载')
+  assert.equal(h.setup.error.value, '', '自愈期间不展示错误文案')
+  assert.ok(sessionStore.has('huobao:chunk-reload-at'), '写入冷却键，防止叠加重载')
+  const logged = h.logged.map(args => args[0]).join('\n')
+  assert.match(logged, /检测到已失效的前端资源/)
+  h.dispose()
+})
+
+test('a stale-chunk failure during cooldown shows the stale copy without an endpoint suffix', async () => {
+  // 冷却期内仍失败（刚重载过）：可能是新版自身有问题，此时才展示文案，且不拼端点——
+  // 失败与具体接口无关，拼上只会把排障方向带偏。
+  sessionStore.clear(); reloads.length = 0
+  sessionStore.set('huobao:chunk-reload-at', String(Date.now()))
+  const h = harness({
+    request: path => { if (path.includes('grid-capabilities')) throw new TypeError('Failed to fetch dynamically imported module: https://host/_nuxt/CDqF2x1M.js') },
+  })
+  await h.start()
+  assert.equal(reloads.length, 0, '冷却期内不重复重载，避免死循环')
+  assert.equal(h.setup.error.value, translate('errors.staleChunk'))
+  assert.match(h.setup.error.value, /[\u4e00-\u9fff]/, 'staleChunk 必须有中文文案（漏译时 mapError 会原样返回 key）')
+  assert.doesNotMatch(h.setup.error.value, /grid-capabilities/)
+  h.dispose()
 })
 
 test('closing review retains candidates and explicit discard removes only that candidate', async () => {

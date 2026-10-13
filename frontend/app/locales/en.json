@@ -880,6 +880,7 @@
   },
   "errors": {
     "network": "Cannot reach the server. Check your network or that the service is running.",
+    "staleChunk": "Page resources are outdated and the auto-refresh did not resolve it. Please reload the page manually and try again.",
     "server": "The server returned an unexpected response. Please try again later.",
     "unavailable": "Service temporarily unavailable. Please try again later.",
     "auth": "Authentication failed. Check your API key settings.",

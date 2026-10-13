@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
 import { toast } from 'vue-sonner'
 import { Check, Eye, Grid2X2, History, Images, Loader2, RefreshCw, Scissors, Settings2, SlidersHorizontal, Sparkles, Trash2, Upload, X } from 'lucide-vue-next'
-import { uploadAPI } from '~/composables/useApi'
+import { isStaleChunkError, reloadStaleBundle, uploadAPI } from '~/composables/useApi'
 import { mapError } from '~/composables/useToast'
 import { i18n } from '~/composables/i18n'
 import { FRAME_COUNT_MAX, frameKey, gridLayoutForCount, mediaUrl, orderedFrames, previsRequest,
@@ -128,10 +128,24 @@ const UNKNOWN_ERROR_TEXT = i18n.global.t('errors.unknown')
  * 内联错误的唯一出口：统一走 mapError，把网络层失败显示成「无法连接服务器…」这类可读文案，
  * 而不是把浏览器裸的英文 `Failed to fetch` 直接印在界面上（那是排障信息，不该给用户看）。
  * 原始错误连端点一起进 DevTools——并发打多个接口时，要能一眼看出是哪一条挂了。
+ *
+ * 陈旧 bundle（部署后停留在旧页面）是特例：动态 import 的 chunk 已被新构建删除，重试接口、
+ * 刷新数据都没有意义，直接整页重载自愈；冷却期内仍失败才展示文案，且不拼端点——
+ * 失败与具体接口无关，拼上只会把排障方向带偏。
  */
 function failure(cause: unknown, fallback: string, endpoint = '') {
+  if (isStaleChunkError(cause)) {
+    console.error(`[grid] 检测到已失效的前端资源${endpoint ? `（操作 ${endpoint.split('?')[0]}）` : ''}`, cause)
+    if (reloadStaleBundle()) return
+    error.value = mapError(cause)
+    return
+  }
   const friendly = mapError(cause)
-  error.value = friendly === UNKNOWN_ERROR_TEXT ? fallback : friendly
+  // 端点拼进可见文案（去掉 query 只留路径）。网络层失败本身不带任何定位信息，排障时
+  // 最要紧的是知道「哪一条接口挂了」——此前只能开 DevTools 看 console，门槛太高。
+  // 其余对 error.value 的赋值都是整串替换，因此不会残留上一个端点的后缀。
+  const where = endpoint ? `（${endpoint.split('?')[0]}）` : ''
+  error.value = (friendly === UNKNOWN_ERROR_TEXT ? fallback : friendly) + where
   console.error(`[grid] ${fallback}${endpoint ? ` ← ${endpoint}` : ''}`, cause)
 }
 function stopPolling() { clearTimeout(polling); polling = undefined }

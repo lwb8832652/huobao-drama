@@ -11,14 +11,17 @@
  *       前端 toast 原样展示成「Failed to fetch」（看起来像接口挂了，其实不是）。
  *
  * Vite 在动态 import 失败时会派发可取消的 `vite:preloadError` 事件，这里接管它做
- * 一次整页刷新，让用户无感拿到线上最新版本；用 sessionStorage 做冷却，避免新版自身
- * 有问题时陷入「刷新 → 仍然失败 → 再刷新」的死循环。
+ * 一次整页刷新，让用户无感拿到线上最新版本。
+ *
+ * 冷却锁与自愈逻辑本身在 composables/useApi.ts 的 reloadStaleBundle()：
+ * vite:preloadError 覆盖不到「裸 import() 失败」（路由 chunk 等），那类错误会以
+ * TypeError 形式冒到业务 catch（useToast.mapError / StoryboardGridTools.failure），
+ * 两条路径必须共用同一把 sessionStorage 锁，否则可能叠加重载或绕过冷却。
  *
  * 注意：本插件只能覆盖「新页面」；已经停留在旧 bundle 上的页面无从加载它，那类页面
  * 仍需手动硬刷新一次。
  */
-const RELOAD_KEY = 'huobao:chunk-reload-at'
-const RELOAD_COOLDOWN_MS = 10_000
+import { reloadStaleBundle } from '~/composables/useApi'
 
 export default defineNuxtPlugin(() => {
   if (!import.meta.client) return
@@ -26,17 +29,6 @@ export default defineNuxtPlugin(() => {
   window.addEventListener('vite:preloadError', (event) => {
     // 阻止 Vite 继续抛出：否则控制台仍会留下未捕获错误，Nuxt 也可能再处理一次
     event.preventDefault()
-
-    let last = 0
-    try { last = Number(sessionStorage.getItem(RELOAD_KEY) || 0) } catch { /* 隐私模式下不可用 */ }
-    if (Date.now() - last < RELOAD_COOLDOWN_MS) {
-      console.warn('[chunk] 资源已失效且刚重新加载过，跳过自动重载以避免死循环')
-      return
-    }
-    try { sessionStorage.setItem(RELOAD_KEY, String(Date.now())) } catch { /* 同上 */ }
-
-    // 不做缓存穿透参数：HTML 无缓存头，普通 reload 即会拿到新的 chunk 清单
-    console.warn('[chunk] 检测到已失效的前端资源（通常是部署后停留在旧页面），正在重新加载最新版本…')
-    window.location.reload()
+    reloadStaleBundle()
   })
 })
