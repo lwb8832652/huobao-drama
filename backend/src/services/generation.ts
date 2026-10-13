@@ -51,6 +51,7 @@ interface GenerateImageParams {
 }
 
 interface GenerateVideoParams {
+  videoContinuity?: import('./previs-video-continuity.js').VideoContinuitySnapshot
   referenceInput?: import('./previs-video-reference-domain.js').VideoReferenceInput
   previs?: { versionId: number; itemKey: string }
   storyboardId?: number
@@ -142,6 +143,7 @@ export async function generateVideo(params: GenerateVideoParams): Promise<number
     lastFrameUrl: params.lastFrameUrl,
     referenceImageUrls: params.referenceImageUrls,
     referenceInput: params.referenceInput,
+    videoContinuity: params.videoContinuity,
     referenceVideoUrls: params.referenceVideoUrls,
     referenceAudioUrls: params.referenceAudioUrls,
     referenceFileUrl: params.referenceFileUrl,
@@ -341,8 +343,10 @@ async function processTask(id: number, config: AIConfig) {
     } else {
       const adapter = getVideoAdapter(config.provider)
       const resolvedImageUrl = await normalizeVideoReferenceUrl(params.imageUrl)
-      const resolvedFirstFrameUrl = await normalizeVideoReferenceUrl(params.firstFrameUrl)
-      const resolvedLastFrameUrl = await normalizeVideoReferenceUrl(params.lastFrameUrl)
+      const endpoints = params.videoContinuity?.actual === 'first_last'
+        ? await (await import('./previs-video-continuity.js')).normalizeVideoEndpoints(params.videoContinuity) : undefined
+      const resolvedFirstFrameUrl = endpoints?.firstFrameUrl || await normalizeVideoReferenceUrl(params.firstFrameUrl)
+      const resolvedLastFrameUrl = endpoints?.lastFrameUrl || await normalizeVideoReferenceUrl(params.lastFrameUrl)
       const resolvedReferenceImageUrls = params.referenceInput
         ? await (await import('./previs-video-reference-normalizer.js')).normalizeSnapshotImages(params.referenceInput)
         : await normalizeVideoReferenceUrls(params.referenceImageUrls)

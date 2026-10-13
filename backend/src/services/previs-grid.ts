@@ -28,6 +28,8 @@ import { composeGrid, mergeGridSelection, splitGrid } from './previs-grid-images
 import { freezeReferenceMedia, mediaDigest, readReferenceMedia } from './previs-reference-media.js'
 import { scheduleContactSheets } from './previs-contact-sheets.js'
 import { chooseGridSize, gridImageCapabilities } from './previs-grid-capabilities.js'
+import { getDramaStylePrompt } from './style-preset.js'
+import { continuityMatchesTimeline, type PanelContinuity } from './previs-continuity.js'
 import { resolvePanelGridReferences, type GridReferenceItem } from './previs-grid-references.js'
 
 export interface GridRequest {
@@ -53,6 +55,7 @@ export interface GridReferenceAsset extends FrozenMedia {
   sourceUrl?: string
 }
 interface GridSnapshot {
+  continuity?: PanelContinuity
   revision: number
   panel: Panel
   panelHash: string
@@ -105,7 +108,12 @@ function candidateRow(versionId: number, id: number) {
 }
 function view(row: Row) {
   const s = snapshot(row)
+  const timeline = normalizeTimeline(JSON.parse(versionRow(row.versionId).timelineJson))
+  const continuityStale = s.continuity ? !continuityMatchesTimeline(s.continuity, timeline) : false
   return {
+    continuity: s.continuity,
+    continuityStale,
+    continuityStaleReason: continuityStale ? '前序边界或转场已变化；此候选保留原生成输入。' : undefined,
     id: row.id,
     versionId: row.versionId,
     panelId: row.panelId,
@@ -277,6 +285,7 @@ export async function startGridCandidates(versionId: number, request: GridReques
     throw new PrevisError(caps.reason || '当前模型不支持参考生图或图片微调')
   const ep = db.select().from(schema.episodes).where(eq(schema.episodes.id, row.episodeId)).get()!
   const drama = db.select().from(schema.dramas).where(eq(schema.dramas.id, ep.dramaId)).get()
+  const style = await getDramaStylePrompt(ep.dramaId)
   const size = chooseGridSize(
     caps,
     drama?.aspectRatio || '16:9',
@@ -284,7 +293,9 @@ export async function startGridCandidates(versionId: number, request: GridReques
   )
   // Validate all manifests and counts before reading/freezing any source, including remote uploads.
   const assetsByPanel = new Map(panels.map(p => {
-    const manifest = resolvePanelGridReferences(p, ep.dramaId)
+    const firstId = orderedFrames(p)[0]?.id
+    const manifest = resolvePanelGridReferences(p, ep.dramaId, { timeline: t, versionId,
+      includeBoundary: request.mode === 'generate' || Boolean(firstId && request.targetFrameIds?.includes(firstId)) })
     if (manifest.items.some(item => item.required && !item.url) || (request.mode === 'generate' && !manifest.ready))
       throw new PrevisError(manifest.error)
     const assets = manifest.items.filter((item): item is GridReferenceItem & { url: string } => Boolean(item.url))
@@ -293,7 +304,7 @@ export async function startGridCandidates(versionId: number, request: GridReques
       throw new PrevisError(
         `需要 ${referenceSlots} 张参考图片，当前模型上限 ${caps.maxReferences}；请调整资产或更换模型`,
       )
-    return [p.id, assets] as const
+    return [p.id, { assets, continuity: manifest.continuity }] as const
   }))
   // Freeze every unit first: an invalid later unit cannot create partial paid tasks.
   const prepared: { panelId: number; inputHash: string; s: GridSnapshot }[] = []
@@ -313,11 +324,16 @@ export async function startGridCandidates(versionId: number, request: GridReques
     )
     if (request.mode !== 'generate' && Object.values(instructions).some((v) => !v))
       throw new PrevisError('请为每个选中画面填写修改指令')
-    const assets = assetsByPanel.get(p.id)!
+    const { assets, continuity } = assetsByPanel.get(p.id)!
+    const frozenContinuity = continuity && structuredClone(continuity)
     const referenceAssets: GridReferenceAsset[] = await Promise.all(assets.map(async item => ({
       ...await freezeReferenceMedia(item.url), label: item.label, kind: item.kind,
       required: item.required, sourceUrl: item.url,
     })))
+    if (frozenContinuity?.previous) {
+      const boundary = referenceAssets.find(item => item.sourceUrl === frozenContinuity.previous!.sourceUrl || item.sourceUrl === `/${frozenContinuity.previous!.sourceUrl}`)
+      if (boundary) Object.assign(frozenContinuity.previous, { frozenUrl: boundary.url, digest: boundary.digest })
+    }
     const references: FrozenMedia[] = referenceAssets.map(({ url, digest }) => ({ url, digest }))
     const currentSources: GridSnapshot['currentSources'] = []
     let base: FrozenMedia | undefined,
@@ -387,6 +403,7 @@ export async function startGridCandidates(versionId: number, request: GridReques
         : ''
     const s: GridSnapshot = {
       revision: request.revision,
+      continuity: frozenContinuity,
       panel: structuredClone(p),
       panelHash: panelHash(p),
       projectAspectRatio: drama?.aspectRatio || '16:9',
@@ -400,7 +417,8 @@ export async function startGridCandidates(versionId: number, request: GridReques
       aspectRatio: size.width / size.height,
       resolution: request.resolution || caps.resolutions[0],
       prompt: [
-        drama?.style,
+        style,
+        frozenContinuity?.previous?.digest ? `前序末画面只约束当前首个静态状态的动作阶段与空间关系，不要在每格重复前序完整动作。人物身份、服装、道具和场景以当前绑定资产为准，资产身份参考优先于前序漂移。${frozenContinuity.reason}` : '',
         promptFor(p, grid, request.mode, targets, instructions, assets),
         neighborLegend,
       ]

@@ -1,4 +1,5 @@
 import type { ContactSheetView } from './previs-contact-sheet-domain.js'
+import type { VideoContinuitySnapshot } from './previs-video-continuity.js'
 import type { VideoReferenceInput } from './previs-video-reference-domain.js'
 /** Version-owned production data. Times are integer milliseconds throughout. */
 export type FrameType = 'start' | 'middle' | 'end' | 'beat'
@@ -160,6 +161,7 @@ export interface AnimaticVersion {
 }
 export interface VideoOutput {
   generationScope?: 'storyboard' | 'group'
+  videoContinuity?: VideoContinuitySnapshot
   referenceInput?: VideoReferenceInput
   key: string
   panelIds: number[]
@@ -170,6 +172,7 @@ export interface VideoOutput {
 }
 export interface BatchItem {
   generationScope?: 'storyboard' | 'group'
+  videoContinuity?: VideoContinuitySnapshot
   referenceInput?: VideoReferenceInput
   id: number
   groupId: string

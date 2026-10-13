@@ -59,7 +59,7 @@ async function run(id: number, candidateId: number) {
   for (let index = 0; index < 100; index++) {
     await grid.tickGridCandidates()
     const candidate = grid.listGridCandidates(id).find(item => item.id === candidateId)!
-    if (['ready', 'failed'].includes(candidate.status)) return candidate
+    if (['ready', 'adopted', 'failed'].includes(candidate.status)) return candidate
     await new Promise(resolve => setTimeout(resolve, 25))
   }
   throw new Error('Mock generation timeout')
@@ -134,7 +134,7 @@ test('reference-free generate rejects before any partial candidate while legacy 
   assert.equal(db.select().from(schema.gridCandidates).all().length, before)
   assert.equal(submissions.length, 0)
   const edit = await grid.startGridCandidates(noRefs, { ...request, mode: 'frame_edit', targetFrameIds: ['start'], instruction: 'Smile' })
-  assert.equal((await run(noRefs, edit.items[0].id)).status, 'ready')
+  assert.ok(['ready', 'adopted'].includes((await run(noRefs, edit.items[0].id)).status))
 })
 
 test('cap preflight runs before freezing any reference and before creating candidates or paid tasks', async () => {
@@ -172,7 +172,7 @@ test('actual multipart bytes match the deterministic reference legend and frozen
   // Replacing a source after submission cannot alter the candidate's actual reference preview or upload.
   writeFileSync(path.join(root, 'static', '0.png'), bytes[5])
   const before = submissions.length
-  assert.equal((await run(id, created.items[0].id)).status, 'ready')
+  assert.equal((await run(id, created.items[0].id)).status, 'adopted')
   assert.equal(submissions.length, before + 1)
   assert.deepEqual(submissions.at(-1)!.images, bytes.slice(0, 5))
   assert.equal(submissions.at(-1)!.prompt.replace(/\r\n/g, '\n'), s.prompt)
@@ -189,6 +189,42 @@ test('actual multipart bytes match the deterministic reference legend and frozen
   assert.match(editSnapshot.prompt, /参考图片2：场景/)
   assert.match(editSnapshot.prompt, /参考图片7为相邻画面/)
   assert.doesNotMatch(editSnapshot.prompt, /画格2（第1行/)
-  assert.equal((await run(editId, edit.items[0].id)).status, 'ready')
+  assert.ok(['ready', 'adopted'].includes((await run(editId, edit.items[0].id)).status))
   assert.deepEqual(submissions.at(-1)!.images, [bytes[0], ...bytes.slice(0, 5), bytes[5]])
+})
+
+test('same scene appends LAST previous boundary after identity assets and freezes exact multipart order', async () => {
+  const previous = { ...panel(), id: 90 }
+  previous.frames[0].url = urls[5]; previous.frames[1].url = urls[0]
+  const current = { ...panel(), id: 3 }
+  const id = version([previous, current]), manifest = read(id, 3)
+  assert.equal(manifest.continuity?.previous?.panelId, 90)
+  assert.equal(manifest.continuity?.previous?.frameId, 'end')
+  assert.equal(manifest.items.at(-1)?.kind, 'continuity')
+  const result = await grid.startGridCandidates(id, { ...request, panelIds: [3] })
+  const row = db.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, result.items[0].id)).get()!
+  const saved = JSON.parse(row.snapshotJson)
+  assert.equal(saved.continuity.previous.digest, saved.referenceAssets.at(-1).digest)
+  assert.match(saved.prompt, /首.*静态状态/)
+  assert.match(saved.prompt, /身份.*优先/)
+  await run(id, result.items[0].id)
+  assert.deepEqual(submissions.at(-1)!.images, [...bytes.slice(0, 5), bytes[5]])
+  const timeline = JSON.parse(db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, id)).get()!.timelineJson)
+  timeline.panels[0].frames[0].prompt = 'Changed ending'
+  db.update(schema.animaticVersions).set({ timelineJson: JSON.stringify(timeline) }).where(eq(schema.animaticVersions.id, id)).run()
+  assert.equal(grid.listGridCandidates(id, 3)[0].continuityStale, true)
+  assert.equal(read(id, 3).continuityStale, true)
+})
+test('last missing/reset never appends previous earlier available frame; editing later frames needs no cross-panel image', async () => {
+  const previous = { ...panel(), id: 90 }; previous.frames[1].url = urls[5]
+  const current = { ...panel(), id: 3 }; current.frames.forEach(f => { f.url = urls[0] })
+  const id = version([previous, current])
+  assert.equal(read(id, 3).continuity?.status, 'missing')
+  assert.equal(read(id, 3).items.some(i => i.kind === 'continuity'), false)
+  previous.frames[0].url = urls[5]
+  const id2 = version([previous, current])
+  const created = await grid.startGridCandidates(id2, { ...request, panelIds: [3], mode: 'frame_edit', targetFrameIds: ['end'], instruction: 'Smile' })
+  const s = JSON.parse(db.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, created.items[0].id)).get()!.snapshotJson)
+  assert.equal(s.referenceAssets.some((i: any) => i.kind === 'continuity'), false)
+  await run(id2, created.items[0].id)
 })

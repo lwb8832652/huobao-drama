@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { readContactSheets, scheduleContactSheets } from './previs-contact-sheets.js'
+import { videoContinuityMatchesTimeline, type VideoContinuitySnapshot } from './previs-video-continuity.js'
 import type { VideoReferenceInput } from './previs-video-reference-domain.js'
 import { videoReferenceMatchesSource } from './previs-video-reference.js'
 import { z } from 'zod'
@@ -31,6 +32,20 @@ const referenceInputSchema = z.object({
   panels: z.array(z.object({ panelId: id, durationMs: ms, sheetId: id.nullable(), sheetHash: z.string().max(64).nullable(),
     frames: z.array(z.object({ frameId: z.string().max(100), imageIndex: id, gridIndex: id.nullable(), offsetMs: ms, sourceUrl: url })).max(9),
   })).max(1000),
+})
+const continuitySchema = z.object({
+  version: z.literal(1), panelId: id, status: z.enum(['reset', 'missing', 'available']), reason: text,
+  exactVideoBoundary: z.boolean(), signature: z.string().length(64),
+  transition: z.object({ from: z.string(), to: z.string(), type: z.enum(['cut', 'match_cut', 'occlusion', 'insert', 'establishing', 'audio_bridge']), continuity: z.enum(['strong', 'normal', 'scene_change']), allowedChanges: z.array(z.string()).max(50) }).optional(),
+  previous: z.object({ versionId: id, panelId: id, panelTitle: text, frameId: z.string().max(100), sourceUrl: url, offsetMs: ms,
+    source: frameSource.optional(), sourceSignature: z.string().length(64), frozenUrl: url.optional(), digest: z.string().length(64).optional() }).optional(),
+})
+const videoEndpointSchema = z.object({ panelId: id, frameId: z.string().max(100), sourceUrl: url, frozenUrl: url, digest: z.string().length(64), offsetMs: ms })
+const videoContinuitySchema = z.object({
+  version: z.literal(1), requested: z.enum(['auto', 'reference', 'first_last']), actual: z.enum(['reference', 'first_last']),
+  fallbackReason: text.optional(), aspectRatio: z.string().max(30), continuity: continuitySchema.optional(),
+  first: videoEndpointSchema.optional(), last: videoEndpointSchema.optional(),
+  frames: z.array(z.object({ panelId: id, frameId: z.string().max(100), sourceUrl: url, digest: z.string().length(64), offsetMs: ms })).max(9).optional(),
 })
 export const timelineSchema = z.object({
   schemaVersion: z.union([z.literal(1), z.literal(2)]),
@@ -72,6 +87,7 @@ export const timelineSchema = z.object({
     key: z.string(), panelIds: z.array(id), url, taskId: id.optional(),
     generationMode: z.enum(['direct', 'storyboard_frames']).optional(), stale: z.boolean(),
     referenceInput: referenceInputSchema.optional(),
+    videoContinuity: videoContinuitySchema.optional(),
     generationScope: z.enum(['storyboard', 'group']).optional(),
   })).optional(),
 })
@@ -123,11 +139,12 @@ export function frameFingerprint(frame: Keyframe, panel?: Panel) {
     movement: panel?.movement, composition: frame.composition,
   })
 }
-export function videoFingerprint(t: Timeline, panels: Panel[], generationMode: VideoGenerationMode = 'storyboard_frames', referenceInput?: VideoReferenceInput) {
+export function videoFingerprint(t: Timeline, panels: Panel[], generationMode: VideoGenerationMode = 'storyboard_frames', referenceInput?: VideoReferenceInput, videoContinuity?: VideoContinuitySnapshot) {
   return hashContent({
     mode: referenceInput?.generationScope || t.strategy.mode,
     generationMode,
     ...(referenceInput ? { referenceInput } : {}),
+    ...(videoContinuity ? { videoContinuity } : {}),
     panels: panels.map(p => ({
       id: p.id, description: p.description, atmosphere: p.atmosphere, prompt: p.videoPrompt, durationMs: p.durationMs,
       references: generationMode === 'direct' ? p.referenceImages : undefined,
@@ -138,6 +155,7 @@ export function videoFingerprint(t: Timeline, panels: Panel[], generationMode: V
         ? p.frames.map(f => ({
           id: frameKey(f), url: f.url, offsetMs: f.offsetMs, type: f.type,
           shotType: f.shotType, angle: f.angle, composition: f.composition,
+          ...(videoContinuity ? { prompt: f.prompt, continuity: f.continuity } : {}),
         }))
         : undefined,
     })),
@@ -344,7 +362,7 @@ export function readBatches(versionId: number): BatchRun[] {
         status: item.status, taskId: item.taskId, error: item.error, frameId: request.frameId,
         localPath: task?.localPath, resultUrl: task?.resultUrl,
         actualStrategy: request.actualStrategy, generationMode: request.generationMode,
-        panelIds: request.panelIds, inputHash: request.inputHash, referenceInput: request.referenceInput, generationScope: request.generationScope,
+        panelIds: request.panelIds, inputHash: request.inputHash, referenceInput: request.referenceInput, videoContinuity: request.videoContinuity, generationScope: request.generationScope,
       }
     }),
   }))
@@ -360,6 +378,10 @@ export function getVersion(versionId: number): AnimaticVersion {
   return { ...row, status: row.status as AnimaticVersion['status'], timeline, issues: checkContinuity(timeline),
     isCurrent: isCurrentVersion(versionId), outputs: resolveVideoOutputs(versionId, timeline, batches),
     busy: isBusy(versionId, batches), batches, contactSheets: readContactSheets(versionId) }
+}
+function contactSheetAspectRatio(versionId: number) {
+  const episode = episodeForPrevis(versionRow(versionId).episodeId)
+  return db.select().from(schema.dramas).where(eq(schema.dramas.id, episode.dramaId)).get()?.aspectRatio || '16:9'
 }
 export function resolveVideoOutputs(
   versionId: number,
@@ -381,11 +403,11 @@ export function resolveVideoOutputs(
     const orderChanged = item.generationScope === 'group' && sourceOrder.some((id, i) => id !== ids[i])
     const inputTimeline = item.generationScope ? { ...timeline, strategy: { ...timeline.strategy, mode: item.generationScope } } : timeline
     const stale = (!!item.inputHash && item.inputHash !== videoFingerprint(
-      inputTimeline, panels, item.generationMode || 'storyboard_frames', item.referenceInput,
-    )) || orderChanged || (!!item.referenceInput && !videoReferenceMatchesSource(versionId, item.referenceInput, panels))
+      inputTimeline, panels, item.generationMode || 'storyboard_frames', item.referenceInput, item.videoContinuity,
+    )) || (!!item.videoContinuity && (!videoContinuityMatchesTimeline(item.videoContinuity, timeline, panels) || contactSheetAspectRatio(versionId) !== item.videoContinuity.aspectRatio)) || orderChanged || (!!item.referenceInput && !videoReferenceMatchesSource(versionId, item.referenceInput, panels))
     results.push({
       key: `task-${item.taskId}`, panelIds: ids, url, taskId: item.taskId,
-      generationMode: item.generationMode, generationScope: item.generationScope, referenceInput: item.referenceInput, stale,
+      generationMode: item.generationMode, generationScope: item.generationScope, referenceInput: item.referenceInput, videoContinuity: item.videoContinuity, stale,
     })
     if (!stale) ids.forEach(id => claimed.add(id))
   }
@@ -393,7 +415,7 @@ export function resolveVideoOutputs(
     trackedUrls.add(output.url)
     if (output.panelIds.some(id => claimed.has(id) || !timeline.panels.some(p => p.id === id))) continue
     const order = timelineSegments(timeline).map(segment => segment.panel.id).filter(id => output.panelIds.includes(id))
-    const stale = output.stale || (output.generationScope === 'group' && order.some((id, i) => id !== output.panelIds[i])) || (!!output.referenceInput && !videoReferenceMatchesSource(versionId, output.referenceInput, output.panelIds.map(id => timeline.panels.find(p => p.id === id)!)))
+    const stale = output.stale || (!!output.videoContinuity && (!videoContinuityMatchesTimeline(output.videoContinuity, timeline, output.panelIds.map(id => timeline.panels.find(p => p.id === id)!)) || contactSheetAspectRatio(versionId) !== output.videoContinuity.aspectRatio)) || (output.generationScope === 'group' && order.some((id, i) => id !== output.panelIds[i])) || (!!output.referenceInput && !videoReferenceMatchesSource(versionId, output.referenceInput, output.panelIds.map(id => timeline.panels.find(p => p.id === id)!)))
     results.push({ ...output, stale })
     if (!stale) output.panelIds.forEach(id => claimed.add(id))
   }
@@ -517,9 +539,9 @@ export function saveTimeline(versionId: number, revision: number, input: unknown
     const timeline = validateTimeline(input, original)
     timeline.inheritedOutputs = original.inheritedOutputs?.map(o => ({
       ...o, stale: o.stale || videoFingerprint(
-        original, original.panels.filter(p => o.panelIds.includes(p.id)), o.generationMode || 'storyboard_frames', o.referenceInput,
+        original, original.panels.filter(p => o.panelIds.includes(p.id)), o.generationMode || 'storyboard_frames', o.referenceInput, o.videoContinuity,
       ) !== videoFingerprint(
-        timeline, timeline.panels.filter(p => o.panelIds.includes(p.id)), o.generationMode || 'storyboard_frames', o.referenceInput,
+        timeline, timeline.panels.filter(p => o.panelIds.includes(p.id)), o.generationMode || 'storyboard_frames', o.referenceInput, o.videoContinuity,
       ),
     }))
     // Metadata baselines are server-owned; keep optimistic concurrency across the two pages.

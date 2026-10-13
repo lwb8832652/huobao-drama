@@ -1,5 +1,6 @@
 import { readFile, mkdir, writeFile, stat, realpath } from 'node:fs/promises'
 import path from 'node:path'
+import { readFileSync, realpathSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import sharp from 'sharp'
 import { STORAGE_ROOT } from '../utils/paths.js'
@@ -48,4 +49,15 @@ export async function freezeReferenceMedia(url: string) {
     if (error.code !== 'EEXIST') throw error
   })
   return { url: `/static/previs-inputs/${digest}.img`, digest }
+}
+
+/** GET paths inspect local sources only; remote metadata never causes network/provider work. */
+export function localReferenceDigest(url: string): string | null {
+  if (/^https?:\/\//i.test(url)) return null
+  try {
+    if (url.startsWith('data:')) return mediaDigest(Buffer.from(url.split(',')[1], 'base64'))
+    const root = realpathSync(STORAGE_ROOT), file = realpathSync(path.resolve(STORAGE_ROOT, url.replace(/^\/?static\//, '')))
+    if (!file.startsWith(root + path.sep) || statSync(file).size > maxBytes) return ''
+    return mediaDigest(readFileSync(file))
+  } catch { return '' }
 }

@@ -5,6 +5,7 @@ import {
   createVersion, getVersion, getVersionState, getWorkspace, getWorkspaceState,
   listVersions, saveTimeline, checkOrLock, PrevisError,
 } from '../services/previs.js'
+import { videoContinuityCapabilities } from '../services/previs-video-continuity.js'
 import { createBatch, updateBatch, videoCapabilities } from '../services/previs-batch.js'
 import { listContinuityReviews, reviewContinuity } from '../services/continuity-review.js'
 import { scheduleContactSheets, readContactSheets, tickContactSheets } from '../services/previs-contact-sheets.js'
@@ -24,6 +25,7 @@ app.onError((err, c) => {
   return c.json({ code: status, message }, status)
 })
 app.get('/previs/capabilities', c => success(c, { enabled: process.env.PREVIS_ENABLED !== 'false', video: videoCapabilities }))
+app.get('/previs/video-continuity-capabilities', async c => success(c, await videoContinuityCapabilities(c.req.query('config_id') ? positiveId.parse(Number(c.req.query('config_id'))) : undefined, c.req.query('model'))))
 app.get('/previs/grid-capabilities', async c => success(c, await gridCapabilities(c.req.query('config_id') ? Number(c.req.query('config_id')) : undefined, c.req.query('model'))))
 app.get('/animatic-versions/:id/grid-references', c => success(c, readGridReferences(
   positiveId.parse(Number(c.req.param('id'))), positiveId.parse(Number(c.req.query('panel_id'))),
@@ -121,6 +123,7 @@ app.post('/animatic-versions/:id/batch-runs', async c => {
     frameTypes: z.array(z.enum(['start', 'middle', 'end', 'beat'])).min(1).max(4).optional(),
     frameIds: z.array(z.string().min(1).max(100)).min(1).max(1000).optional(), force: z.boolean().optional(),
     generationMode: z.enum(['direct', 'storyboard_frames']).optional(),
+    videoContinuityMode: z.enum(['auto', 'reference', 'first_last']).optional(),
     videoReferenceInputStrategy: z.enum(['auto', 'individual', 'contact_sheet']).optional(),
     generationScope: z.enum(['storyboard', 'group']).optional(),
   }).parse(await c.req.json())

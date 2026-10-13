@@ -1,18 +1,22 @@
 import { eq } from 'drizzle-orm'
 import { db, schema } from '../db/index.js'
-import { normalizeTimeline, orderedFrames, type Panel } from './previs-domain.js'
+import { normalizeTimeline, orderedFrames, type Panel, type Timeline } from './previs-domain.js'
+import { continuityMatchesTimeline, resolvePanelContinuity, type PanelContinuity } from './previs-continuity.js'
 import { episodeForPrevis, PrevisError, versionRow } from './previs.js'
 
 export interface GridReferenceItem {
   url: string | null
   label: string
-  kind: 'scene' | 'character' | 'prop' | 'custom'
+  kind: 'scene' | 'character' | 'prop' | 'custom' | 'continuity'
   required: boolean
 }
 export interface GridReferenceManifest {
   items: GridReferenceItem[]
   ready: boolean
   error: string
+  continuity?: PanelContinuity
+  continuityStale?: boolean
+  continuityStaleReason?: string
 }
 
 /** Only the two supported local static spellings identify the same source. */
@@ -21,7 +25,7 @@ function referenceUrl(url: string) {
 }
 
 /** Metadata only: no freezing, file access, network requests, or provider work. */
-export function resolvePanelGridReferences(panel: Panel, dramaId: number): GridReferenceManifest {
+export function resolvePanelGridReferences(panel: Panel, dramaId: number, context?: { timeline: Timeline; versionId: number; includeBoundary?: boolean }): GridReferenceManifest {
   const items: GridReferenceItem[] = []
   const labels = new Map<string, string[]>()
   const errors: string[] = []
@@ -62,14 +66,26 @@ export function resolvePanelGridReferences(panel: Panel, dramaId: number): GridR
   for (const [index, frame] of orderedFrames(panel).entries()) {
     frame.referenceImages?.forEach((url, refIndex) => add({ url, label: `画格${index + 1}参考素材${refIndex + 1}`, kind: 'custom', required: false }))
   }
+  const continuity = context ? resolvePanelContinuity(context.timeline, panel.id, context.versionId) : undefined
+  if (context?.includeBoundary !== false && continuity?.status === 'available' && continuity.previous?.sourceUrl)
+    add({ url: continuity.previous.sourceUrl, label: `前序分镜「${continuity.previous.panelTitle}」末画面：仅约束当前首个静态状态，身份以当前资产为准`, kind: 'continuity', required: false })
   if (!items.some(item => item.url) && !errors.length) errors.push('请先绑定资产或上传参考图片，再生成联合宫格')
-  return { items, ready: !errors.length, error: errors.join('；') }
+  return { items, ready: !errors.length, error: errors.join('；'), ...(continuity ? { continuity } : {}) }
 }
 
 export function readGridReferences(versionId: number, panelId: number): GridReferenceManifest {
   const version = versionRow(versionId)
   const episode = episodeForPrevis(version.episodeId)
-  const panel = normalizeTimeline(JSON.parse(version.timelineJson)).panels.find(panel => panel.id === panelId)
+  const timeline = normalizeTimeline(JSON.parse(version.timelineJson))
+  const panel = timeline.panels.find(panel => panel.id === panelId)
   if (!panel) throw new PrevisError('分镜不属于当前版本', 404)
-  return resolvePanelGridReferences(panel, episode.dramaId)
+  const manifest = resolvePanelGridReferences(panel, episode.dramaId, { timeline, versionId })
+  const sourceId = orderedFrames(panel)[0]?.source?.candidateId
+  const candidate = sourceId ? db.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, sourceId)).get() : undefined
+  const saved: PanelContinuity | undefined = candidate && JSON.parse(candidate.snapshotJson).continuity
+  if (saved) {
+    manifest.continuityStale = !continuityMatchesTimeline(saved, timeline)
+    if (manifest.continuityStale) manifest.continuityStaleReason = '前序边界或转场已变化；当前画面保留原生成输入，可按需重新生成。'
+  }
+  return manifest
 }

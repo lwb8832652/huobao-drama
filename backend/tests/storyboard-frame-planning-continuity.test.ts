@@ -137,3 +137,24 @@ test('every frame splitter prompt layer declares the same static-state and conti
   const inline = await readFile(new URL('../src/agents/index.ts', import.meta.url), 'utf8')
   assert.doesNotMatch(inline, /不要全部填同一个值/)
 })
+
+test('planning receives previous and next text/assets/boundary states in timeline order directly', async () => {
+  const episode = db.select().from(schema.episodes).all()[0]
+  const target = panel(), previous = { ...panel(), id: 90, title: 'Previous', description: 'Previous action', frames: [{ ...makeFrame('previous-last', 5999), prompt: 'Previous static end', url: '/static/end.png' }] }, next = { ...panel(), id: 3, title: 'Next', description: 'Next action', frames: [{ ...makeFrame('next-first'), prompt: 'Next static start' }] }
+  const t = { schemaVersion: 2, panels: [next, target, previous], groups: [90, 7, 3].map(id => ({ id: `panel-${id}`, title: '', note: '', panelIds: [id], entry: { holding: 'cup' }, exit: { holding: 'cup' } })), transitions: [{ from: 'panel-90', to: 'panel-7', type: 'cut', continuity: 'strong', allowedChanges: [] }], audio: [], strategy: defaultStrategy, acknowledgements: {} }
+  const versionId = Number(db.insert(schema.animaticVersions).values({ episodeId: episode.id, versionNo: 3, timelineJson: JSON.stringify(t), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }).run().lastInsertRowid)
+  const result = await contextApi.readFramePlanningContext(versionId, [7], episode.id, episode.dramaId)
+  assert.ok(!('error' in result))
+  const shot = result.panels[0] as any
+  assert.ok(shot.previousPanel, 'planning must provide previous panel context')
+  assert.ok(shot.nextPanel, 'planning must provide next panel context')
+  assert.equal(shot.previousPanel.panelId, 90); assert.equal(shot.nextPanel.panelId, 3)
+  assert.equal(shot.previousPanel.description, 'Previous action'); assert.equal(shot.nextPanel.description, 'Next action')
+  assert.equal(shot.previousPanel.boundaryFrame.prompt, 'Previous static end')
+  assert.equal(shot.nextPanel.boundaryFrame.prompt, 'Next static start')
+  assert.equal(shot.previousPanel.exit.holding, 'cup')
+  assert.equal(shot.referenceManifest.continuity.exactVideoBoundary, true)
+  assert.ok(Array.isArray(shot.previousPanel.characters))
+  const content = planning.buildFramePlanningRequestContent({ versionId, panelId: 7, count: 3, context: result })
+  assert.match(content, /Previous static end/); assert.match(content, /Next static start/)
+})

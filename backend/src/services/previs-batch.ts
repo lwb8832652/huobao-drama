@@ -10,6 +10,8 @@ import { FRAME_COUNT_MAX } from './previs-frame-contract.js'
 import { scheduleContactSheets } from './previs-contact-sheets.js'
 import { buildVideoReferenceInput, videoReferenceMatchesSource } from './previs-video-reference.js'
 import { normalizeSnapshotImages } from './previs-video-reference-normalizer.js'
+import { freezeReferenceMedia } from './previs-reference-media.js'
+import { chooseVideoContinuity, buildVideoContinuitySnapshot, normalizeVideoEndpoints, videoEndpointLegend, videoContinuityMatchesTimeline, type VideoContinuityMode } from './previs-video-continuity.js'
 import { videoReferenceLegend, type VideoReferenceInputStrategy } from './previs-video-reference-domain.js'
 import {
   frameKey, normalizeTimeline, orderedFrames, groupPanels, panelImageFallback,
@@ -36,6 +38,7 @@ interface BatchOptions {
   frameIds?: string[]
   force?: boolean
   generationMode?: VideoGenerationMode
+  videoContinuityMode?: VideoContinuityMode
   videoReferenceInputStrategy?: VideoReferenceInputStrategy
   generationScope?: 'storyboard' | 'group'
 }
@@ -112,6 +115,12 @@ export async function createBatch(versionId: number, options: BatchOptions) {
   const generationTimeline = { ...t, strategy: { ...t.strategy, mode: generationScope } }
   const selectedIds = t.groups.flatMap(group => group.panelIds).filter(id => !options.panelIds?.length || options.panelIds.includes(id))
   const groups = generationScope === 'group' ? [{ id: `selection-${selectedIds.join('-')}`, title: '所选分镜', note: '', panelIds: selectedIds, entry: {}, exit: {} }] : t.groups
+  const frozenSources = new Map<string, Promise<{ url: string; digest: string }>>()
+  const freezeSource = (url: string) => {
+    const canonical = /^\/?static\//.test(url) ? `/${url.replace(/^\//, '')}` : url
+    if (!frozenSources.has(canonical)) frozenSources.set(canonical, freezeReferenceMedia(url))
+    return frozenSources.get(canonical)!
+  }
   for (const group of groups) {
     const allPanels = groupPanels(t, group)
     const selected = allPanels.filter(p => !options.panelIds?.length || options.panelIds.includes(p.id))
@@ -159,11 +168,15 @@ export async function createBatch(versionId: number, options: BatchOptions) {
       for (const unit of generationScope === 'group' ? (panels.length ? [panels] : []) : panels.map(p => [p])) {
         const cap = videoCapabilities[config.provider as keyof typeof videoCapabilities]
         if (!cap) throw new PrevisError('当前视频服务尚未声明预演生成能力')
-        const referenceInput = generationMode === 'storyboard_frames'
+        const chosen = chooseVideoContinuity(config.provider, model, options.videoContinuityMode || 'reference', unit, generationScope)
+        const videoContinuity = options.videoContinuityMode ? await buildVideoContinuitySnapshot(t, unit, versionId, drama?.aspectRatio || '16:9', options.videoContinuityMode, chosen.actual, chosen.fallbackReason, freezeSource) : undefined
+        const endpoints = videoContinuity?.actual === 'first_last' ? await normalizeVideoEndpoints(videoContinuity) : undefined
+        const referenceInput = generationMode === 'storyboard_frames' && chosen.actual === 'reference'
           ? await buildVideoReferenceInput(versionId, unit, options.videoReferenceInputStrategy || 'auto', cap.maxImages, generationScope) : undefined
         // Decode and enforce the transport budget for every unit before any jobs exist.
         const validatedImages = referenceInput ? await normalizeSnapshotImages(referenceInput) : undefined
-        const inputs = videoInputs(generationTimeline, unit, config.provider, generationMode, referenceInput?.imageUrls)
+        const baseInputs = videoInputs(generationTimeline, unit, config.provider, generationMode, chosen.actual === 'first_last' ? [] : referenceInput?.imageUrls)
+        const inputs = chosen.actual === 'first_last' ? { ...baseInputs, actualStrategy: 'first_last', referenceMode: 'first_last', firstFrameUrl: videoContinuity!.first!.frozenUrl, lastFrameUrl: videoContinuity!.last!.frozenUrl, referenceImageUrls: [] as string[] } : baseInputs
         const referenceLegend = generationMode === 'storyboard_frames'
           ? unit.flatMap(p => orderedFrames(p).map((frame, i) => {
             const index = inputs.referenceImageUrls.indexOf(frame.url)
@@ -173,7 +186,7 @@ export async function createBatch(versionId: number, options: BatchOptions) {
             const index = inputs.referenceImageUrls.indexOf(url)
             return index < 0 ? '' : `@图片${index + 1}：${p.referenceLabels?.[i] || '绑定素材'}`
           })).filter(Boolean)
-        const prompt = [style, ...(referenceInput ? [videoReferenceLegend(referenceInput, unit)] : [...new Set(referenceLegend)]), ...unit.map(p => {
+        const prompt = [style, ...(videoContinuity?.actual === 'first_last' ? [videoEndpointLegend(videoContinuity, unit)] : referenceInput ? [videoReferenceLegend(referenceInput, unit)] : [...new Set(referenceLegend)]), ...unit.map(p => {
           let text = (p.videoPrompt || [p.description, p.atmosphere].filter(Boolean).join('\n')).replace(/@图片(\d+)/g, (_, n) => {
             const index = inputs.referenceImageUrls.indexOf(p.referenceImages[Number(n) - 1])
             return index < 0 ? (p.referenceLabels?.[Number(n) - 1] || '') : `@图片${index + 1}`
@@ -190,16 +203,16 @@ export async function createBatch(versionId: number, options: BatchOptions) {
           }
           return `[${p.durationMs / 1000}秒] ${text}`
         })].filter(Boolean).join('\n')
-        if (referenceInput && prompt.length > 20_000) throw new PrevisError('视频提示词超过 20000 字符，请缩短描述后重试；本批次未提交')
+        if ((referenceInput || videoContinuity) && prompt.length > 20_000) throw new PrevisError('视频提示词超过 20000 字符，请缩短描述后重试；本批次未提交')
         const request = { ...inputs, generationScope, storyboardId: generationScope === 'storyboard' ? unit[0].id : undefined,
-          panelIds: unit.map(p => p.id), inputHash: videoFingerprint(generationTimeline, unit, generationMode, referenceInput),
-          referenceInput, videoReferenceInputStrategy: referenceInput?.requested,
+          panelIds: unit.map(p => p.id), inputHash: videoFingerprint(generationTimeline, unit, generationMode, referenceInput, videoContinuity),
+          referenceInput, videoContinuity, videoReferenceInputStrategy: referenceInput?.requested,
           dramaId: ep.dramaId, prompt, model, configId, aspectRatio: drama?.aspectRatio || '16:9', resolution: ep.resolution || '720p' }
         // Validate the contract before persisting any jobs or making a paid call.
         // Static images are converted to data URLs by generation.ts; use web URLs for contract validation only.
         const validationUrl = (url?: string) => url && /^\/?static\//.test(url) ? `https://local.invalid/${url}` : url
         getVideoAdapter(config.provider).buildGenerateRequest(config, {
-          ...request, id: 0, firstFrameUrl: validationUrl(request.firstFrameUrl), lastFrameUrl: validationUrl(request.lastFrameUrl),
+          ...request, id: 0, firstFrameUrl: endpoints?.firstFrameUrl || validationUrl(request.firstFrameUrl), lastFrameUrl: endpoints?.lastFrameUrl || validationUrl(request.lastFrameUrl),
           referenceImageUrls: JSON.stringify(validatedImages || request.referenceImageUrls.map(validationUrl)),
         })
         items.push({ groupId: group.id, panelId: request.storyboardId || null, frameType: null, requestJson: JSON.stringify(request) })
@@ -333,8 +346,8 @@ function reconcile() {
                 const r = JSON.parse(i.requestJson)
                 return i.id > item.id && (r.panelIds || (i.panelId ? [i.panelId] : [])).includes(panel.id)
               })
-              if (!newer && (!request.referenceInput || videoReferenceMatchesSource(row.id, request.referenceInput, [panel])) && (!request.inputHash || request.inputHash === videoFingerprint(
-                timeline, [panel], request.generationMode || 'storyboard_frames', request.referenceInput,
+              if (!newer && (!request.videoContinuity || videoContinuityMatchesTimeline(request.videoContinuity, timeline, [panel])) && (!request.referenceInput || videoReferenceMatchesSource(row.id, request.referenceInput, [panel])) && (!request.inputHash || request.inputHash === videoFingerprint(
+                timeline, [panel], request.generationMode || 'storyboard_frames', request.referenceInput, request.videoContinuity,
               ))) {
                 if (row.status !== 'locked') { panel.videoUrl = url; changed = true }
                 if (isCurrentVersion(row.id)) tx.update(schema.storyboards).set({ videoUrl: url, updatedAt: now() })

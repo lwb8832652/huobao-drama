@@ -3,6 +3,7 @@ import { test } from 'node:test'
 import { VolcEngineImageAdapter } from '../src/services/adapters/volcengine-image.js'
 import { GeminiImageAdapter } from '../src/services/adapters/gemini-image.js'
 import { OpenAIImageAdapter } from '../src/services/adapters/openai-image.js'
+import { gridImageCapabilities } from '../src/services/previs-grid-capabilities.js'
 import { NuwaxImageAdapter } from '../src/services/adapters/nuwax-image.js'
 
 const refs = ['data:image/png;base64,YQ==', 'data:image/jpeg;base64,Yg==']
@@ -38,10 +39,22 @@ test('all image transports reject an invalid middle reference instead of renumbe
   ] as const) assert.throws(() => adapter.buildGenerateRequest(cfg, invalid), /参考|reference/i)
 })
 
-test('references for unsupported image models fail instead of creating a text-only request', () => {
-  assert.throws(() => new VolcEngineImageAdapter().buildGenerateRequest(config('volcengine', 'doubao-seedream-3-0-t2i-250415'), record), /支持|support/i)
-  assert.throws(() => new GeminiImageAdapter().buildGenerateRequest(config('gemini', 'gemini-3-pro'), record), /支持|support/i)
-  assert.throws(() => new OpenAIImageAdapter().buildGenerateRequest(config('openai', 'dall-e-3'), record), /支持|support/i)
+test('unlisted image models forward ordered references under the current default policy; unmapped workflows reject', async () => {
+  const seedream = config('volcengine', 'doubao-seedream-3-0-t2i-250415')
+  const caps = gridImageCapabilities(seedream, seedream.model)
+  assert.equal(caps.maxReferences, 6)
+  assert.equal(caps.supportsReferences, true)
+  const request = new VolcEngineImageAdapter().buildGenerateRequest(seedream, record)
+  assert.deepEqual(request.body.image, refs)
+  assert.equal(request.body.size, record.size)
+  const gemini = new GeminiImageAdapter().buildGenerateRequest(config('gemini', 'gemini-3-pro'), record)
+  assert.deepEqual(gemini.body.contents[0].parts.slice(0, 2), [
+    { inline_data: { mime_type: 'image/png', data: 'YQ==' } },
+    { inline_data: { mime_type: 'image/jpeg', data: 'Yg==' } },
+  ])
+  const openai = new OpenAIImageAdapter().buildGenerateRequest(config('openai', 'dall-e-3'), record)
+  assert.match(openai.url, /images\/edits$/)
+  assert.deepEqual(await Promise.all(((openai.body as FormData).getAll('image[]') as File[]).map(f => f.text())), ['a', 'b'])
   assert.throws(() => new NuwaxImageAdapter().buildGenerateRequest(config('nuwax', '20'), record), /映射|mapping|支持/i)
 })
 

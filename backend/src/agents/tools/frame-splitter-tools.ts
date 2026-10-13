@@ -9,7 +9,7 @@ import { eq } from 'drizzle-orm'
 import { z } from 'zod'
 import { db, schema } from '../../db/index.js'
 import { getDramaStylePrompt } from '../../services/style-preset.js'
-import { normalizeTimeline, orderedFrames } from '../../services/previs-domain.js'
+import { normalizeTimeline, orderedFrames, timelineSegments } from '../../services/previs-domain.js'
 import { resolvePanelGridReferences } from '../../services/previs-grid-references.js'
 import { getDramaId, getEpisodeId } from '../context.js'
 
@@ -52,6 +52,19 @@ export async function readFramePlanningContext(versionId: number, panelIds: numb
 
   const timeline = normalizeTimeline(JSON.parse(row.timelineJson))
   const style = await getDramaStylePrompt(dramaId)
+  const segments = timelineSegments(timeline)
+  function neighbor(panelId: number, delta: number) {
+    const segment = segments[segments.findIndex(s => s.panel.id === panelId) + delta]
+    if (!segment) return null
+    const p = segment.panel, group = timeline.groups.find(g => g.id === segment.groupId)
+    const ordered = orderedFrames(p)
+    return { panelId: p.id, title: p.title, description: p.description, videoPrompt: p.videoPrompt,
+      imagePrompt: p.imagePrompt, atmosphere: p.atmosphere, scene: p.scene, sceneId: p.sceneId,
+      shotType: p.shotType, angle: p.angle, movement: p.movement, entry: group?.entry, exit: group?.exit,
+      boundaryFrame: delta < 0 ? ordered.at(-1) : ordered[0],
+      referenceManifest: resolvePanelGridReferences(p, dramaId),
+      characters: assetsOf('characters', p.characterIds, dramaId), props: assetsOf('props', p.propIds, dramaId) }
+  }
   const panels = []
   for (const panelId of panelIds) {
     const panel = timeline.panels.find(item => item.id === panelId)
@@ -68,7 +81,8 @@ export async function readFramePlanningContext(versionId: number, panelIds: numb
       panelId: panel.id, title: panel.title, description: panel.description,
       videoPrompt: panel.videoPrompt, imagePrompt: panel.imagePrompt, atmosphere: panel.atmosphere,
       referenceImages: panel.referenceImages, referenceLabels: panel.referenceLabels,
-      referenceManifest: resolvePanelGridReferences(panel, dramaId),
+      referenceManifest: resolvePanelGridReferences(panel, dramaId, { timeline, versionId }),
+      previousPanel: neighbor(panelId, -1), nextPanel: neighbor(panelId, 1),
       durationSeconds: Number(((panel.durationMs || 0) / 1000).toFixed(1)), durationMs: panel.durationMs,
       shotType: panel.shotType, angle: panel.angle, movement: panel.movement,
       continuityConstraints: panel.continuityConstraints,
