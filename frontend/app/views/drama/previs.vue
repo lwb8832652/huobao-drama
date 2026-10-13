@@ -13,13 +13,14 @@ import ThemeToggle from '~/components/ThemeToggle.vue'
 import PrevisPlayer from '~/components/previs/PrevisPlayer.vue'
 import PrevisTimeline from '~/components/previs/PrevisTimeline.vue'
 import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.vue'
+import VideoContinuityControl from '~/components/previs/VideoContinuityControl.vue'
 import StoryboardGridTools from '~/components/previs/StoryboardGridTools.vue'
 import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
 import StoryboardContactSheet from '~/components/previs/StoryboardContactSheet.vue'
 import { uploadAPI } from '~/composables/useApi'
 import {
   FRAME_COUNT_MAX, frameCountChangeAllowed, checkContinuity, createFrameId, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl, orderedFrames,
-  applyFramePlanToPanel, contactSheetForPanel, videoReferenceReadiness, videoGenerationScopeError, planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy,
+  applyFramePlanToPanel, contactSheetForPanel, videoContinuityReadiness, panelIncomingTransition, useVideoContinuityMode, useVideoContinuityCapabilities, videoGenerationScopeError, planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy,
   type AudioClip, type ContinuityIssue, type ContinuityReview, type FrameType, type Keyframe,
   type Panel, type PanelFramePlan, type Timeline, type VideoGenerationScope,
 } from '~/composables/usePrevis'
@@ -39,6 +40,7 @@ const {
 } = usePrevis()
 const videoGenerationMode = useVideoGenerationMode()
 const videoReferenceInputStrategy = useVideoReferenceInputStrategy()
+const videoContinuityMode = useVideoContinuityMode()
 const videoGenerationScope = ref<VideoGenerationScope>('storyboard')
 const drama = ref<any>(), episode = ref<any>(), error = ref(''), loading = ref(true), enabled = ref(true)
 const groupId = ref(''), panelId = ref(0), currentMs = ref(0)
@@ -65,7 +67,7 @@ const sidebarCollapsed = ref((() => {
 })())
 const frameNames: Record<FrameType, string> = { start: '开场画面', middle: '过程画面', end: '结束画面', beat: '分镜画面' }
 const constraintNames: Record<string, string> = {
-  auto: '全部分镜画面', direct: '直传素材（历史）', first_last: '首尾帧（历史）',
+  auto: '全部分镜画面', direct: '直传素材（历史）', first_last: '首尾帧',
   first: '首帧（历史）', reference: '全部分镜画面', text: '纯文本（历史）',
 }
 const statusNames: Record<string, string> = {
@@ -90,6 +92,7 @@ const total = computed(() => timeline.value ? durationMs(timeline.value) : 0)
 const group = computed(() => groups.value.find(g => g.id === groupId.value) || groups.value[0])
 const panels = computed(() => timeline.value && group.value ? groupPanels(timeline.value, group.value) : [])
 const panel = computed(() => panels.value.find(p => p.id === panelId.value) || panels.value[0])
+const currentPanelVideo = computed(() => version.value?.outputs.find(o => o.panelIds.includes(panel.value?.id || 0)))
 const activeFrameId = computed(() => {
   const current = segments.value.find(s => currentMs.value >= s.startMs && currentMs.value < s.endMs)
     || segments.value.at(-1)
@@ -181,6 +184,7 @@ function modelChoice(type: 'text' | 'image' | 'video') {
   const selected = type === 'text' ? textModel.value : type === 'image' ? imageModel.value : videoModel.value
   return modelOptions(type).find(o => o.key === selected) || modelOptions(type)[0]
 }
+const { capability: videoContinuityCapability, error: videoContinuityError } = useVideoContinuityCapabilities(() => modelChoice('video'))
 const resolutionOptions = computed(() => {
   const provider = modelChoice('video')?.provider
   if (provider === 'minimax') return [
@@ -299,8 +303,8 @@ const videoReferenceState = computed(() => {
   const error = videoGenerationScopeError(videoTargetPanels.value, videoGenerationScope.value, videoCapability.value)
   if (error) return { ready: false, error, effective: undefined }
   const units = videoGenerationScope.value === 'group' ? [videoTargetPanels.value] : videoTargetPanels.value.map(panel => [panel])
-  const states = units.map(panels => videoReferenceReadiness(panels, videoReferenceInputStrategy.value, videoCapability.value?.maxImages || 9, version.value?.contactSheets || [], videoGenerationScope.value))
-  return states.find(state => !state.ready) || { ready: true, error: '', effective: states[0]?.effective }
+  const states = units.map(panels => videoContinuityReadiness(panels, videoContinuityMode.value, videoContinuityCapability.value, videoReferenceInputStrategy.value, videoCapability.value?.maxImages || 9, version.value?.contactSheets || [], videoGenerationScope.value))
+  return states.find(state => !state.ready) || { ...states[0], ready: true, error: '', effective: states[0]?.effective }
 })
 function groupScene(id: string) {
   const item = groups.value.find(group => group.id === id)
@@ -572,7 +576,7 @@ async function startVideo() {
     panelIds: videoPanelIds.value.length ? videoPanelIds.value : undefined,
     generationMode: videoGenerationMode.value,
     generationScope: videoGenerationScope.value,
-    videoReferenceInputStrategy: videoReferenceInputStrategy.value })
+    videoReferenceInputStrategy: videoReferenceInputStrategy.value, videoContinuityMode: videoContinuityMode.value })
   modal.value = ''; inspector.value = 'tasks'
 }
 function downloadDraft() {
@@ -885,7 +889,10 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
                 :splitting="framePlanSubmitting || framePlanActive > 0"
                 :before-action="beforeGridAction" :commit-adoption="adoptGridCandidate" @busy="gridBusy = $event"
                 @split="options => options?.force ? (modal = 'split') : run(splitPanel)"
-                v-model:reference-strategy="videoReferenceInputStrategy"
+                :connection="panelIncomingTransition(timeline, panel.id)?.continuity"
+                @update:connection="value => edit(t => { const e = panelIncomingTransition(t, panel.id); if (e) e.continuity = value })"
+                :reference-strategy="videoContinuityReadiness([panel], videoContinuityMode, videoContinuityCapability, videoReferenceInputStrategy, videoCapability?.maxImages || 9, version.contactSheets || []).actual === 'reference' ? videoReferenceInputStrategy : undefined"
+                @update:reference-strategy="videoReferenceInputStrategy = $event"
               >
                 <template #default="{ refineFrame, canRefineGrid, canRefineFrame }">
                   <StoryboardFramesEditor
@@ -894,8 +901,8 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
                     :key="`${version.id}-${panel.id}`"
                     :panel="panel"
                     :contact-sheet="sheetForPanel(panel)"
-                    :video-input-ready="videoReferenceReadiness([panel], videoReferenceInputStrategy, videoCapability?.maxImages || 9, version.contactSheets || []).ready"
-                    :video-input-error="videoReferenceReadiness([panel], videoReferenceInputStrategy, videoCapability?.maxImages || 9, version.contactSheets || []).error"
+                    :video-input-ready="videoContinuityReadiness([panel], videoContinuityMode, videoContinuityCapability, videoReferenceInputStrategy, videoCapability?.maxImages || 9, version.contactSheets || []).ready"
+                    :video-input-error="videoContinuityReadiness([panel], videoContinuityMode, videoContinuityCapability, videoReferenceInputStrategy, videoCapability?.maxImages || 9, version.contactSheets || []).error"
                     @retry-sheet="retryContactSheet(panel.id)"
                     :editable="editable && !gridBusy"
                     :generatable="generatable && !gridBusy"
@@ -913,6 +920,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
                   />
                 </template>
               </StoryboardGridTools>
+              <p v-if="currentPanelVideo?.videoContinuity" class="pv-frame-note">当前视频：{{ currentPanelVideo.videoContinuity.actual === 'first_last' ? '首尾帧' : '画面参考' }}<template v-if="currentPanelVideo.stale"> · 输入已变化，请检查后重新生成</template><br v-if="currentPanelVideo.videoContinuity.fallbackReason">{{ currentPanelVideo.videoContinuity.fallbackReason }}</p>
             </template>
             <template v-else-if="inspector === 'issues'">
               <section v-if="edge" class="pv-ai-review">
@@ -986,7 +994,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
                   <button v-if="framePlansSummary.failed" :disabled="working" @click="run(retryFailedFramePlans)">重试失败项</button>
                 </div>
               </article>
-              <article v-for="batch in batches" :key="batch.id" class="pv-batch"><header><b>{{ batch.type === 'image' ? '关键帧' : '视频' }} #{{ batch.id }}</b><span>{{ statusNames[batch.status] || batch.status }}</span></header><progress :value="batch.items.filter(i => i.status === 'completed').length" :max="batch.items.length" /><small>{{ batch.items.filter(i => i.status === 'completed').length }} / {{ batch.items.length }} 已完成</small><div class="pv-batch-actions"><button v-if="batch.items.some(i => i.status === 'failed')" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry'))">重试失败项</button><button v-if="batch.items.some(i => i.status === 'pending')" :disabled="working" @click="run(() => batchAction(batch.id, 'cancel'))">取消排队任务</button></div><details><summary>查看 {{ batch.items.length }} 个任务</summary><div v-for="item in batch.items" :key="item.id" class="pv-task-item"><b>{{ timeline.panels.find(p => p.id === item.panelId)?.title || groups.find(g => g.id === item.groupId)?.title }} {{ item.frameType ? frameNames[item.frameType] : '' }}</b><span>{{ statusNames[item.status] || item.status }}<small v-if="item.referenceInput"> · {{ item.referenceInput.effective === 'contact_sheet' ? '宫格参考' : '逐张参考' }}</small><small v-if="item.actualStrategy"> · {{ constraintNames[item.actualStrategy] }}</small></span><p v-if="item.error" class="pv-frame-error">{{ item.error }}</p><button v-if="item.status === 'failed'" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry', [item.id]))">重试此项</button><a v-if="item.status === 'completed' && (item.localPath || item.resultUrl)" :href="mediaUrl(item.localPath || item.resultUrl)" target="_blank" rel="noopener">查看生成结果 ↗</a></div></details></article><div v-if="!batches.length" class="pv-small-empty"><Film :size="27" /><p>还没有生成任务</p><span>生成关键帧后，进度会显示在这里。</span></div>
+              <article v-for="batch in batches" :key="batch.id" class="pv-batch"><header><b>{{ batch.type === 'image' ? '关键帧' : '视频' }} #{{ batch.id }}</b><span>{{ statusNames[batch.status] || batch.status }}</span></header><progress :value="batch.items.filter(i => i.status === 'completed').length" :max="batch.items.length" /><small>{{ batch.items.filter(i => i.status === 'completed').length }} / {{ batch.items.length }} 已完成</small><div class="pv-batch-actions"><button v-if="batch.items.some(i => i.status === 'failed')" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry'))">重试失败项</button><button v-if="batch.items.some(i => i.status === 'pending')" :disabled="working" @click="run(() => batchAction(batch.id, 'cancel'))">取消排队任务</button></div><details><summary>查看 {{ batch.items.length }} 个任务</summary><div v-for="item in batch.items" :key="item.id" class="pv-task-item"><b>{{ timeline.panels.find(p => p.id === item.panelId)?.title || groups.find(g => g.id === item.groupId)?.title }} {{ item.frameType ? frameNames[item.frameType] : '' }}</b><span>{{ statusNames[item.status] || item.status }}<small v-if="item.referenceInput"> · {{ item.referenceInput.effective === 'contact_sheet' ? '宫格参考' : '逐张参考' }}</small><small v-if="item.videoContinuity?.fallbackReason"> · {{ item.videoContinuity.fallbackReason }}</small><small v-if="item.actualStrategy"> · {{ constraintNames[item.actualStrategy] }}</small></span><p v-if="item.error" class="pv-frame-error">{{ item.error }}</p><button v-if="item.status === 'failed'" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry', [item.id]))">重试此项</button><a v-if="item.status === 'completed' && (item.localPath || item.resultUrl)" :href="mediaUrl(item.localPath || item.resultUrl)" target="_blank" rel="noopener">查看生成结果 ↗</a></div></details></article><div v-if="!batches.length" class="pv-small-empty"><Film :size="27" /><p>还没有生成任务</p><span>生成关键帧后，进度会显示在这里。</span></div>
             </template>
           </div>
         </aside>
@@ -998,7 +1006,8 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
         <header><h2>{{ ({ strategy: '模型设置', video: '生成正式视频', audio: '编辑音轨', waiver: '确认连续性提示', lock: '锁定故事版', sync: '同步最新分镜', reload: '重新载入版本', split: '重新拆分分镜画面' } as Record<string, string>)[modal] }}</h2><button aria-label="关闭对话框" @click="modal = ''"><X :size="18" /></button></header>
         <div v-if="modal === 'strategy'" class="pv-form">
           <label>图片模型<select v-model="imageModel"><option value="" disabled>选择图片模型</option><option v-for="o in modelOptions('image')" :key="o.key" :value="o.key">{{ o.label }}</option></select></label>
-          <label>画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
+          <VideoContinuityControl v-model="videoContinuityMode" :capability="videoContinuityCapability" :actual="videoReferenceState.actual" :fallback-reason="videoReferenceState.fallbackReason" :error="videoContinuityError" :disabled="working" />
+          <label v-if="videoReferenceState.actual !== 'first_last'">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
           <label>视频模型<select v-model="videoModel"><option value="" disabled>选择视频模型</option><option v-for="o in modelOptions('video')" :key="o.key" :value="o.key">{{ o.label }}</option></select></label>
           <NuxtLink v-if="!modelOptions('image').length || !modelOptions('video').length" to="/settings">前往设置启用生成模型 →</NuxtLink>
           <p v-if="videoCapability" class="pv-help">当前视频服务支持 {{ videoCapability.minSeconds }}–{{ videoCapability.maxSeconds }} 整数秒、每次生成最多 {{ videoCapability.maxImages }} 张参考图。{{ videoCapability.group ? '支持将所选分镜合为一组生成。' : '支持按分镜生成。' }}</p>
@@ -1010,9 +1019,10 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
           <p>将使用当前工作版 V{{ version?.versionNo }} 生成{{ videoPanelIds.length ? '当前镜头' : '全部镜头' }}。</p>
           <label>生成范围<select v-model="videoGenerationScope"><option value="storyboard">按分镜</option><option value="group">所选分镜合为一组</option></select></label>
           <p class="pv-help">{{ videoGenerationScope === 'group' ? `所选 ${videoTargetPanels.length} 个分镜按时间线顺序合为一个视频，整组 ${videoTargetDuration} 秒，计为一次生成任务。` : `${videoTargetPanels.length} 个分镜各生成一个视频，共 ${videoTargetPanels.length} 次生成任务；总时长 ${videoTargetDuration} 秒。` }}</p>
-          <label>画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
+          <VideoContinuityControl v-model="videoContinuityMode" :capability="videoContinuityCapability" :actual="videoReferenceState.actual" :fallback-reason="videoReferenceState.fallbackReason" :error="videoContinuityError" :disabled="working" />
+          <label v-if="videoReferenceState.actual !== 'first_last'">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
           <label>视频模型<select v-model="videoModel"><option value="" disabled>选择模型</option><option v-for="o in modelOptions('video')" :key="o.key" :value="o.key">{{ o.label }}</option></select></label>
-          <p class="pv-help">全部分镜画面将按时间顺序作为视频参考。</p>
+          <p class="pv-help">{{ videoReferenceState.actual === 'first_last' ? '首尾画面固定边界，中间关键状态按规划提示推进。' : '全部分镜画面将按时间顺序作为视频参考。' }}</p>
           <p v-if="!videoReferenceState.ready" class="pv-frame-error">{{ videoReferenceState.error }}</p>
           <p v-if="incompleteVideoPanels.length" class="pv-frame-error">还有 {{ incompleteVideoPanels.length }} 个镜头存在未完成画面，请先生成或上传全部画面。</p>
           <footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="working || !videoModel || !videoReferenceState.ready" @click="run(startVideo)"><Film :size="14" />提交生成</button></footer>

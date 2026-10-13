@@ -3,10 +3,11 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } fro
 import { toast } from 'vue-sonner'
 import { Check, Eye, Grid2X2, History, Images, Loader2, RefreshCw, Scissors, Settings2, SlidersHorizontal, Sparkles, Trash2, Upload, X } from 'lucide-vue-next'
 import { isStaleChunkError, reloadStaleBundle, uploadAPI } from '~/composables/useApi'
+import GridReferenceAssets from './GridReferenceAssets.vue'
 import { mapError } from '~/composables/useToast'
 import { i18n } from '~/composables/i18n'
 import { FRAME_COUNT_MAX, frameKey, gridLayoutForCount, mediaUrl, orderedFrames, previsRequest,
-  type AnimaticVersion, type GridCandidate, type GridCapabilities, type GridMode, type Panel } from '~/composables/usePrevis'
+  type AnimaticVersion, type GridCandidate, type GridCapabilities, type GridMode, type Panel, type GridReferenceManifest } from '~/composables/usePrevis'
 
 const props = defineProps<{
   panel: Panel
@@ -21,10 +22,29 @@ const props = defineProps<{
   splitting?: boolean
   /** 视频输入的参考策略（逐张画面 / 整组宫格），在生成设置弹窗中调整。 */
   referenceStrategy?: string
+  connection?: 'normal' | 'strong' | 'scene_change'
   beforeAction: () => Promise<{ versionId: number; revision: number } | false>
   commitAdoption: (versionId: number, candidateId: number, revision: number) => Promise<AnimaticVersion | false>
 }>()
-const emit = defineEmits<{ adopted: [version: AnimaticVersion]; busy: [value: boolean]; split: [options?: { force?: boolean }]; 'update:referenceStrategy': [value: string] }>()
+const emit = defineEmits<{ adopted: [version: AnimaticVersion]; busy: [value: boolean]; split: [options?: { force?: boolean }]; 'update:referenceStrategy': [value: string]; 'update:connection': [value: 'normal' | 'strong' | 'scene_change'] }>()
+const referenceManifest = ref<GridReferenceManifest>(), referenceLoading = ref(false), referenceError = ref('')
+let referenceToken = 0
+async function refreshReferences() {
+  const current = ++referenceToken, versionId = props.versionId, panelId = props.panel.id
+  referenceLoading.value = true; referenceError.value = ''
+  try {
+    const manifest = await previsRequest<GridReferenceManifest>(`/animatic-versions/${versionId}/grid-references?panel_id=${panelId}`)
+    if (!disposed && current === referenceToken && props.versionId === versionId && props.panel.id === panelId) referenceManifest.value = manifest
+    return current === referenceToken && !disposed ? manifest : undefined
+  } catch (cause: any) {
+    if (current === referenceToken && !disposed) { referenceManifest.value = undefined; referenceError.value = mapError(cause) }
+    return undefined
+  } finally { if (current === referenceToken) referenceLoading.value = false }
+}
+const frozenManifest = computed<GridReferenceManifest | undefined>(() => review.value?.referenceAssets ? ({
+  items: review.value.referenceAssets.map(item => ({ ...item, url: item.url })), ready: true, error: '',
+  continuity: review.value.continuity, continuityStale: review.value.continuityStale, continuityStaleReason: review.value.continuityStaleReason,
+}) : undefined)
 const capabilities = ref<GridCapabilities>()
 const candidates = ref<GridCandidate[]>([])
 const error = ref(''), submitting = ref(false), loading = ref(false)
@@ -53,7 +73,7 @@ const selectedSize = computed(() => capabilities.value?.sizes?.find(size => size
 const gridLayout = computed(() => gridLayoutForCount(frames.value.length, projectRatio.value))
 const predictedCell = computed(() => selectedSize.value && ({ width: Math.floor(selectedSize.value.width / gridLayout.value.columns), height: Math.floor(selectedSize.value.height / gridLayout.value.rows) }))
 const canSubmit = computed(() => props.editable && validFrameCount.value && !!capabilities.value?.enabled && !!selectedSize.value && !paidBusy.value)
-const canGenerate = computed(() => canSubmit.value && frames.value.every(frame => !frame.locked))
+const canGenerate = computed(() => !!referenceManifest.value?.ready && !referenceLoading.value && canSubmit.value && frames.value.every(frame => !frame.locked))
 const canGridEdit = computed(() => canSubmit.value && !!capabilities.value?.supportsEdit && frames.value.every(frame => frame.url) && frames.value.some(frame => !frame.locked))
 const canFrameEdit = computed(() => canSubmit.value && !!capabilities.value?.supportsEdit && frames.value.some(frame => frame.url && !frame.locked))
 /** 重新拆分分镜画面：与生成/微调解耦，只要求版本可编辑且已有画面。 */
@@ -177,6 +197,8 @@ async function loadContext() {
   contextKey = nextContextKey
   stopPolling()
   const requestToken = ++token, versionId = props.versionId, panelId = props.panel.id
+  referenceManifest.value = undefined
+  const referenceRequest = refreshReferences()
   discardedIds.clear()
   candidates.value = []; capabilities.value = undefined; error.value = ''; loading.value = true
   submitting.value = false; closeModal()
@@ -203,6 +225,8 @@ async function loadContext() {
   }
   // 初次载入的状态是基线，不触发完成提示
   for (const candidate of candidates.value) candidateStatuses.set(candidate.id, candidate.status)
+  await referenceRequest
+  if (!active(requestToken, versionId, panelId)) return
   loading.value = false
   schedulePolling(requestToken, versionId, panelId)
 }
@@ -235,6 +259,9 @@ async function submitCandidate(mode: GridMode) {
   try {
     const saved = await savedContext(requestToken, versionId, panelId)
     if (!saved) return
+    const manifest = await refreshReferences()
+    if (!active(requestToken, versionId, panelId)) return
+    if (!manifest || !manifest.ready && (mode === 'generate' || manifest.items.length > 0)) { error.value = manifest?.error || referenceError.value || '参考素材读取失败，请重试'; return }
     if (!submissionAllowed(mode, targetFrameIds, chosenModel.resolution, edit.baseCandidateId)) {
       error.value = '画面或模型状态已变化，未提交；请检查原图、锁定和生成设置后重试'
       return
@@ -375,13 +402,16 @@ async function uploadGrid(event: Event) {
 watch(modal, async value => { if (value) { await nextTick(); if (modal.value && !dialog.value?.open) dialog.value?.showModal() } })
 watch(paidBusy, value => emit('busy', value), { flush: 'sync' })
 watch(resolution, value => { try { localStorage.setItem(RESOLUTION_STORAGE_KEY, value) } catch {} })
-watch(() => [props.versionId, props.panel.id, props.configId, props.model, props.aspectRatio], () => { if (mounted) void loadContext() })
+watch(() => props.revision, () => { if (mounted) void refreshReferences() })
+// Saving replaces panel objects. Compare the logical context, not a fresh array,
+// so our own save/poll cannot close settings or invalidate a paid submission.
+watch(currentContextKey, () => { if (mounted) void loadContext() })
 onMounted(() => {
   mounted = true
   try { resolution.value = localStorage.getItem(RESOLUTION_STORAGE_KEY) || DEFAULT_RESOLUTION } catch {}
   return loadContext()
 })
-onBeforeUnmount(() => { disposed = true; token++; stopPolling(); closeModal(); emit('busy', false) })
+onBeforeUnmount(() => { disposed = true; token++; referenceToken++; stopPolling(); closeModal(); emit('busy', false) })
 </script>
 
 <template>
@@ -397,6 +427,7 @@ onBeforeUnmount(() => { disposed = true; token++; stopPolling(); closeModal(); e
         <button type="button" class="btn btn-sm" data-testid="grid-settings" :disabled="loading && !capabilities" @click="openModal('settings')"><Settings2 :size="12" />生成设置</button>
       </div>
     </header>
+    <GridReferenceAssets :manifest="referenceManifest" :loading="referenceLoading" :error="referenceError" />
     <slot :refine-frame="refineFrame" :can-refine-grid="canGridEdit" :can-refine-frame="canFrameEdit" />
     <input ref="fileInput" class="grid-file-input" type="file" accept="image/*" aria-label="上传整组宫格" @change="uploadGrid">
     <p v-if="!validFrameCount" class="grid-hint">先规划 1–9 张画面，再生成宫格。</p>
@@ -431,6 +462,11 @@ onBeforeUnmount(() => { disposed = true; token++; stopPolling(); closeModal(); e
               </div>
             </div>
             <p class="grid-hint">当前分镜 {{ frames.filter(frame => frame.url).length }} / {{ frames.length }} 张画面已就绪<template v-if="gridLayout.count > frames.length"> · {{ gridLayout.count - frames.length }} 个留白格</template>。</p>
+          </section>
+          <section v-if="connection !== undefined" class="grid-settings-section">
+            <h3>与上一分镜衔接</h3>
+            <label class="grid-resolution"><span>衔接方式</span><select :value="connection" aria-label="分镜衔接方式" :disabled="!editable || paidBusy" @change="emit('update:connection', ($event.target as HTMLSelectElement).value as 'normal' | 'strong' | 'scene_change')"><option value="normal">自动衔接</option><option value="strong">连续动作</option><option value="scene_change">场景切换</option></select></label>
+            <p class="grid-hint">连续动作仅在同场景、机位和状态兼容时共用视频边界；普通切镜保留当前构图。</p>
           </section>
           <section v-if="referenceStrategy !== undefined" class="grid-settings-section">
             <h3><Images :size="13" />画面参考</h3>
@@ -509,6 +545,7 @@ onBeforeUnmount(() => { disposed = true; token++; stopPolling(); closeModal(); e
             </aside>
             <section class="grid-preview-side">
               <div class="grid-preview-section-title"><span>候选信息</span><span v-if="review.width && review.height" class="dim">{{ review.width }} × {{ review.height }}px · {{ review.adoptFrameIds.length }} 张画面 · {{ versionLabel(review.batchNo) }}</span></div>
+              <GridReferenceAssets v-if="frozenManifest" :manifest="frozenManifest" frozen />
               <p v-if="review.error" role="alert" class="grid-error">{{ review.error }}</p>
               <p v-if="review.status === 'ready'" class="grid-hint">采用后该候选会切分并更新对应画面，原画面保留在画面历史中。</p>
               <p v-else-if="review.status === 'adopted'" class="grid-hint">该候选正在使用中，即为当前分镜画面。</p>

@@ -20,6 +20,8 @@ const emit = defineEmits<{
 const SHOT_TYPE_OPTIONS = ['', '远景', '全景', '中景', '近景', '特写']
 const ANGLE_OPTIONS = ['', '平视', '俯拍', '仰拍', '侧拍', '过肩']
 const drafts = ref<PanelFramePlan[]>(JSON.parse(JSON.stringify(props.plans)))
+const requestedCount = ref(props.count)
+watch(() => props.count, count => { requestedCount.value = count })
 // 窗口先开、结果后到：结果到达时必须刷新草稿，否则一直停在"应用 0 张画面"。
 watch(() => props.plans, plans => { drafts.value = JSON.parse(JSON.stringify(plans)) })
 const dialog = ref<HTMLDialogElement>()
@@ -41,6 +43,9 @@ function seconds(value: number) { return (value / 1000).toFixed(1) }
 function apply() {
   if (!canApply.value) return
   emit('apply', JSON.parse(JSON.stringify(drafts.value.filter(plan => plan.frames.length))))
+}
+function replan() {
+  if (props.editable && !props.busy) emit('recount', requestedCount.value)
 }
 function onKey(event: KeyboardEvent) {
   event.stopPropagation()
@@ -68,7 +73,7 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
       <header class="plan-header">
         <span class="plan-icon"><Scissors :size="20" /></span>
         <div>
-          <h2 :id="titleId">分镜画面拆分方案</h2>
+          <h2 :id="titleId">宫格画面规划</h2>
           <p :id="descriptionId">{{ drafts.length }} 个镜头 · {{ totalFrames }} 张画面{{ aiCount ? ` · ${aiCount} 个镜头来自 AI` : ' · 规则兜底' }}</p>
         </div>
         <button type="button" class="btn btn-icon" aria-label="关闭拆分方案" @click="emit('close')"><X :size="18" /></button>
@@ -76,12 +81,13 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
 
       <div class="plan-toolbar">
         <label>
-          <span>每个镜头的画面数</span>
-          <select :value="count" :disabled="busy" @change="emit('recount', Number(($event.target as HTMLSelectElement).value))">
+          <span>目标画面数</span>
+          <select v-model.number="requestedCount" :disabled="busy || !editable">
             <option v-for="layout in layoutOptions" :key="layout.count" :value="layout.count">{{ layout.label }} · {{ layout.count }} 张</option>
           </select>
         </label>
-        <span class="plan-hint">按宫格布局拆分（{{ layoutOptions.map(l => l.label).join(' / ') }}），画面数正好铺满宫格；调整后会按新数量重新拆分。</span>
+        <button type="button" class="btn btn-sm" :disabled="busy || !editable" @click="replan"><Sparkles :size="12" />重新规划</button>
+        <span class="plan-hint">选择数量后点击重新规划。下方按时间排列，每格描述一个静态瞬间。</span>
       </div>
 
       <div class="plan-body">
@@ -97,10 +103,10 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
             <span class="plan-source" :class="plan.source"><Sparkles v-if="plan.source === 'ai'" :size="11" />{{ sourceLabel(plan) }}</span>
             <span class="plan-count">{{ plan.frames.length }} 张</span>
           </header>
-          <label class="plan-continuity">
+          <details class="plan-shared-details"><summary>人物、场景与整组约束</summary><label class="plan-continuity">
             <span>整组连续性约束</span>
             <textarea v-model="plan.continuityConstraints" rows="2" maxlength="4000" aria-label="整组连续性约束" placeholder="人物、服装、背景、轴线和光线等需要保持一致的条件" :disabled="!editable || busy" />
-          </label>
+          </label></details>
           <article v-for="(frame, frameIndex) in plan.frames" :key="`${plan.panelId}-${frameIndex}`" class="plan-frame">
             <div class="plan-frame-head">
               <span class="plan-index">{{ String(frameIndex + 1).padStart(2, '0') }}</span>
@@ -113,6 +119,7 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
               ><Trash2 :size="13" /></button>
             </div>
             <textarea v-model="frame.prompt" rows="3" maxlength="4000" aria-label="画面提示词" :disabled="!editable || busy" />
+            <details class="plan-frame-details"><summary>衔接与镜头设置</summary>
             <label class="plan-frame-continuity"><span>与前后画面的衔接</span><textarea v-model="frame.continuity" rows="2" maxlength="2000" aria-label="画面连续性要求" placeholder="例如：人物位置和视线沿用上一画面，仅抬起右手" :disabled="!editable || busy" /></label>
             <div class="plan-camera">
               <label>
@@ -140,6 +147,7 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
                 >
               </label>
             </div>
+            </details>
           </article>
           <p v-if="!plan.frames.length" class="plan-empty">这个镜头没有可用的拆分结果，可取消后单独处理。</p>
         </section>
@@ -192,6 +200,9 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
 .plan-source.ai { color: var(--accent-text); }
 .plan-count { color: var(--text-2); font: 10px var(--font-mono); }
 .plan-frame { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.plan-frame-details, .plan-shared-details { font-size: 11px; color: var(--text-2); }
+.plan-frame-details summary, .plan-shared-details summary { padding: 8px 0; cursor: pointer; }
+.plan-shared-details { padding: 0 10px; border-bottom: 1px solid var(--border); }
 .plan-continuity { display: flex; flex-direction: column; gap: 5px; padding: 9px 10px; font-size: 11px; color: var(--text-2); background: var(--surface-soft); }
 .plan-continuity textarea { padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-0); font: inherit; line-height: 1.6; resize: vertical; }
 .plan-frame-continuity { display: block; margin-top: 7px; font-size: 11px; color: var(--text-2); }

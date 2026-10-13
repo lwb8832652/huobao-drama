@@ -686,7 +686,10 @@
                       :splitting="productionFramePlanBusy"
                       :before-action="beforeProductionGridAction" :commit-adoption="adoptProductionGridCandidate" @busy="productionGridBusy = $event"
                       @split="splitProductionFrames"
-                      v-model:reference-strategy="videoReferenceInputStrategy"
+                      :connection="panelIncomingTransition(productionTimeline, productionPanel.id)?.continuity"
+                      @update:connection="value => editProduction(t => { const e = panelIncomingTransition(t, productionPanel.id); if (e) e.continuity = value })"
+                      :reference-strategy="productionReferenceState(productionPanel.id).actual === 'reference' ? videoReferenceInputStrategy : undefined"
+                      @update:reference-strategy="videoReferenceInputStrategy = $event"
                     >
                       <template #default="{ refineFrame, canRefineGrid, canRefineFrame }">
                         <StoryboardFramesEditor
@@ -838,9 +841,11 @@
                     {{ t('episode.inspector.effective', { model: effectiveVideoModelLabel || t('episode.vid.defaultModel'), res: episodeResolutionShort, dur: effectiveVideoDuration }) }}
                     <small v-if="!previewVideoUrl && productionOutputById(selectedSb?.id)?.referenceInput"> · 当前视频使用{{ productionOutputById(selectedSb?.id).referenceInput.effective === 'contact_sheet' ? '宫格参考' : '逐张参考' }}</small>
                   </div>
+                  <VideoContinuityControl v-model="videoContinuityMode" :capability="videoContinuityCapability" :actual="productionReferenceState(selectedSb?.id).actual" :fallback-reason="productionReferenceState(selectedSb?.id).fallbackReason" :error="videoContinuityError" :disabled="videoTaskState(selectedSb) === 'pending'" />
+                  <p v-if="currentProductionVideo?.videoContinuity" class="video-param-hint">当前视频：{{ currentProductionVideo.videoContinuity.actual === 'first_last' ? '首尾帧' : '画面参考' }}<template v-if="currentProductionVideo.stale"> · 输入已变化，请检查后重新生成</template><br v-if="currentProductionVideo.videoContinuity.fallbackReason">{{ currentProductionVideo.videoContinuity.fallbackReason }}</p>
                   <div class="video-frame-readiness" :class="{ ready: videoCanGenerate(selectedSb?.id) }">
                     {{ productionReferenceState(selectedSb?.id).ready
-                      ? `视频参考：${productionReferenceState(selectedSb?.id).effective === 'contact_sheet' ? '宫格画面' : '逐张画面'} · 全部 ${productionPanelById(selectedSb?.id)?.frames.length || 0} 张`
+                      ? `视频输入：${productionReferenceState(selectedSb?.id).actual === 'first_last' ? '首尾帧' : productionReferenceState(selectedSb?.id).effective === 'contact_sheet' ? '宫格画面' : '逐张画面'} · 全部 ${productionPanelById(selectedSb?.id)?.frames.length || 0} 张`
                       : productionReferenceState(selectedSb?.id).error }}
                   </div>
                   <button
@@ -1462,7 +1467,8 @@
             <div class="batch-video-row"><span>生成任务</span><strong>{{ batchVideoGenerationScope === 'group' ? 1 : batchVideoConfirm.targets.length }} 个{{ batchVideoGenerationScope === 'group' ? ` · 整组 ${batchVideoTotalDuration} 秒` : '' }}</strong></div>
             <div class="batch-video-row"><span>{{ t('episode.vid.confirmModel') }}</span><strong>{{ effectiveVideoModelLabel || t('episode.vid.defaultModel') }}</strong></div>
             <div class="batch-video-row"><span>{{ t('episode.vid.confirmResolution') }}</span><strong>{{ episodeResolutionLabel }}</strong></div>
-            <label class="batch-video-row"><span>画面参考</span><select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
+            <VideoContinuityControl v-model="videoContinuityMode" :capability="videoContinuityCapability" :actual="batchVideoReferenceState.actual" :fallback-reason="batchVideoReferenceState.fallbackReason" :error="videoContinuityError" />
+            <label v-if="batchVideoReferenceState.actual !== 'first_last'" class="batch-video-row"><span>画面参考</span><select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
             <p class="batch-video-note">分镜画面按时间顺序作为视频参考；未完成的画面会阻止提交。</p>
             <p class="batch-video-note">{{ batchVideoGenerationScope === 'group' ? '所选分镜按时间线顺序生成一个视频，计为一次生成任务。' : '每个所选分镜各生成一个视频，分别计为生成任务。' }}</p>
             <p v-if="!batchVideoReferenceState.ready" class="batch-video-note">{{ batchVideoReferenceState.error }}</p>
@@ -1511,10 +1517,11 @@ import { useAgent } from '~/composables/useAgent'
 import { toastError, mapError, MODERATION_RE } from '~/composables/useToast'
 import LocaleSwitcher from '~/components/LocaleSwitcher.vue'
 import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.vue'
+import VideoContinuityControl from '~/components/previs/VideoContinuityControl.vue'
 import StoryboardGridTools from '~/components/previs/StoryboardGridTools.vue'
 import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
 import StoryboardContactSheet from '~/components/previs/StoryboardContactSheet.vue'
-import { contactSheetForPanel, videoReferenceReadiness, videoGenerationScopeError, previsRequest, mediaUrl, useFramePlanner, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy } from '~/composables/usePrevis'
+import { contactSheetForPanel, videoContinuityReadiness, panelIncomingTransition, useVideoContinuityMode, useVideoContinuityCapabilities, videoGenerationScopeError, previsRequest, mediaUrl, useFramePlanner, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy } from '~/composables/usePrevis'
 
 definePageMeta({ layout: 'studio' })
 
@@ -1540,6 +1547,7 @@ const {
 }, () => ({ configId: chatConfigId(), model: chatModelOverride() }))
 const videoGenerationMode = useVideoGenerationMode()
 const videoReferenceInputStrategy = useVideoReferenceInputStrategy()
+const videoContinuityMode = useVideoContinuityMode()
 const videoCapabilities = ref({})
 const productionGridBusy = ref(false)
 // 工作台面板位置记忆（按剧集隔离）：仅页面刷新(reload)时恢复到上次所在步骤；
@@ -2326,6 +2334,7 @@ const selectedVideoConfig = computed(() => {
     .filter(config => config.is_active)
     .sort((a, b) => (b.priority || 0) - (a.priority || 0))[0]
 })
+const { capability: videoContinuityCapability, error: videoContinuityError } = useVideoContinuityCapabilities(() => videoGenerationOption.value)
 const isWan3Video = computed(() => selectedVideoConfig.value?.provider === 'aliyun'
   || bareModelName(videoModel.value).startsWith('wan3.0-video'))
 
@@ -2349,9 +2358,9 @@ const batchVideoReferenceState = computed(() => {
   const error = videoGenerationScopeError(panels, batchVideoGenerationScope.value, capability)
   if (error) return { ready: false, error }
   const units = batchVideoGenerationScope.value === 'group' ? [panels] : panels.map(panel => [panel])
-  const states = units.map(unit => videoReferenceReadiness(unit, videoReferenceInputStrategy.value,
+  const states = units.map(unit => videoContinuityReadiness(unit, videoContinuityMode.value, videoContinuityCapability.value, videoReferenceInputStrategy.value,
     capability?.maxImages || 9, productionVersion.value?.contactSheets || [], batchVideoGenerationScope.value))
-  return states.find(state => !state.ready) || { ready: true, error: '' }
+  return states.find(state => !state.ready) || { ...states[0], ready: true, error: '' }
 })
 
 function openBatchVideoConfirm(pool) {
@@ -2392,6 +2401,7 @@ async function confirmBatchVideos() {
       generationMode: videoGenerationMode.value,
       generationScope,
       videoReferenceInputStrategy: videoReferenceInputStrategy.value,
+      videoContinuityMode: videoContinuityMode.value,
     })
     toast.success(`已提交 ${generationScope === 'group' ? 1 : ids.length} 个视频生成任务`)
     if (videoSelectMode.value) toggleVideoSelectMode()
@@ -2773,6 +2783,7 @@ const currentSubStageLabel = computed(() => currentStageLabel.value)
 const totalDuration = computed(() => sbs.value.reduce((s, sb) => s + (sb.duration || 10), 0))
 const selectedSb = ref(null)
 const productionPanel = computed(() => productionTimeline.value?.panels.find(p => p.id === selectedSb.value?.id))
+const currentProductionVideo = computed(() => productionVersion.value?.outputs.find(o => o.panelIds.includes(selectedSb.value?.id)))
 const productionImageTasks = computed(() => productionVersion.value?.batches
   .filter(batch => batch.type === 'image').flatMap(batch => batch.items)
   .filter(item => item.panelId === productionPanel.value?.id) || [])
@@ -2792,7 +2803,7 @@ function videoFramesReady(id) {
 }
 function productionReferenceState(id) {
   const target = productionPanelById(id)
-  return videoReferenceReadiness(target ? [target] : [], videoReferenceInputStrategy.value,
+  return videoContinuityReadiness(target ? [target] : [], videoContinuityMode.value, videoContinuityCapability.value, videoReferenceInputStrategy.value,
     videoCapabilities.value[selectedVideoConfig.value?.provider]?.maxImages || 9, productionVersion.value?.contactSheets || [])
 }
 function videoCanGenerate(id) {
@@ -3620,6 +3631,7 @@ async function genVid(sb, opts = {}) {
       panelIds: [sb.id], configId: option.configId, model: option.model,
       generationMode: videoGenerationMode.value,
       videoReferenceInputStrategy: videoReferenceInputStrategy.value,
+      videoContinuityMode: videoContinuityMode.value,
     })
     if (!opts.silent) toast.success(t('episode.vid.generating'))
   } catch (e) {

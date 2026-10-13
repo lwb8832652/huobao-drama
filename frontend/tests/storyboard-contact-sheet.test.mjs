@@ -116,7 +116,7 @@ test('standalone readiness uses the selected scope instead of the legacy timelin
     videoTargetPanels: vue.ref([first, second]), videoUsesStoryboardFrames: vue.ref(true),
     videoReferenceInputStrategy: vue.ref('auto'), videoCapability: vue.ref({ group: true, minSeconds: 2, maxSeconds: 12, maxImages: 1 }),
     version: vue.ref({ contactSheets: [sheet(first), sheet(second)] }),
-    videoReferenceReadiness: api().videoReferenceReadiness, videoGenerationScopeError: api().videoGenerationScopeError,
+    videoContinuityReadiness: api().videoContinuityReadiness, videoContinuityMode: vue.ref('reference'), videoContinuityCapability: vue.ref({ firstLast: false, reference: true }), videoReferenceReadiness: api().videoReferenceReadiness, videoGenerationScopeError: api().videoGenerationScopeError,
   })
   assert.equal(h.videoReferenceState.value.ready, true)
   scope.value = 'group'
@@ -143,7 +143,7 @@ test('batch readiness uses the provider that default-model submission actually s
       videoReferenceInputStrategy: vue.ref('auto'),
       videoCapabilities: vue.ref({ aliyun: { group: true, minSeconds: 2, maxSeconds: 30, maxImages: 9 },
         nuwax: { group: false, minSeconds: 2, maxSeconds: 30, maxImages: 9 }, minimax: { group: true, minSeconds: 2, maxSeconds: 5, maxImages: 9 } }),
-      videoReferenceReadiness: api().videoReferenceReadiness, videoGenerationScopeError: api().videoGenerationScopeError,
+      videoContinuityReadiness: api().videoContinuityReadiness, videoContinuityMode: vue.ref('reference'), videoContinuityCapability: vue.ref({ firstLast: false, reference: true }), videoReferenceReadiness: api().videoReferenceReadiness, videoGenerationScopeError: api().videoGenerationScopeError,
     })
     assert.equal(h.selectedVideoConfig.value.provider, defaultProvider)
     assert.equal(h.batchVideoReferenceState.value.ready, ready)
@@ -237,7 +237,7 @@ test('workbench and standalone handlers submit the chosen strategy and block una
       const model = { key: 'provider/model', configId: 9, model: 'model' }
       const state = { ready, error: '宫格尚未就绪', effective: 'contact_sheet' }
       const h = evaluate(functions, {}, {
-        videoReferenceInputStrategy: vue.ref('contact_sheet'), videoUsesStoryboardFrames: vue.ref(true),
+        videoContinuityMode: vue.ref('auto'), videoReferenceInputStrategy: vue.ref('contact_sheet'), videoUsesStoryboardFrames: vue.ref(true),
         batchVideoGenerationScope: vue.ref(scope), videoGenerationScope: vue.ref(scope),
         batchVideoReferenceState: vue.ref(state),
         videoGenerationMode: vue.ref('storyboard_frames'), videoModel: vue.ref(model.key),
@@ -255,7 +255,7 @@ test('workbench and standalone handlers submit the chosen strategy and block una
       assert.equal(submissions.length, ready ? 1 : 0, `${name} must guard unavailable contact sheets`)
       if (ready) {
         assert.equal(submissions[0].type, 'video')
-        assert.equal(submissions[0].payload.videoReferenceInputStrategy, 'contact_sheet')
+        assert.equal(submissions[0].payload.videoReferenceInputStrategy, 'contact_sheet'); assert.equal(submissions[0].payload.videoContinuityMode, 'auto')
         assert.deepEqual(Array.from(submissions[0].payload.panelIds), [7])
         if (name !== 'genVid') assert.equal(submissions[0].payload.generationScope, scope)
         else assert.notEqual(submissions[0].payload.generationScope, 'group')

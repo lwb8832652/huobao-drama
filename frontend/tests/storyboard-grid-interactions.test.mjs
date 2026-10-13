@@ -76,6 +76,7 @@ function harness({ items = [], save = async () => ({ versionId: 4, revision: 9 }
   const api = async (path, method = 'GET', body) => {
     requests.push({ path, method, body: body === undefined ? undefined : JSON.parse(JSON.stringify(body)) })
     if (request) { const result = await request(path, method, body); if (result !== undefined) return result }
+    if (path.includes('grid-references')) return { ready: true, error: '', items: [{ url: '/static/ref.png', label: '场景', kind: 'scene', required: true }] }
     if (path.includes('grid-capabilities')) return { enabled: true, supportsReferences: true, supportsEdit: true, resolutions: ['1K', '2K', '4K'], sizes: [
       { aspectRatio: '16:9', resolution: '1K', width: 1024, height: 576 },
       { aspectRatio: '16:9', resolution: '2K', width: 2048, height: 1152 },
@@ -87,6 +88,7 @@ function harness({ items = [], save = async () => ({ versionId: 4, revision: 9 }
   props.commitAdoption = commitAdoption || ((versionId, candidateId, revision) => api(`/animatic-versions/${versionId}/grid-candidates/${candidateId}/adopt`, 'POST', { revision }))
   const component = evaluate(script.content, {
     vue: { ...vue, onMounted: fn => mounted.push(fn), onBeforeUnmount: fn => disposers.push(fn), onUnmounted: fn => disposers.push(fn), useId: () => 'grid-dialog' },
+    './GridReferenceAssets.vue': {},
     'lucide-vue-next': {}, 'vue-sonner': { toast: { success: message => toasts.push(message) } },
     '~/composables/useApi': { ...useApi, uploadAPI: { image: async () => ({ path: '/static/upload.png' }) } },
     '~/composables/usePrevis': { previsRequest: api, mediaUrl: url => url, orderedFrames: panel => panel.frames, frameKey: frame => frame.id, FRAME_COUNT_MAX: 9, gridLayoutForCount: frameContract.gridLayoutForCount },
@@ -251,7 +253,7 @@ test('reference strategy lives inside the generation settings dialog', async () 
     const source = read(path)
     const block = source.match(/<StoryboardGridTools\b[\s\S]*?<\/StoryboardGridTools>/)
     assert.ok(block, `${path} must render grid tools`)
-    assert.match(block[0], /v-model:reference-strategy="videoReferenceInputStrategy"/, `${path} must bind the reference strategy into the settings dialog`)
+    assert.match(block[0], /:reference-strategy="[^"]*videoReferenceInputStrategy[^"]*"/,  `${path} must bind the reference strategy into the settings dialog`)
     // 页面工具栏不再自带画面参考下拉
     assert.doesNotMatch(source, /class="(pv-|video-)reference-select"/)
   }
@@ -517,7 +519,7 @@ test('a response already in flight cannot restore a cancelled candidate', async 
   let reads = 0, resolve
   const waiting = candidate({ status: 'processing' })
   const h = harness({ request: (path, method) => {
-    if (method === 'GET' && path.endsWith('?panel_id=7')) {
+    if (method === 'GET' && path.includes('grid-candidates') && path.endsWith('?panel_id=7')) {
       if (++reads === 1) return { items: [waiting] }
       return new Promise(done => { resolve = done })
     }
@@ -638,4 +640,26 @@ test('both workspaces save first and accept adopted versions through the composa
     assert.ok(/adoptGridCandidate/.test(source), `${path} must accept adopted versions through the stable workspace`)
     assert.ok(/:commit-adoption=/.test(source), `${path} must own the adoption commit outside the review component`)
   }
+})
+
+// Reference refreshes use an independent token so saving our own revision cannot cancel a submission.
+test('reference preview reloads after save and blocks missing required assets without paid submission', async () => {
+  let missing = false
+  const h = harness({ save: async () => { h.props.revision = 10; missing = true; return { versionId: 4, revision: 10 } }, request: path => path.includes('grid-references') ? { ready: !missing, error: missing ? '人物参考缺失' : '', items: [{ url: missing ? null : '/ref.png', label: '人物', kind: 'character', required: true }] } : undefined })
+  await h.start(); await h.setup.generateGrid()
+  assert.equal(h.requests.filter(r => r.method === 'POST').length, 0)
+  assert.match(h.setup.error.value, /人物参考缺失/);assert.equal(h.setup.submitting.value,false);h.dispose()
+})
+test('own revision refresh preserves paid request and frozen candidate references', async () => {
+  const h = harness({ save: async () => { h.props.revision++; await vue.nextTick();return { versionId:4,revision:h.props.revision } } })
+  await h.start();await h.setup.generateGrid();assert.equal(h.requests.filter(r=>r.method==='POST').length,1)
+  h.setup.reviewCandidate(candidate({ referenceAssets:[{url:'/static/frozen.png',sourceUrl:'/original.png',digest:'digest',label:'人物',kind:'character',required:true}],continuityStale:true }))
+  assert.equal(h.setup.frozenManifest.value.items[0].url,'/static/frozen.png');assert.equal(h.setup.frozenManifest.value.continuityStale,true);h.dispose()
+})
+
+test('workspace save replacing the same panel object preserves settings and paid submission token', async () => {
+  const h = harness({ save: async () => { h.props.panel = structuredClone(JSON.parse(JSON.stringify(h.props.panel))); h.props.revision++; await vue.nextTick(); return { versionId: 4, revision: h.props.revision } } })
+  await h.start();h.setup.openModal('settings');h.props.panel = {...h.props.panel};await vue.nextTick();await flush()
+  assert.equal(h.setup.modal.value,'settings')
+  await h.setup.generateGrid();assert.equal(h.requests.filter(r=>r.method==='POST').length,1);h.dispose()
 })

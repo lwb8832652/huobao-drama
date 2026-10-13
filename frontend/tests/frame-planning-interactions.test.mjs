@@ -557,20 +557,20 @@ test('split submission identifies both new tasks and cached tasks, and results k
   const functions = ast.statements.filter(statement => ts.isFunctionDeclaration(statement) && names.includes(statement.name?.text))
     .map(statement => statement.getText(ast)).join('\n')
   for (const status of [null, 'pending', 'completed']) {
-    let row = status && { id: 13, panelId: 7, status, resultJson: JSON.stringify({ source: 'ai', frames: draft().frames }) }
+    let row = status && { id: 13, panelId: 7, status, inputHash: 'current-description', count: 4, configId: 9, model: 'selected-text-model', resultJson: JSON.stringify({ source: 'ai', frames: draft().frames }) }
     const builder = {
       from() { return this }, where() { return this }, orderBy() { return this },
-      get: () => row, all: () => [row],
+      get: () => row, all: () => row ? [row] : [],
       set(values) { Object.assign(row, values); return this },
       values(values) { row = { id: 22, ...values }; return this },
       run: () => ({ lastInsertRowid: 22 }),
     }
-    const db = { select: () => builder, update: () => builder, insert: () => builder }
+    const db = { select: () => builder, update: () => builder, insert: () => builder, transaction: fn => fn({ select: () => ({ ...builder, where(condition) { this.activeOnly = condition === 'active'; return this }, get() { return this.activeOnly && row?.status !== 'pending' && row?.status !== 'processing' ? undefined : row } }), update: () => builder, insert: () => builder }) }
     const target = { ...panel(), characterIds: [], propIds: [] }
     const timeline = { schemaVersion: 2, panels: [target], groups: [], transitions: [], audio: [], strategy: { ...domain.defaultStrategy } }
     const api = evaluate(functions, {}, {
       db, schema: { framePlans: {} }, ...contract,
-      and() {}, eq() {}, desc() {},
+      and(...args) { return args.includes('active') ? 'active' : undefined }, inArray() { return 'active' }, eq() {}, desc() {},
       requireEditable: () => ({ timelineJson: JSON.stringify(timeline) }),
       episodeForPrevis: () => ({ id: 1, dramaId: 1 }),
       readFramePlanningContext: async () => ({}),
@@ -580,7 +580,7 @@ test('split submission identifies both new tasks and cached tasks, and results k
       planInputHash: () => 'current-description', tickFramePlans: async () => {},
     })
     const result = await api.startFramePlan(4, { revision: 2, panelIds: [7], configId: 9 })
-    assert.equal(result.queued, status === 'completed' ? 0 : 1)
+    assert.equal(result.queued, status ? 0 : 1)
     assert.equal(result.taskIds[0], status ? 13 : 22)
     row.status = 'completed'
     row.resultJson = JSON.stringify({ source: 'ai', frames: draft().frames })

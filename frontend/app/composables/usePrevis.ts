@@ -81,6 +81,12 @@ export async function submitFramePlan(versionId: number, payload: FramePlanPaylo
 export async function fetchFramePlans(versionId: number) {
   return previsRequest<FramePlansResult>(`/animatic-versions/${versionId}/frames/plan`)
 }
+export type { PanelContinuity } from '../../../backend/src/services/previs-continuity'
+export type { GridReferenceManifest } from '../../../backend/src/services/previs-grid-references'
+export type { GridReferenceAsset } from '../../../backend/src/services/previs-grid'
+export type { VideoContinuityMode, VideoContinuitySnapshot } from '../../../backend/src/services/previs-video-continuity'
+import type { VideoContinuityMode } from '../../../backend/src/services/previs-video-continuity'
+import { timelineSegments as orderedSegments } from '../../../backend/src/services/previs-domain'
 export type GridMode = 'generate' | 'grid_edit' | 'frame_edit'
 export interface GridCapabilities {
   enabled: boolean
@@ -117,6 +123,10 @@ export interface GridCandidate {
   cellHeight?: number | null
   createdAt: string
   baseCandidateId?: number | null
+  referenceAssets?: import('../../../backend/src/services/previs-grid').GridReferenceAsset[]
+  continuity?: import('../../../backend/src/services/previs-continuity').PanelContinuity
+  continuityStale?: boolean
+  continuityStaleReason?: string
 }
 
 /** Keep stable slots and their media when reviewing a revised frame plan. */
@@ -189,6 +199,53 @@ export function videoReferenceReadiness(panels: Panel[], requested: VideoReferen
     return { ready: true, effective, error: '' }
   } catch (cause: any) { return { ready: false, effective: undefined, error: cause.message || '分镜画面尚未就绪' } }
 }
+export interface VideoContinuityCapabilities {
+  firstLast: boolean; reference: boolean; reason?: string; maxImages?: number
+}
+export function videoContinuityReadiness(panels: Panel[], mode: VideoContinuityMode, caps: VideoContinuityCapabilities | undefined,
+  referenceStrategy: VideoReferenceInputStrategy, maxImages: number, sheets: ContactSheetView[] = [], scope: VideoGenerationScope = 'storyboard') {
+  if (!caps) return { ready: false, error: '正在读取视频模型能力', actual: undefined }
+  if (!panels.length || panels.some(p => !p.frames.length || p.frames.length > FRAME_COUNT_MAX || p.frames.some(f => !f.url))) return { ready: false, error: '请先完成全部分镜画面', actual: undefined }
+  const fallbackReason = !caps.firstLast ? caps.reason || '当前模型使用参考图模式' : scope === 'group' || panels.length !== 1
+    ? '按组生成使用画面参考' : panels[0].frames.length < 2 ? '单张画面使用参考图模式' : ''
+  if (mode === 'first_last' && fallbackReason) return { ready: false, error: fallbackReason, actual: undefined }
+  if (mode !== 'reference' && !fallbackReason) return { ready: true, error: '', actual: 'first_last' as const, effective: undefined }
+  if (!caps.reference) return { ready: false, error: caps.reason || '当前模型不支持画面参考', actual: undefined }
+  return { ...videoReferenceReadiness(panels, referenceStrategy, maxImages, sheets, scope), actual: 'reference' as const,
+    fallbackReason: mode === 'auto' ? fallbackReason : '' }
+}
+export function useVideoContinuityMode() {
+  const key = 'huobao:video-continuity-mode'
+  let initial: VideoContinuityMode = 'auto'
+  if (import.meta.client) { try { const stored = localStorage.getItem(key); if (stored === 'reference' || stored === 'first_last') initial = stored } catch {} }
+  const mode = ref<VideoContinuityMode>(initial)
+  watch(mode, value => { try { localStorage.setItem(key, value) } catch {} })
+  return mode
+}
+export function useVideoContinuityCapabilities(choice: () => { configId?: number; model?: string } | undefined) {
+  const capability = ref<VideoContinuityCapabilities>(), loading = ref(false), error = ref('')
+  let token = 0
+  watch(() => { const c = choice(); return `${c?.configId || ''}:${c?.model || ''}` }, async () => {
+    const current = ++token, c = choice(); capability.value = undefined; error.value = ''
+    if (!c?.configId) { error.value = '请先选择视频模型'; return }
+    loading.value = true
+    try {
+      const q = new URLSearchParams({ config_id: String(c.configId) }); if (c.model) q.set('model', c.model)
+      const result = await previsRequest<VideoContinuityCapabilities>(`/previs/video-continuity-capabilities?${q}`)
+      if (current === token) capability.value = result
+    } catch (cause: any) { if (current === token) error.value = cause.message || '模型能力读取失败' }
+    finally { if (current === token) loading.value = false }
+  }, { immediate: true })
+  onUnmounted(() => { token++ })
+  return { capability, loading, error }
+}
+export function panelIncomingTransition(timeline: Timeline | undefined, panelId: number) {
+  if (!timeline) return undefined
+  const segments = orderedSegments(timeline), index = segments.findIndex(s => s.panel.id === panelId)
+  if (index < 1) return undefined
+  return timeline.transitions.find(e => e.from === segments[index - 1].groupId && e.to === segments[index].groupId)
+}
+
 export function useVideoReferenceInputStrategy() {
   const key = 'huobao:video-reference-input-strategy'
   let initial: VideoReferenceInputStrategy = 'auto'
@@ -422,6 +479,7 @@ export function usePrevis() {
     generationMode?: 'direct' | 'storyboard_frames';
     generationScope?: VideoGenerationScope;
     videoReferenceInputStrategy?: VideoReferenceInputStrategy;
+    videoContinuityMode?: VideoContinuityMode;
   } = {}) {
     if (!version.value || gridAdopting.value) return
     working.value = true
