@@ -20,7 +20,31 @@ function evaluate(source, dependencies = {}, globals = {}) {
 }
 const componentPath = '../app/components/previs/StoryboardGridTools.vue'
 const frameContract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
-const candidate = (extra = {}) => ({ id: 20, versionId: 4, panelId: 7, mode: 'generate', status: 'ready',
+
+// 组件用 mapError() 把技术错误映射成友好文案，用 i18n.global.t() 取兜底文案。
+// 这里跑的是真实的 useToast.ts，文案取自真实的 zh.json —— 断言因此对着用户实际
+// 会看到的字符串，而不是自造的哨兵值（i18n key 改名/漏译会被直接测出来）。
+const zhMessages = JSON.parse(read('../app/locales/zh.json'))
+function translate(key, params) {
+  const value = String(key).split('.').reduce((acc, part) => (acc == null ? acc : acc[part]), zhMessages)
+  if (typeof value !== 'string') return key
+  if (!params) return value
+  return value.replace(/\{(\w+)\}/g, (_, name) => (name in params ? String(params[name]) : `{${name}}`))
+}
+const i18nStub = { global: { t: translate } }
+// mapError 内部用 `err instanceof TypeError / SyntaxError` 分流。模块跑在 vm 的独立 realm
+// 里，它的 TypeError 与测试文件（宿主 realm）的不是同一个构造器，宿主 new 出来的错误会
+// instanceof 失败、悄悄走到兜底分支。把内置构造器显式注入，保证分流按真实语义执行。
+const useToast = evaluate(read('../app/composables/useToast.ts'), {
+  'vue-sonner': { toast: { error: () => {}, success: () => {} } },
+  '~/composables/i18n': { i18n: i18nStub },
+}, { TypeError, SyntaxError, Error })
+const UNKNOWN_ERROR_TEXT = translate('errors.unknown')
+
+// usePrevis.ts 依赖 useApi.ts 的 withNetworkRetry。useApi 自身无 import，直接跑真模块，
+// 这样测试覆盖的是真实的重试语义而不是替身。
+const useApi = evaluate(read('../app/composables/useApi.ts'))
+const candidate = (extra = {}) => ({ id: 20, versionId: 4, panelId: 7, mode: 'generate', status: 'ready', batchNo: 1,
   previewUrl: '/static/grid.png', rawUrl: '/static/raw.png', baseUrl: '/static/before.png',
   width: 2048, height: 1152, cellWidth: 1024, cellHeight: 576,
   grid: { columns: 2, rows: 2, cells: [{ frameId: 'one', index: 0 }, { frameId: 'two', index: 1 }] },
@@ -29,7 +53,7 @@ function harness({ items = [], save = async () => ({ versionId: 4, revision: 9 }
   assert.ok(existsSync(new URL(componentPath, import.meta.url)), 'Shared grid tools must implement the candidate workflow')
   const descriptor = parse(read(componentPath)).descriptor
   const script = compileScript(descriptor, { id: 'grid-tools-test' })
-  const requests = [], emitted = [], mounted = [], disposers = [], timers = new Map(), toasts = []
+  const requests = [], emitted = [], mounted = [], disposers = [], timers = new Map(), toasts = [], logged = []
   let nextTimer = 0
   const props = vue.reactive({ versionId: 4, revision: 2, configId: 8, model: 'selected-image', editable, managementEditable: editable, beforeAction: save, aspectRatio,
     panel: { id: 7, frames: [{ id: 'one', offsetMs: 0, url: '/static/one.png' }, { id: 'two', offsetMs: 1000, url: '/static/two.png' }], referenceImages: [] } })
@@ -50,10 +74,18 @@ function harness({ items = [], save = async () => ({ versionId: 4, revision: 9 }
     'lucide-vue-next': {}, 'vue-sonner': { toast: { success: message => toasts.push(message) } },
     '~/composables/useApi': { uploadAPI: { image: async () => ({ path: '/static/upload.png' }) } },
     '~/composables/usePrevis': { previsRequest: api, mediaUrl: url => url, orderedFrames: panel => panel.frames, frameKey: frame => frame.id, FRAME_COUNT_MAX: 9, gridLayoutForCount: frameContract.gridLayoutForCount },
-  }, { localStorage: storage, setTimeout: callback => { const id = ++nextTimer; timers.set(id, callback); return id }, clearTimeout: id => timers.delete(id) }).default
+    '~/composables/useToast': { mapError: useToast.mapError },
+    '~/composables/i18n': { i18n: i18nStub },
+  }, {
+    localStorage: storage,
+    // 组件在失败路径会 console.error 记录端点（排障用）；VM 沙箱没有 console，
+    // 不注入会直接 ReferenceError，所以这里给一个可断言的收集器。
+    console: { error: (...args) => logged.push(args), warn: () => {}, log: () => {}, info: () => {}, debug: () => {} },
+    setTimeout: callback => { const id = ++nextTimer; timers.set(id, callback); return id }, clearTimeout: id => timers.delete(id),
+  }).default
   const effect = vue.effectScope()
   const setup = effect.run(() => component.setup(props, { expose() {}, emit: (event, ...args) => { emitted.push({ event, args }); onEvent?.(event, ...args) } }))
-  return { setup, props, requests, emitted, timers, toasts, async start() { for (const fn of mounted) await fn() }, dispose() { disposers.forEach(fn => fn()); effect.stop() }, descriptor, script }
+  return { setup, props, requests, emitted, timers, toasts, logged, async start() { for (const fn of mounted) await fn() }, dispose() { disposers.forEach(fn => fn()); effect.stop() }, descriptor, script }
 }
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve() }
 
@@ -135,9 +167,34 @@ test('unadopted candidates have compact notices while adopted records stay close
   h.setup.candidates.value.push(candidate({ id: 25 }))
   assert.equal(h.setup.activeCandidates.value.some(item => item.id === 25), false)
   assert.equal(h.setup.modal.value, '')
-  assert.match(h.descriptor.template.content, /modal === 'records'/)
+  // 生成记录内嵌在生成设置弹窗中，已采用的候选标记为「当前」
+  assert.match(h.descriptor.template.content, /data-testid="grid-candidate-records"/)
+  assert.match(h.descriptor.template.content, /class="grid-candidate" :class="\{ current: candidate\.status === 'adopted' \}"/)
+  assert.match(h.descriptor.template.content, /grid-candidate-current">当前</)
   assert.ok(h.descriptor.template.content.indexOf('<slot ') < h.descriptor.template.content.indexOf('grid-candidate-notices'), 'Current images precede candidate notices')
-  h.setup.openModal('records'); assert.equal(h.setup.modal.value, 'records')
+  h.setup.openModal('settings'); assert.equal(h.setup.modal.value, 'settings')
+  h.dispose()
+})
+
+test('generation records group candidates by version with the newest version first', async () => {
+  const h = harness({ items: [
+    candidate({ id: 30, batchNo: 2, status: 'adopted' }),
+    candidate({ id: 29, batchNo: 2, mode: 'grid_edit' }),
+    candidate({ id: 21, batchNo: 1 }),
+    candidate({ id: 20, batchNo: 0 }),
+  ] })
+  await h.start()
+  // 新版本在上：V2 → V1 → 历史生成（batch_no=0 沉底）；同版本内按 id 降序
+  assert.deepEqual(Array.from(h.setup.candidateBatches.value, group => group.batchNo), [2, 1, 0])
+  assert.deepEqual(Array.from(h.setup.candidateBatches.value[0].items, item => item.id), [30, 29])
+  assert.deepEqual(Array.from(h.setup.candidateBatches.value[2].items, item => item.id), [20])
+  // 版本号标签：V1/V2…；0 = 版本概念上线前的历史候选
+  assert.equal(h.setup.versionLabel(2), 'V2')
+  assert.equal(h.setup.versionLabel(0), '历史生成')
+  // 生成记录分区头、当前采用中徽标、预览弹窗候选信息行的版本标注
+  assert.match(h.descriptor.template.content, /class="grid-batch-head">\{\{ versionLabel\(batch\.batchNo\) \}\} · \{\{ batch\.items\.length \}\} 个候选/)
+  assert.match(h.descriptor.template.content, /grid-batch-current">当前采用中</)
+  assert.match(h.descriptor.template.content, /张画面 · \{\{ versionLabel\(review\.batchNo\) \}\}/)
   h.dispose()
 })
 
@@ -145,6 +202,51 @@ test('both workspaces integrate frame details in the shared generation area', ()
   for (const path of ['../app/views/drama/episode.vue', '../app/views/drama/previs.vue']) {
     const source = read(path)
     assert.match(source, /<StoryboardGridTools\b[\s\S]*?<template #default="\{[^}]*refineFrame[^}]*\}">[\s\S]*?<StoryboardFramesEditor\b[\s\S]*?\bintegrated\b[\s\S]*?@refine="refineFrame"[\s\S]*?<\/StoryboardGridTools>/)
+  }
+})
+
+test('grid toolbar surfaces the resplit entry and labels the settings menu', async () => {
+  const h = harness(); await h.start()
+  assert.match(h.descriptor.template.content, /data-testid="grid-resplit"/)
+  assert.match(h.descriptor.template.content, /data-testid="grid-settings"[^]*openModal\('settings'\)/)
+  assert.doesNotMatch(h.descriptor.template.content, />更多</)
+  assert.doesNotMatch(h.descriptor.template.content, /class="grid-more"/)
+  h.setup.resplit()
+  assert.deepEqual(JSON.parse(JSON.stringify(h.emitted.filter(item => item.event === 'split').map(item => item.args[0]))), [{ force: true }])
+  // 不可编辑或拆分进行中时不再重复提交
+  for (const mutate of [() => { h.props.editable = false }, () => { h.props.splitting = true }]) {
+    h.props.editable = true; h.props.splitting = false
+    mutate(); h.setup.resplit()
+    assert.equal(h.emitted.filter(item => item.event === 'split').length, 1)
+  }
+  h.props.editable = true; h.props.splitting = false
+  h.props.panel.frames = []
+  assert.equal(h.setup.canResplit.value, false)
+  h.dispose()
+})
+
+test('reference strategy lives inside the generation settings dialog', async () => {
+  const h = harness(); await h.start()
+  assert.match(h.descriptor.template.content, /aria-label="画面参考方式"/)
+  assert.match(h.descriptor.template.content, /emit\('update:referenceStrategy'/)
+  assert.match(h.descriptor.template.content, /v-if="referenceStrategy !== undefined"/)
+  h.dispose()
+  for (const path of ['../app/views/drama/episode.vue', '../app/views/drama/previs.vue']) {
+    const source = read(path)
+    const block = source.match(/<StoryboardGridTools\b[\s\S]*?<\/StoryboardGridTools>/)
+    assert.ok(block, `${path} must render grid tools`)
+    assert.match(block[0], /v-model:reference-strategy="videoReferenceInputStrategy"/, `${path} must bind the reference strategy into the settings dialog`)
+    // 页面工具栏不再自带画面参考下拉
+    assert.doesNotMatch(source, /class="(pv-|video-)reference-select"/)
+  }
+})
+
+test('both workspaces wire the resplit event on the grid toolbar', () => {
+  for (const path of ['../app/views/drama/episode.vue', '../app/views/drama/previs.vue']) {
+    const block = read(path).match(/<StoryboardGridTools\b[\s\S]*?<\/StoryboardGridTools>/)
+    assert.ok(block, `${path} must render grid tools`)
+    assert.ok(block[0].includes(':splitting='), `${path} must pass the split busy state`)
+    assert.ok(block[0].includes('@split='), `${path} must handle the split event`)
   }
 })
 
@@ -216,7 +318,6 @@ test('candidate adoption is explicit and returns the full version to the parent'
   const h = harness({ items: [candidate()] }); await h.start()
   h.setup.reviewCandidate(candidate())
   assert.equal(h.requests.some(r => r.method === 'POST'), false)
-  h.setup.confirmedReview.value = true
   await h.setup.adoptCandidate()
   const action = h.requests.find(r => r.path.endsWith('/20/adopt'))
   assert.equal(action.body.revision, 9)
@@ -230,6 +331,20 @@ test('locked and failed candidates cannot submit or adopt, but remain reviewable
   await h.setup.generateGrid(); await h.setup.adoptCandidate()
   assert.equal(h.requests.some(r => r.method === 'POST'), false)
   assert.equal(h.setup.review.value.status, 'failed'); h.dispose()
+})
+
+test('a raw network failure surfaces as friendly copy, never the English browser string', async () => {
+  // 回归：曾经把 err.message 直接塞进 error.value，界面上就出现裸的
+  // 「Failed to fetch」——用户看到的正是这行英文。现在必须映射为中文文案，
+  // 原始错误只进 DevTools，并带上出错的接口路径便于定位。
+  const h = harness({ request: (path, method) => { if (method === 'GET') throw new TypeError('Failed to fetch') } })
+  await h.start()
+  assert.equal(h.setup.error.value, translate('errors.network'))
+  assert.doesNotMatch(h.setup.error.value, /failed to fetch/i)
+  const logged = h.logged.map(args => args[0]).join('\n')
+  assert.match(logged, /\[grid\]/)
+  assert.match(logged, /\/previs\/grid-capabilities/)
+  assert.equal(h.setup.loading.value, false); h.dispose()
 })
 
 test('closing review retains candidates and explicit discard removes only that candidate', async () => {
@@ -259,13 +374,13 @@ test('save failure and network failure remain visible and release submission sta
   assert.match(h.setup.error.value, /网络不可用/); assert.equal(h.setup.submitting.value, false); h.dispose()
 })
 
-test('single-frame review overlays only the refined cell, keeping its original number', async () => {
+test('single-frame preview shows only the refined cell, keeping its original number', async () => {
   const refined = candidate({ mode: 'frame_edit', targetFrameIds: ['two'], adoptFrameIds: ['two'] })
   const h = harness(); await h.start()
   h.setup.reviewCandidate(refined)
-  assert.equal(h.setup.reviewCells.value.length, 1)
-  assert.equal(h.setup.reviewCells.value[0].frameId, 'two')
-  assert.equal(h.setup.reviewCells.value[0].number, 2)
+  assert.equal(h.setup.reviewThumbs.value.length, 1)
+  assert.equal(h.setup.reviewThumbs.value[0].frameId, 'two')
+  assert.equal(h.setup.reviewThumbs.value[0].number, 2)
   assert.equal(h.setup.cellStyle(refined, 0).width, '100%'); h.dispose()
 })
 
@@ -323,7 +438,8 @@ test('unsupported project ratios cannot submit and native per-cell size is shown
   assert.equal(unsupported.requests.some(r => r.method === 'POST'), false); unsupported.dispose()
   const h = harness(); await h.start()
   // 2 帧 → 1×2 宫格（1 列 × 2 行），每格宽度 = 整图宽 / 1，高度 = 整图高 / 2
-  assert.equal(h.setup.predictedCell.value.width, 2048); assert.equal(h.setup.predictedCell.value.height, 576)
+  // 分辨率默认 1K（未存储偏好时）：整图 1024 × 576
+  assert.equal(h.setup.predictedCell.value.width, 1024); assert.equal(h.setup.predictedCell.value.height, 288)
   h.dispose()
 })
 
@@ -360,10 +476,10 @@ test('a response already in flight cannot restore a cancelled candidate', async 
   assert.equal(h.timers.size, 0); h.dispose()
 })
 
-test('adoption requires manual review confirmation even for a ready candidate', async () => {
+test('a ready candidate is adopted from the preview without extra confirmation', async () => {
   const h = harness({ items: [candidate()] }); await h.start(); h.setup.reviewCandidate(candidate())
   await h.setup.adoptCandidate()
-  assert.equal(h.requests.some(r => r.method === 'POST'), false); h.dispose()
+  assert.equal(h.requests.filter(r => r.method === 'POST').some(r => r.path.endsWith('/20/adopt')), true); h.dispose()
 })
 
 test('closing, refreshing, changing context or unmounting review cannot release a workspace adoption commit', async () => {
@@ -376,6 +492,7 @@ test('closing, refreshing, changing context or unmounting review cannot release 
   let finish
   const api = evaluate(read('../app/composables/usePrevis.ts'), {
     vue: { ...vue, onUnmounted() {} }, 'vue-sonner': { toast: {} },
+    '~/composables/useApi': useApi,
     '../../../backend/src/services/previs-domain': domain,
     '../../../backend/src/services/previs-frame-contract': contract,
     '../../../backend/src/services/previs-video-reference-domain': reference,
@@ -385,7 +502,7 @@ test('closing, refreshing, changing context or unmounting review cannot release 
   const h = harness({ items: [candidate()],
     save: async () => { await workspace.save(); return { versionId: 4, revision: workspace.version.value.revision } },
     commitAdoption: workspace.adoptGridCandidate,
-  }); await h.start(); h.setup.reviewCandidate(candidate()); h.setup.confirmedReview.value = true
+  }); await h.start(); h.setup.reviewCandidate(candidate())
   const adopting = h.setup.adoptCandidate(); await flush()
   h.setup.closeModal()
   if (lifecycle === 'refresh') await h.setup.loadContext()
@@ -411,6 +528,7 @@ test('the workspace adoption lease releases on failure and shows a persistent er
   const payload = { id: 4, revision: 2, status: 'draft', busy: false, timeline: { panels: [], groups: [], audio: [] } }
   const api = evaluate(read('../app/composables/usePrevis.ts'), {
     vue: { ...vue, onUnmounted() {} }, 'vue-sonner': { toast: { error() {} } },
+    '~/composables/useApi': useApi,
     '../../../backend/src/services/previs-domain': domain, '../../../backend/src/services/previs-frame-contract': contract,
     '../../../backend/src/services/previs-video-reference-domain': reference,
   }, { fetch: async url => { if (url.endsWith('/adopt')) throw new Error('采用提交失败'); return { ok: true, json: async () => ({ data: payload }) } } })

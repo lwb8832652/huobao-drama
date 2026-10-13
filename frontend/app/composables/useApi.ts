@@ -1,5 +1,35 @@
 const BASE = '/api/v1'
 
+/**
+ * 网络层失败识别：浏览器 fetch 遇到「连接被中途重置 / 代理掐断 / 隧道抖动」时只会抛裸的
+ * `TypeError: Failed to fetch`（读 body 中途断同样如此），不会给出状态码。
+ * 注意必须与「服务端返回的状态码/非 JSON」区分：后者不是 TypeError，照常抛出、不重试。
+ */
+const NETWORK_ERROR_RE = /failed to fetch|network ?error|load failed|fetch failed|err_connection|err_network/i
+
+export function isNetworkError(cause: unknown): boolean {
+  return cause instanceof TypeError && NETWORK_ERROR_RE.test(cause.message || '')
+}
+
+/**
+ * 幂等请求的网络抖动容错。
+ *
+ * fetch 自身不重试，一次连接抖动就会原样冒到业务层变成「Failed to fetch」——本机前面挂着
+ * nitro 代理与 frp 隧道，链路比直连长，这类一次性抖动值得挡在 UI 之外。
+ * 因此对 **GET** 补一次带 300ms 退避的重试；**非 GET 一律不重试**，否则可能重复建任务/重复下单。
+ * 只重试网络层 TypeError，HTTP 状态码与业务错误不受影响。
+ */
+export async function withNetworkRetry<T>(run: () => Promise<T>, method = 'GET', retries = 1): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await run()
+    } catch (cause) {
+      if (attempt >= retries || method.toUpperCase() !== 'GET' || !isNetworkError(cause)) throw cause
+      await new Promise(resolve => setTimeout(resolve, 300))
+    }
+  }
+}
+
 async function req<T = any>(method: string, path: string, body?: any): Promise<T> {
   const opts: RequestInit = { method, headers: { 'Content-Type': 'application/json' } }
   if (body) opts.body = JSON.stringify(body)
@@ -8,8 +38,10 @@ async function req<T = any>(method: string, path: string, body?: any): Promise<T
   console.log(`%c[API] %c${method} %c${path}`, 'color:#888', 'color:#4fc3f7;font-weight:bold', 'color:#ccc', body || '')
 
   try {
-    const resp = await fetch(`${BASE}${path}`, opts)
-    const json = await resp.json()
+    const { resp, json } = await withNetworkRetry(async () => {
+      const resp = await fetch(`${BASE}${path}`, opts)
+      return { resp, json: await resp.json() }
+    }, method)
     const ms = Math.round(performance.now() - start)
 
     if (!resp.ok || (json.code && json.code >= 400)) {

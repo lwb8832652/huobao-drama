@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { mkdir, writeFile } from 'node:fs/promises'
 import sharp from 'sharp'
-import { and, desc, eq, inArray } from 'drizzle-orm'
+import { and, desc, eq, inArray, ne } from 'drizzle-orm'
 import { db, schema } from '../db/index.js'
 import { STORAGE_ROOT } from '../utils/paths.js'
 import { now } from '../utils/response.js'
@@ -70,7 +70,21 @@ type Row = typeof schema.gridCandidates.$inferSelect
 const table = schema.gridCandidates
 const snapshot = (row: Row): GridSnapshot => JSON.parse(row.snapshotJson)
 const activeStatuses = ['pending', 'processing']
-const panelHash = (p: Panel) => hashContent(p)
+/**
+ * 候选有效性只依赖画面规划结构（帧 id 及顺序，即切格映射）。
+ * 采用/上传只替换画面内容（url/history），不应让旧候选永久失效——否则无法在生成记录间切换。
+ * 原画面文件的不可变性由 adopt 时的 currentSources digest 校验兜底。
+ */
+const panelHash = (p: Panel) => hashContent(orderedFrames(p).map((frame) => frame.id))
+/**
+ * 候选创建时的有序帧 id 序列（= 切格映射依据）。快照 panel 保存了创建时的完整面板，
+ * 旧快照同样可恢复，因此结构校验不依赖 panelHash 的算法——公式更换不会让历史候选失配
+ * （2026-10-13 事故：panelHash 公式升级未兼容旧快照，全部旧候选采用即 409）。
+ */
+const snapshotFrameIds = (s: GridSnapshot) =>
+  s.panel ? orderedFrames(s.panel).map((frame) => frame.id) : s.grid.cells.map((c) => c.frameId)
+const sameFrameStructure = (p: Panel, s: GridSnapshot) =>
+  JSON.stringify(orderedFrames(p).map((frame) => frame.id)) === JSON.stringify(snapshotFrameIds(s))
 function candidateRow(versionId: number, id: number) {
   versionRow(versionId)
   const row = db
@@ -96,6 +110,7 @@ function view(row: Row) {
     width: row.width,
     height: row.height,
     error: row.error,
+    batchNo: row.batchNo,
     grid: s.grid,
     targetFrameIds: s.targets,
     adoptFrameIds: s.adoptTargets,
@@ -343,7 +358,7 @@ export async function startGridCandidates(versionId: number, request: GridReques
           prior.mode === 'frame_edit' ||
           prior.status !== 'ready' ||
           !prior.previewUrl ||
-          s.panelHash !== panelHash(p)
+          !sameFrameStructure(p, s)
         )
           throw new PrevisError('原候选不可编辑或规划已变化', 409)
         base = await freezeReferenceMedia(prior.previewUrl)
@@ -442,6 +457,24 @@ export async function startGridCandidates(versionId: number, request: GridReques
         if (active.inputHash === inputHash) return view(active)
         throw new PrevisError('该分镜已有宫格任务，请等待或取消后再提交', 409)
       }
+      // 批次（代际）：整组生成开新批；微调跟随基准候选（跨 panel 的基准不继承），
+      // 无基准的微调跟随当前采用结果；都没有（含历史 batch_no=0）才开新批
+      const batchNo = (() => {
+        if (request.baseCandidateId) {
+          const base = tx.select({ batchNo: table.batchNo, panelId: table.panelId }).from(table)
+            .where(and(eq(table.versionId, versionId), eq(table.id, request.baseCandidateId))).get()
+          if (base && base.panelId === panelId && base.batchNo) return base.batchNo
+        }
+        if (request.mode !== 'generate') {
+          const adopted = tx.select({ batchNo: table.batchNo }).from(table)
+            .where(and(eq(table.versionId, versionId), eq(table.panelId, panelId), eq(table.status, 'adopted'))).get()
+          if (adopted?.batchNo) return adopted.batchNo
+        }
+        const latest = tx.select({ batchNo: table.batchNo }).from(table)
+          .where(and(eq(table.versionId, versionId), eq(table.panelId, panelId)))
+          .orderBy(desc(table.batchNo)).limit(1).get()
+        return (latest?.batchNo || 0) + 1
+      })()
       const inserted = tx
         .insert(table)
         .values({
@@ -449,6 +482,7 @@ export async function startGridCandidates(versionId: number, request: GridReques
           panelId,
           mode: request.mode,
           inputHash,
+          batchNo,
           snapshotJson: JSON.stringify(s),
           createdAt: now(),
           updatedAt: now(),
@@ -622,6 +656,10 @@ export async function uploadGridCandidate(versionId: number, revision: number, p
     buffer = await readReferenceMedia(base.url)
   const decoded = await splitGrid(buffer, grid, ratio[0] / ratio[1])
   requireEditable(versionId, revision)
+  // 上传替换 = 一次新的整组生成，开新批
+  const latestBatch = db.select({ batchNo: table.batchNo }).from(table)
+    .where(and(eq(table.versionId, versionId), eq(table.panelId, panelId)))
+    .orderBy(desc(table.batchNo)).limit(1).get()
   const currentSources = await Promise.all(
     p.frames
       .filter((f) => f.url)
@@ -655,6 +693,7 @@ export async function uploadGridCandidate(versionId: number, revision: number, p
       mode: 'generate',
       status: 'ready',
       inputHash: hashContent(s),
+      batchNo: (latestBatch?.batchNo || 0) + 1,
       snapshotJson: JSON.stringify(s),
       rawUrl: base.url,
       previewUrl: base.url,
@@ -745,8 +784,10 @@ export async function adoptGridCandidate(versionId: number, id: number, revision
     const t: Timeline = normalizeTimeline(JSON.parse(latest.timelineJson)),
       p = t.panels.find((p) => p.id === row.panelId)
     if (candidateRow(versionId, id).status !== 'ready') throw new PrevisError('候选已经处理，请刷新', 409)
-    if (!p || panelHash(p) !== s.panelHash)
-      throw new PrevisError('原图或画面规划已变化，保留旧候选供查看，请重新生成', 409)
+    // 画面规划结构（帧 id 及顺序）必须与候选创建时一致，否则切格映射错位。
+    // 比较序列而非 panelHash：旧快照的哈希是旧公式算的，逐位比较会让历史候选全部失配。
+    if (!p || !sameFrameStructure(p, s))
+      throw new PrevisError('画面规划结构已变化，该候选的切格映射不再适用，请重新生成', 409)
     if (p.frames.some((f) => s.adoptTargets.includes(f.id!) && f.locked))
       throw new PrevisError('目标画面已锁定，无法采用', 409)
     for (const f of p.frames) {
@@ -776,6 +817,11 @@ export async function adoptGridCandidate(versionId: number, id: number, revision
         updatedAt: now(),
       })
       .where(and(eq(schema.animaticVersions.id, versionId), eq(schema.animaticVersions.revision, revision)))
+      .run()
+    // 同一分镜同一时间只允许一个采用结果：旧采用记录回退为待采用，便于再次切换
+    tx.update(table)
+      .set({ status: 'ready', updatedAt: now() })
+      .where(and(eq(table.versionId, versionId), eq(table.panelId, row.panelId), eq(table.status, 'adopted'), ne(table.id, id)))
       .run()
     tx.update(table).set({ status: 'adopted', updatedAt: now() }).where(eq(table.id, id)).run()
     mirrorCurrent(versionId, t)

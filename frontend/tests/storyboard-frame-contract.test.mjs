@@ -19,6 +19,8 @@ function evaluate(source, dependencies = {}, globals = {}) {
   })
   return module.exports
 }
+// usePrevis.ts 依赖 useApi.ts 的 withNetworkRetry；useApi 自身无 import，直接跑真模块。
+const useApi = evaluate(read('../app/composables/useApi.ts'))
 const domain = evaluate(read('../../backend/src/services/previs-domain.ts'))
 const reference = evaluate(read('../../backend/src/services/previs-video-reference-domain.ts'), { './previs-domain.js': domain })
 const contract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
@@ -35,6 +37,7 @@ function api(notices = [], globals = {}) {
   return evaluate(read('../app/composables/usePrevis.ts'), {
     vue: { ...vue, onUnmounted() {} },
     'vue-sonner': { toast: Object.fromEntries(['error', 'success', 'info'].map(kind => [kind, message => notices.push({ kind, message })])) },
+    '~/composables/useApi': useApi,
     '../../../backend/src/services/previs-domain': domain,
     '../../../backend/src/services/previs-frame-contract': contract,
     '../../../backend/src/services/previs-video-reference-domain': reference,

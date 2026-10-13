@@ -487,7 +487,6 @@
               <span class="dim" style="font-size:12px">{{ t('episode.prod.videos') }}</span>
               <span class="tag mono">{{ t('episode.sb.segmentStat', { n: sbs.length, dur: totalDuration }) }}</span>
               <span class="tag mono" :title="t('episode.vid.aspectRatio')">{{ dramaAspectRatio }}</span>
-              <label class="video-reference-select">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
               <div class="ml-auto flex gap-1">
                 <button class="btn btn-sm btn-primary" @click="navigateTo(`/drama/${dramaId}/episode/${episodeNumber}/previs`)">
                   <Clapperboard :size="13" />
@@ -684,11 +683,14 @@
                       :aspect-ratio="dramaAspectRatio"
                       :editable="productionEditable && !productionFramePlanBusy"
                       :management-editable="productionGeneratable && !productionWorking"
+                      :splitting="productionFramePlanBusy"
                       :before-action="beforeProductionGridAction" :commit-adoption="adoptProductionGridCandidate" @busy="productionGridBusy = $event"
+                      @split="splitProductionFrames"
+                      v-model:reference-strategy="videoReferenceInputStrategy"
                     >
-                      <template #default="{ planning, refineFrame, canRefineGrid, canRefineFrame }">
+                      <template #default="{ refineFrame, canRefineGrid, canRefineFrame }">
                         <StoryboardFramesEditor
-                          integrated :planning="planning" :can-refine-grid="canRefineGrid" :can-refine-frame="canRefineFrame"
+                          integrated :can-refine-grid="canRefineGrid" :can-refine-frame="canRefineFrame"
                           @refine="refineFrame"
                           :panel="productionPanel"
                           :contact-sheet="productionSheetById(productionPanel.id)"

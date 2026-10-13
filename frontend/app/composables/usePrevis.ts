@@ -1,5 +1,6 @@
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { toast } from 'vue-sonner'
+import { withNetworkRetry } from '~/composables/useApi'
 import type { AnimaticVersion, Timeline, FrameType, Panel, Keyframe } from '../../../backend/src/services/previs-domain'
 import { frameKey, makeFrame, orderedFrames, retimeBoundAudio } from '../../../backend/src/services/previs-domain'
 import { FRAME_COUNT_MAX } from '../../../backend/src/services/previs-frame-contract'
@@ -21,13 +22,16 @@ export type {
 
 // Timeline prompts and provider credentials must not be logged by the client.
 export async function previsRequest<T = any>(path: string, method = 'GET', body?: unknown): Promise<T> {
-  const response = await fetch(`/api/v1${path}`, {
-    method, headers: { 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
-  const result = await response.json()
-  if (!response.ok) throw new Error(result.message || `请求失败 (${response.status})`)
-  return result.data ?? result
+  // 幂等请求套一层网络抖动重试：切换镜头会并发打多个接口，单条连接抖动不该让整屏报「Failed to fetch」。
+  return withNetworkRetry(async () => {
+    const response = await fetch(`/api/v1${path}`, {
+      method, headers: { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.message || `请求失败 (${response.status})`)
+    return result.data ?? result
+  }, method)
 }
 export interface FramePlanDraft {
   id?: string
@@ -94,6 +98,8 @@ export interface GridCandidate {
   panelId: number
   mode: GridMode
   status: 'pending' | 'processing' | 'ready' | 'failed' | 'adopted' | 'discarded'
+  /** 所属版本（代际，UI 展示为 V1/V2…）：一次整组生成/上传 = 一个新版本，微调跟随基准；0 = 版本概念上线前的历史候选 */
+  batchNo: number
   taskId?: number | null
   rawUrl?: string | null
   previewUrl?: string | null

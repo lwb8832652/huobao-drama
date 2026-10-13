@@ -803,7 +803,6 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
               <p>{{ groups.length }} 个镜头 · {{ frameCount }} 张画面 · {{ (total / 1000).toFixed(1) }} 秒</p>
             </div>
           </div>
-          <label class="pv-reference-select">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
           <div class="pv-header-actions">
             <button
               class="btn btn-sm"
@@ -883,11 +882,14 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
                 :aspect-ratio="drama?.aspect_ratio || drama?.aspectRatio || '16:9'"
                 :editable="editable && !framePlanSubmitting && !framePlanActive"
                 :management-editable="generatable && !working"
+                :splitting="framePlanSubmitting || framePlanActive > 0"
                 :before-action="beforeGridAction" :commit-adoption="adoptGridCandidate" @busy="gridBusy = $event"
+                @split="options => options?.force ? (modal = 'split') : run(splitPanel)"
+                v-model:reference-strategy="videoReferenceInputStrategy"
               >
-                <template #default="{ planning, refineFrame, canRefineGrid, canRefineFrame }">
+                <template #default="{ refineFrame, canRefineGrid, canRefineFrame }">
                   <StoryboardFramesEditor
-                    integrated :planning="planning" :can-refine-grid="canRefineGrid" :can-refine-frame="canRefineFrame"
+                    integrated :can-refine-grid="canRefineGrid" :can-refine-frame="canRefineFrame"
                     @refine="refineFrame"
                     :key="`${version.id}-${panel.id}`"
                     :panel="panel"
