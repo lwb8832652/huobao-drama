@@ -2497,7 +2497,7 @@ function stopGenTasksPolling() {
 }
 
 const genTaskActiveCount = computed(() =>
-  genTasks.value.filter(t => t.status === 'processing').length +
+  genTasks.value.filter(t => t.status === 'processing' || t.status === 'pending').length +
   genMerges.value.filter(m => m.status === 'processing' || m.status === 'pending').length
 )
 const genTaskDoneCount = computed(() =>
@@ -2592,10 +2592,10 @@ function genTaskDuration(row) {
   return ms >= 60000 ? `${Math.floor(ms / 60000)}m${Math.round((ms % 60000) / 1000)}s` : `${Math.round(ms / 1000)}s`
 }
 
-// 抽屉打开且有进行中任务时,4s 轮询;关闭或全部结束时停止
-watch([taskDrawer, genTaskActiveCount], ([open, active]) => {
+// 抽屉打开期间持续同步：排队任务或其他入口新建任务不能依赖旧快照的 active 数量触发刷新。
+watch(taskDrawer, (open) => {
   stopGenTasksPolling()
-  if (open && active > 0) {
+  if (open) {
     genTasksTimer = setInterval(loadGenTasks, 4000)
   }
 })

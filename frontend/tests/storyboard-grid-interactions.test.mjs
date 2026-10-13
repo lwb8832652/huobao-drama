@@ -216,6 +216,12 @@ test('generation records group candidates by version with the newest version fir
   h.dispose()
 })
 
+test('task drawer polls while open even when its cached tasks are all terminal', () => {
+  const source = read('../app/views/drama/episode.vue')
+  assert.match(source, /watch\(taskDrawer, \(open\) => \{\s*stopGenTasksPolling\(\)\s*if \(open\) \{\s*genTasksTimer = setInterval\(loadGenTasks, 4000\)/)
+  assert.match(source, /genTasks\.value\.filter\(t => t\.status === 'processing' \|\| t\.status === 'pending'\)/)
+})
+
 test('both workspaces integrate frame details in the shared generation area', () => {
   for (const path of ['../app/views/drama/episode.vue', '../app/views/drama/previs.vue']) {
     const source = read(path)
