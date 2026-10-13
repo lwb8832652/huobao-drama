@@ -196,3 +196,19 @@ test('strong transition with frame camera reversal sends current own first bytes
   assert.match(actual.input.prompt, /reverse low/)
   assert.match(actual.input.prompt, /wide/)
 })
+test('strong allowed holding/custom changes use actual current first bytes; explicit time change resets', async () => {
+  for (const change of ['holding', 'arbitrary_custom_change', 'timeOfDay']) {
+    const id = version([panel(130, 0, 1), panel(131, 2, 3)], true), before = submissions.length
+    const row = db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, id)).get()!
+    const t = JSON.parse(row.timelineJson); t.transitions[0].allowedChanges = [change]
+    t.groups[0].exit.holding = 'cup'; t.groups[1].entry.holding = 'empty hands'
+    db.update(schema.animaticVersions).set({ timelineJson: JSON.stringify(t) }).where(eq(schema.animaticVersions.id, id)).run()
+    await createBatch(id, opts); await finish(before + 2)
+    const [a, b] = request(id)
+    assert.equal(b.data.videoContinuity.continuity.exactVideoBoundary, false, change)
+    assert.equal(b.data.videoContinuity.continuity.status, change === 'timeOfDay' ? 'reset' : 'available')
+    assert.equal(b.data.videoContinuity.first.panelId, 131)
+    assert.notEqual(a.data.videoContinuity.last.digest, b.data.videoContinuity.first.digest)
+    assert.deepEqual(wanFrameBytes(wanSubmissionFor(b.data, submissions.slice(before)), 'first_frame'), images[2])
+  }
+})

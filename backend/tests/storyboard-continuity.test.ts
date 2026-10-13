@@ -102,3 +102,28 @@ test('strong boundary compares effective frame camera and composition overrides 
   t.panels[0].angle = ''; t.panels[1].angle = ''
   assert.equal(resolve(t, 3).exactVideoBoundary, false)
 })
+test('strong sharing requires no allowed changes and compatible explicitly declared boundary states', () => {
+  const t = timeline(); t.transitions[0].continuity = 'strong'; t.transitions[0].allowedChanges = []
+  for (const change of ['holding', 'pose', 'position', 'gaze', 'arbitrary_custom_change']) {
+    t.transitions[0].allowedChanges = [change]
+    assert.equal(resolve(t, 3).exactVideoBoundary, false, change)
+    assert.equal(resolve(t, 3).status, 'available')
+  }
+  t.transitions[0].allowedChanges = []
+  for (const key of ['holding', 'pose', 'position', 'gaze', 'custom_state']) {
+    t.groups[0].exit[key] = 'before'; t.groups[1].entry[key] = 'after'
+    assert.equal(resolve(t, 3).exactVideoBoundary, false, key)
+    delete t.groups[0].exit[key]; delete t.groups[1].entry[key]
+  }
+  assert.equal(resolve(t, 3).exactVideoBoundary, true)
+})
+test('timeOfDay and time_of_day changes reset continuity', () => {
+  const t = timeline(); t.transitions[0].continuity = 'strong'
+  for (const change of ['timeOfDay', 'time_of_day']) {
+    t.transitions[0].allowedChanges = [change]
+    assert.equal(resolve(t, 3).status, 'reset', change)
+  }
+  t.transitions[0].allowedChanges = []
+  t.groups[0].exit.time_of_day = 'morning'; t.groups[1].entry.time_of_day = 'night'
+  assert.equal(resolve(t, 3).status, 'reset')
+})

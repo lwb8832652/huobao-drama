@@ -50,8 +50,8 @@ export function resolvePanelContinuity(input: Timeline, panelId: number, version
   const aTime = timeQualifier(a.scene), bTime = timeQualifier(b.scene)
   if (aTime && bTime && aTime !== bTime) return reset('场景时间标记不同，重新建立开场状态。')
   const changes = transition?.allowedChanges || []
-  if (changes.some(change => /^(time|time_gap|time_jump|时间|时间跳跃)$/i.test(change))) return reset('转场允许时间跳跃，前序画面不能约束当前开场。')
-  for (const key of ['time', 'timeOfDay', '时间']) {
+  if (changes.some(change => /^(time|time_gap|time_jump|timeOfDay|time_of_day|时间|时间跳跃)$/i.test(change))) return reset('转场允许时间跳跃，前序画面不能约束当前开场。')
+  for (const key of ['time', 'timeOfDay', 'time_of_day', '时间']) {
     const exit = previousGroup?.exit[key], entry = currentGroup?.entry[key]
     if (exit && entry && exit !== entry) return reset('相邻分镜的时间状态不同，重新建立开场状态。')
   }
@@ -66,8 +66,14 @@ export function resolvePanelContinuity(input: Timeline, panelId: number, version
   const previousAngle = last.angle || a.angle, currentAngle = currentFirst?.angle || b.angle
   const previousShot = last.shotType || a.shotType, currentShot = currentFirst?.shotType || b.shotType
   const sameComposition = !last.composition || !currentFirst?.composition || last.composition === currentFirst.composition
+  // Free-form allowedChanges cannot be exhaustively classified. Any deliberate
+  // change keeps the current first image; explicitly contradictory states do too.
+  const compatibleStates = Object.entries(previousGroup?.exit || {}).every(([key, value]) => {
+    const entry = currentGroup?.entry[key]
+    return !value || !entry || value === entry
+  })
   const exactVideoBoundary = sameScene && transition?.continuity === 'strong'
-    && !changes.some(change => /camera|composition|shot|angle|scene|light|character|identity|styling|wardrobe|costume|prop|机位|构图|景别|场景|光|人物|身份|服装|道具/i.test(change))
+    && changes.length === 0 && compatibleStates
     && signature([...a.characterIds].sort()) === signature([...b.characterIds].sort())
     && signature([...a.propIds].sort()) === signature([...b.propIds].sort())
     && Boolean(previousAngle && currentAngle && previousAngle === currentAngle)
