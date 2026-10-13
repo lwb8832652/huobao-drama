@@ -1,8 +1,17 @@
 import { fileURLToPath } from 'node:url'
 
+// 构建目录按命令分流：dev 与 build/generate 共用 .nuxt 时会互相污染——build 会把
+// dev 的 /@vite/client 引用混进产物（2026-10-09 实证），表现为线上页面加载 dev 模块。
+// 分流后两者可同时运行，不再需要「停 dev → 移走 .nuxt → 再 build」。
+// prepare（postinstall）仍写 .nuxt，供 tsconfig.json 的 extends 取类型。
+const command = process.argv[2] || ''
+const buildDir = process.env.NUXT_BUILD_DIR
+  || (command === 'dev' ? '.nuxt-dev' : command === 'build' || command === 'generate' ? '.nuxt-build' : '.nuxt')
+
 export default defineNuxtConfig({
   srcDir: 'app/',
   ssr: false,
+  buildDir,
   devtools: { enabled: false },
   experimental: {
     appManifest: false,

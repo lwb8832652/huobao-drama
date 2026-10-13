@@ -1,5 +1,82 @@
 const BASE = '/api/v1'
 
+/**
+ * 网络层失败识别：浏览器 fetch 遇到「连接被中途重置 / 代理掐断 / 隧道抖动」时只会抛裸的
+ * `TypeError: Failed to fetch`（读 body 中途断同样如此），不会给出状态码。
+ * 注意必须与「服务端返回的状态码/非 JSON」区分：后者不是 TypeError，照常抛出、不重试。
+ */
+const NETWORK_ERROR_RE = /failed to fetch|network ?error|load failed|fetch failed|err_connection|err_network/i
+
+/**
+ * 陈旧 bundle 识别：部署后停留在旧页面的用户，动态 import 会去请求已被新构建删除的 chunk：
+ *   GET /_nuxt/<旧哈希>.js → 404
+ *   → TypeError: Failed to fetch dynamically imported module: https://…/_nuxt/<旧哈希>.js
+ * message 里含 "Failed to fetch"，会被 NETWORK_ERROR_RE 误判成网络故障——服务端其实是好的，
+ * 重试也没有意义（文件已经不存在）。单独识别、单独处理，见 isStaleChunkError。
+ */
+const STALE_CHUNK_RE = /dynamically imported module/i
+
+export function isStaleChunkError(cause: unknown): boolean {
+  // 与 isNetworkError 一致要求 TypeError：浏览器对动态 import 失败抛的就是 TypeError，
+  // 收紧一点可避免其它碰巧带同串 message 的普通 Error 被误分类
+  return cause instanceof TypeError && STALE_CHUNK_RE.test(cause.message || '')
+}
+
+export function isNetworkError(cause: unknown): boolean {
+  // 陈旧 chunk 同样是 TypeError + "Failed to fetch"，但重试救不回已删除的文件，排除掉
+  return cause instanceof TypeError && NETWORK_ERROR_RE.test(cause.message || '') && !isStaleChunkError(cause)
+}
+
+/**
+ * 陈旧 bundle 自愈：与 plugins/chunk-reload.client.ts 共用同一把 sessionStorage 冷却锁。
+ * vite:preloadError 只能覆盖 Vite 包装过的动态 import；裸 import() 失败（路由 chunk 等）
+ * 会以 TypeError 的形式冒到业务 catch 里，那些路径也调本函数做同一件事。
+ * 返回 false = 处于 10s 冷却期（刚重载过仍失败），调用方应展示文案而不是再刷一次，
+ * 避免新版自身有问题时陷入「刷新 → 仍然失败 → 再刷新」的死循环。
+ */
+const CHUNK_RELOAD_KEY = 'huobao:chunk-reload-at'
+const CHUNK_RELOAD_COOLDOWN_MS = 10_000
+
+export function reloadStaleBundle(): boolean {
+  let last = 0
+  try { last = Number(sessionStorage.getItem(CHUNK_RELOAD_KEY) || 0) } catch { /* 隐私模式下不可用 */ }
+  if (Date.now() - last < CHUNK_RELOAD_COOLDOWN_MS) {
+    console.warn('[chunk] 资源已失效且刚重新加载过，跳过自动重载以避免死循环')
+    return false
+  }
+  try { sessionStorage.setItem(CHUNK_RELOAD_KEY, String(Date.now())) } catch { /* 同上 */ }
+  // 不做缓存穿透参数：HTML 无缓存头，普通 reload 即会拿到新的 chunk 清单
+  console.warn('[chunk] 检测到已失效的前端资源（通常是部署后停留在旧页面），正在重新加载最新版本…')
+  if (typeof window !== 'undefined') window.location.reload()
+  return true
+}
+
+/**
+ * 幂等请求的网络抖动容错。
+ *
+ * fetch 自身不重试，一次连接抖动就会原样冒到业务层变成「Failed to fetch」——本机前面挂着
+ * nitro 代理与 frp 隧道，链路比直连长，这类一次性抖动值得挡在 UI 之外。
+ *
+ * 重试次数取 2 而不是 1：nitro 的 node-server 用 `new HttpServer()` 不传 options，吃的是
+ * Node 默认 `keepAliveTimeout = 5000`，却在响应里广告 `Keep-Alive: timeout=5`；再叠上
+ * frp 隧道与外部网络的 NAT，空闲连接被对端关掉后，浏览器连接池有一定概率复用到已半死的
+ * socket。一次重试仍可能撞上第二个坏 socket（实测出现过连续两次），所以要给第二次机会。
+ *
+ * 约束：**只重试 GET**（幂等），**非 GET 一律不重试**，否则可能重复建任务/重复下单；
+ * 只重试网络层 TypeError，HTTP 状态码与业务错误不受影响。
+ */
+export async function withNetworkRetry<T>(run: () => Promise<T>, method = 'GET', retries = 2): Promise<T> {
+  const backoff = [300, 900]
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await run()
+    } catch (cause) {
+      if (attempt >= retries || method.toUpperCase() !== 'GET' || !isNetworkError(cause)) throw cause
+      await new Promise(resolve => setTimeout(resolve, backoff[attempt] ?? 900))
+    }
+  }
+}
+
 async function req<T = any>(method: string, path: string, body?: any): Promise<T> {
   const opts: RequestInit = { method, headers: { 'Content-Type': 'application/json' } }
   if (body) opts.body = JSON.stringify(body)
@@ -8,8 +85,10 @@ async function req<T = any>(method: string, path: string, body?: any): Promise<T
   console.log(`%c[API] %c${method} %c${path}`, 'color:#888', 'color:#4fc3f7;font-weight:bold', 'color:#ccc', body || '')
 
   try {
-    const resp = await fetch(`${BASE}${path}`, opts)
-    const json = await resp.json()
+    const { resp, json } = await withNetworkRetry(async () => {
+      const resp = await fetch(`${BASE}${path}`, opts)
+      return { resp, json: await resp.json() }
+    }, method)
     const ms = Math.round(performance.now() - start)
 
     if (!resp.ok || (json.code && json.code >= 400)) {

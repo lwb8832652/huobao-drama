@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, useId, watch } from 'vue'
 import { Loader2, Scissors, Sparkles, Trash2, X } from 'lucide-vue-next'
-import { FRAME_COUNT_OPTIONS, type PanelFramePlan } from '~/composables/usePrevis'
+import { gridLayoutsForRatio, type PanelFramePlan } from '~/composables/usePrevis'
 
 const props = defineProps<{
   plans: PanelFramePlan[]
   count: number
   busy?: boolean
   editable?: boolean
+  aspectRatio?: string
   returnFocus?: HTMLElement
 }>()
 const emit = defineEmits<{
@@ -27,6 +28,7 @@ const descriptionId = useId()
 const previousFocus = props.returnFocus
   || (typeof document === 'undefined' ? null : document.activeElement as HTMLElement | null)
 const totalFrames = computed(() => drafts.value.reduce((sum, plan) => sum + plan.frames.length, 0))
+const layoutOptions = computed(() => gridLayoutsForRatio(props.aspectRatio))
 const aiCount = computed(() => drafts.value.filter(plan => plan.source === 'ai').length)
 const canApply = computed(() => !!props.editable && !props.busy && drafts.value.some(plan => plan.frames.length))
 const sourceLabel = (plan: PanelFramePlan) => plan.source === 'ai' ? 'AI 拆分' : '规则兜底'
@@ -76,10 +78,10 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
         <label>
           <span>每个镜头的画面数</span>
           <select :value="count" :disabled="busy" @change="emit('recount', Number(($event.target as HTMLSelectElement).value))">
-            <option v-for="option in FRAME_COUNT_OPTIONS" :key="option" :value="option">{{ option }} 张</option>
+            <option v-for="layout in layoutOptions" :key="layout.count" :value="layout.count">{{ layout.label }} · {{ layout.count }} 张</option>
           </select>
         </label>
-        <span class="plan-hint">调整后会按新数量重新拆分；确认前可自由修改标题、提示词与镜头参数。</span>
+        <span class="plan-hint">按宫格布局拆分（{{ layoutOptions.map(l => l.label).join(' / ') }}），画面数正好铺满宫格；调整后会按新数量重新拆分。</span>
       </div>
 
       <div class="plan-body">

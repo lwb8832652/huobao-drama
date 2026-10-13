@@ -18,10 +18,12 @@ function evaluate(source, dependencies = {}, globals = {}) {
   })
   return module.exports
 }
+// usePrevis.ts 依赖 useApi.ts 的 withNetworkRetry；useApi 自身无 import，直接跑真模块。
+const useApi = evaluate(read('../app/composables/useApi.ts'))
 const domain = evaluate(read('../../backend/src/services/previs-domain.ts'))
 const contract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
 const reference = evaluate(read('../../backend/src/services/previs-video-reference-domain.ts'), { './previs-domain.js': domain })
-const sheets = evaluate(read('../../backend/src/services/previs-contact-sheet-domain.ts'), { './previs-domain.js': domain })
+const sheets = evaluate(read('../../backend/src/services/previs-contact-sheet-domain.ts'), { './previs-domain.js': domain, './previs-frame-contract.js': contract })
 const panel = () => ({ id: 7, title: '开门', durationMs: 6000, referenceImages: [], frames: [
   { ...domain.makeFrame('one', 0), url: '/static/one.png' },
   { ...domain.makeFrame('two', 5999), url: '/static/two.png' },
@@ -33,6 +35,7 @@ const sheet = target => ({ panelId: target.id, status: 'ready', sourceHash: 'sou
 function api(globals = {}, notices = []) {
   return evaluate(read('../app/composables/usePrevis.ts'), {
     vue: { ...vue, onUnmounted() {} }, 'vue-sonner': { toast: { error: message => notices.push(message), success() {} } },
+    '~/composables/useApi': useApi,
     '../../../backend/src/services/previs-domain': domain,
     '../../../backend/src/services/previs-frame-contract': contract,
     '../../../backend/src/services/previs-video-reference-domain': reference,
@@ -215,7 +218,8 @@ test('contact-sheet hotspots follow descriptor percentages and emit the selected
   const component = evaluate(script.content, { vue, 'lucide-vue-next': {}, '~/composables/usePrevis': { ...domain, ...api() } }).default
   const target = panel(), props = { panel: target, sheet: sheet(target), compact: false, activeFrameId: 'one' }, changes = []
   const setup = component.setup(props, { expose() {}, emit: (event, ...args) => changes.push({ event, args }) })
-  assert.deepEqual(JSON.parse(JSON.stringify(setup.cellStyle(props.sheet.descriptor.cells[1]))), { left: '50%', top: '0%', width: '50%', height: '100%' })
+  // 2 帧 16:9 → 1×2 宫格（1 列 2 行），第 2 格位于下半区整宽
+  assert.deepEqual(JSON.parse(JSON.stringify(setup.cellStyle(props.sheet.descriptor.cells[1]))), { left: '0%', top: '50%', width: '100%', height: '50%' })
   setup.select('two', {})
   assert.equal(changes[0].event, 'select')
   assert.equal(changes[0].args[0], 'two')
@@ -260,7 +264,7 @@ test('workbench and standalone handlers submit the chosen strategy and block una
   }
 })
 
-test('frame editor defaults to the sheet overview and retains every card action in edit mode', () => {
+test('frame editor renders the sheet overview when integrated and keeps card actions standalone', () => {
   const descriptor = parse(read('../app/components/previs/StoryboardFramesEditor.vue')).descriptor
   const script = compileScript(descriptor, { id: 'sheet-overview' })
   const sheetStub = { name: 'sheet-preview' }
@@ -270,19 +274,22 @@ test('frame editor defaults to the sheet overview and retains every card action 
     './FrameSettingsDialog.vue': {}, './StoryboardContactSheet.vue': { default: sheetStub }, '~/composables/useApi': { uploadAPI: {} },
     '~/composables/usePrevis': { ...domain, ...api() },
   }).default
-  const target = panel(), props = { panel: target, contactSheet: sheet(target), editable: true, generatable: true, tasks: [] }
-  const setup = component.setup(props, { expose() {}, emit() {} })
+  const target = panel(), base = { panel: target, contactSheet: sheet(target), editable: true, generatable: true, tasks: [] }
   const template = compileTemplate({ source: descriptor.template.content, filename: 'StoryboardFramesEditor.vue', id: 'sheet-overview', compilerOptions: { bindingMetadata: script.bindings } })
   assert.deepEqual(template.errors, [])
   const { render } = evaluate(template.code, { vue: { ...vue, withDirectives: vnode => vnode } })
   function nodes(node) {
     return [node, ...(Array.isArray(node?.children) ? node.children.flatMap(nodes) : [])]
   }
-  const overview = nodes(render({}, [], props, vue.proxyRefs(setup), {}, {}))
+  // 集成模式：分镜画面固定以宫格（联络表）展示，不再有「编辑规划 / 返回宫格」切换
+  const integratedProps = { ...base, integrated: true }
+  const integrated = component.setup(integratedProps, { expose() {}, emit() {} })
+  const overview = nodes(render({}, [], integratedProps, vue.proxyRefs(integrated), {}, {}))
   assert.ok(overview.some(node => node.type === sheetStub))
   assert.equal(overview.filter(node => node.type === 'article').length, 0)
-  setup.editing.value = true
-  const editing = nodes(render({}, [], props, vue.proxyRefs(setup), {}, {}))
+  // 独立模式：保留逐格卡片与全部操作入口
+  const standalone = component.setup(base, { expose() {}, emit() {} })
+  const editing = nodes(render({}, [], base, vue.proxyRefs(standalone), {}, {}))
   assert.equal(editing.filter(node => node.type === 'article').length, 2)
   assert.ok(editing.some(node => node.props?.class?.includes('frame-settings-action')))
   assert.ok(editing.some(node => node.props?.onClick && node.type === 'button'))

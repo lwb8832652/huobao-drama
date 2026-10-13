@@ -1,5 +1,6 @@
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { toast } from 'vue-sonner'
+import { withNetworkRetry } from '~/composables/useApi'
 import type { AnimaticVersion, Timeline, FrameType, Panel, Keyframe } from '../../../backend/src/services/previs-domain'
 import { frameKey, makeFrame, orderedFrames, retimeBoundAudio } from '../../../backend/src/services/previs-domain'
 import { FRAME_COUNT_MAX } from '../../../backend/src/services/previs-frame-contract'
@@ -7,7 +8,8 @@ import type { ContactSheetView } from '../../../backend/src/services/previs-cont
 import { selectVideoReferenceStrategy, type VideoReferenceInputStrategy } from '../../../backend/src/services/previs-video-reference-domain'
 export type { ContactSheetView, ContactSheetCell } from '../../../backend/src/services/previs-contact-sheet-domain'
 export type { VideoReferenceInputStrategy } from '../../../backend/src/services/previs-video-reference-domain'
-export { FRAME_COUNT_MIN, FRAME_COUNT_MAX, FRAME_COUNT_OPTIONS, frameCountChangeAllowed } from '../../../backend/src/services/previs-frame-contract'
+export { FRAME_COUNT_MIN, FRAME_COUNT_MAX, FRAME_COUNT_OPTIONS, FRAME_GRID_LAYOUTS, FRAME_GRID_COUNTS, gridLayoutForCount, gridLayoutsForRatio, isPortraitRatio, frameCountChangeAllowed } from '../../../backend/src/services/previs-frame-contract'
+export type { FrameGridLayout } from '../../../backend/src/services/previs-frame-contract'
 export {
   autoGroup, checkContinuity, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl,
   orderedFrames, panelImageFallback, planFrames, rebuildTransitions, timelineSegments,
@@ -20,13 +22,16 @@ export type {
 
 // Timeline prompts and provider credentials must not be logged by the client.
 export async function previsRequest<T = any>(path: string, method = 'GET', body?: unknown): Promise<T> {
-  const response = await fetch(`/api/v1${path}`, {
-    method, headers: { 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
-  const result = await response.json()
-  if (!response.ok) throw new Error(result.message || `请求失败 (${response.status})`)
-  return result.data ?? result
+  // 幂等请求套一层网络抖动重试：切换镜头会并发打多个接口，单条连接抖动不该让整屏报「Failed to fetch」。
+  return withNetworkRetry(async () => {
+    const response = await fetch(`/api/v1${path}`, {
+      method, headers: { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.message || `请求失败 (${response.status})`)
+    return result.data ?? result
+  }, method)
 }
 export interface FramePlanDraft {
   id?: string
@@ -93,6 +98,8 @@ export interface GridCandidate {
   panelId: number
   mode: GridMode
   status: 'pending' | 'processing' | 'ready' | 'failed' | 'adopted' | 'discarded'
+  /** 所属版本（代际，UI 展示为 V1/V2…）：一次整组生成/上传 = 一个新版本，微调跟随基准；0 = 版本概念上线前的历史候选 */
+  batchNo: number
   taskId?: number | null
   rawUrl?: string | null
   previewUrl?: string | null
@@ -196,20 +203,16 @@ export function useVideoReferenceInputStrategy() {
   return strategy
 }
 
+/**
+ * 视频生成统一走「分镜画面」模式：视频制作不再提供「直接生成 / 分镜画面」切换入口，
+ * 模式恒为 storyboard_frames。保留该 composable 是为了让调用方继续以响应式引用读取模式，
+ * 也便于以后需要时扩展；旧版本地存储的 'direct' 偏好在初始化时清除，避免影响后续判断。
+ */
 export function useVideoGenerationMode() {
-  type Mode = 'direct' | 'storyboard_frames'
-  let initial: Mode = 'direct'
   if (import.meta.client) {
-    try {
-      const stored = localStorage.getItem(VIDEO_GENERATION_MODE_KEY)
-      if (stored === 'direct' || stored === 'storyboard_frames') initial = stored
-    } catch {}
+    try { localStorage.removeItem(VIDEO_GENERATION_MODE_KEY) } catch {}
   }
-  const mode = ref<Mode>(initial)
-  watch(mode, value => {
-    try { localStorage.setItem(VIDEO_GENERATION_MODE_KEY, value) } catch {}
-  })
-  return mode
+  return ref<'direct' | 'storyboard_frames'>('storyboard_frames')
 }
 
 export function usePrevis() {
@@ -473,7 +476,7 @@ export function useFramePlanner(
   workspace: Pick<ReturnType<typeof usePrevis>, 'version' | 'editable' | 'save' | 'edit'>,
   modelChoice: () => { configId?: number; model?: string },
 ) {
-  const open = ref(false), busy = ref(false), count = ref(3)
+  const open = ref(false), busy = ref(false), count = ref(4)
   const plans = ref<PanelFramePlan[]>([])
   let requestToken = 0, targetPanelId = 0, targetVersionId = 0
   function close() {

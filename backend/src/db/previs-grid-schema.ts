@@ -14,6 +14,7 @@ export const gridCandidates = sqliteTable('previs_grid_candidates', {
   width: integer('width'),
   height: integer('height'),
   error: text('error'),
+  batchNo: integer('batch_no').notNull().default(0),
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),
 })
@@ -22,9 +23,14 @@ export function initGridSchema(sqlite: Database.Database) {
     id INTEGER PRIMARY KEY AUTOINCREMENT, version_id INTEGER NOT NULL, panel_id INTEGER NOT NULL,
     mode TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', input_hash TEXT NOT NULL, snapshot_json TEXT NOT NULL,
     task_id INTEGER, raw_url TEXT, preview_url TEXT, width INTEGER, height INTEGER, error TEXT,
+    batch_no INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   ); CREATE INDEX IF NOT EXISTS idx_grid_version_panel ON previs_grid_candidates(version_id,panel_id);
   CREATE INDEX IF NOT EXISTS idx_grid_status ON previs_grid_candidates(status);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_grid_inflight ON previs_grid_candidates(version_id,panel_id)
     WHERE status IN ('pending','processing');`)
+  // 旧库补列（沿用 previs-schema.ts 的迁移模式）：历史候选 batch_no=0，UI 归入「历史生成」
+  const columns = sqlite.prepare('PRAGMA table_info(previs_grid_candidates)').all() as { name: string }[]
+  if (!columns.some(c => c.name === 'batch_no'))
+    sqlite.exec('ALTER TABLE previs_grid_candidates ADD COLUMN batch_no INTEGER NOT NULL DEFAULT 0')
 }

@@ -19,6 +19,8 @@ function evaluate(source, dependencies = {}, globals = {}) {
   })
   return module.exports
 }
+// usePrevis.ts 依赖 useApi.ts 的 withNetworkRetry；useApi 自身无 import，直接跑真模块。
+const useApi = evaluate(read('../app/composables/useApi.ts'))
 const domain = evaluate(read('../../backend/src/services/previs-domain.ts'))
 const reference = evaluate(read('../../backend/src/services/previs-video-reference-domain.ts'), { './previs-domain.js': domain })
 const contract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
@@ -35,6 +37,7 @@ function api(notices = [], globals = {}) {
   return evaluate(read('../app/composables/usePrevis.ts'), {
     vue: { ...vue, onUnmounted() {} },
     'vue-sonner': { toast: Object.fromEntries(['error', 'success', 'info'].map(kind => [kind, message => notices.push({ kind, message })])) },
+    '~/composables/useApi': useApi,
     '../../../backend/src/services/previs-domain': domain,
     '../../../backend/src/services/previs-frame-contract': contract,
     '../../../backend/src/services/previs-video-reference-domain': reference,
@@ -59,7 +62,7 @@ function standalone(globals) {
   return evaluate(functions, {}, { ...domain, ...api(), editable: vue.ref(true), timeline: vue.ref({ panels: [] }), ...globals })
 }
 
-test('the frame count control offers every value from one through nine', () => {
+test('the frame count control offers grid layouts 1×2 / 2×2 / 1×3 / 2×3 / 3×3', () => {
   const descriptor = parse(read('../app/components/previs/FramePlanDialog.vue')).descriptor
   const script = compileScript(descriptor, { id: 'frame-count-control' })
   const component = evaluate(script.content, {
@@ -77,7 +80,7 @@ test('the frame count control offers every value from one through nine', () => {
     for (const child of Array.isArray(node?.children) ? node.children : []) visit(child)
   }
   visit(render({}, [], props, vue.proxyRefs(setup), {}, {}))
-  assert.deepEqual(values, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+  assert.deepEqual(values, [2, 4, 3, 6, 9])
 })
 
 test('manual add opens below nine and stays closed at or above nine', () => {

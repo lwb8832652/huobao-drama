@@ -31,11 +31,10 @@ const props = withDefaults(defineProps<{
   /** 拆分任务提交中或排队中：与资产批量生成一致，按钮转圈显示“拆分中…” */
   splitting?: boolean
   integrated?: boolean
-  planning?: boolean
   canRefineGrid?: boolean
   canRefineFrame?: boolean
 }>(), {
-  generatable: true, tasks: () => [], showVideoAction: false, videoGenerationMode: 'direct', activeFrameId: '', title: '分镜画面', splitting: false,
+  generatable: true, tasks: () => [], showVideoAction: false, videoGenerationMode: 'storyboard_frames', activeFrameId: '', title: '分镜画面', splitting: false,
 })
 const emit = defineEmits<{
   change: [frames: Keyframe[], coverFrameId?: string]
@@ -48,7 +47,6 @@ const emit = defineEmits<{
 }>()
 
 const uploading = ref('')
-const editing = ref(false)
 const uploadTarget = ref<{ panelId: number; frameId: string }>()
 const fileInput = ref<HTMLInputElement>()
 const settingsTrigger = shallowRef<HTMLElement>()
@@ -56,7 +54,6 @@ const menuId = ref('')
 const toolbarMenu = ref(false)
 const settings = ref<{ panelId: number; frameId?: string; newFrame?: Keyframe }>()
 const frames = computed(() => orderedFrames(props.panel))
-const showPlanning = computed(() => props.integrated ? props.planning : editing.value)
 const canAdd = computed(() => props.editable && frames.value.length < FRAME_COUNT_MAX)
 const usesStoryboardFrames = computed(() => props.videoGenerationMode === 'storyboard_frames')
 const settingsFrame = computed(() => settings.value?.newFrame
@@ -112,7 +109,6 @@ function openSettings(frame: Keyframe, event: Event) {
 function selectSheetFrame(frameId: string, event: Event) {
   const frame = props.panel.frames.find(frame => frameKey(frame) === frameId)
   if (!frame) return
-  if (!props.integrated) editing.value = true
   openSettings(frame, event)
 }
 function refineFrame(edit: { frameId: string; mode: 'grid_edit' | 'frame_edit'; instruction: string }) {
@@ -204,7 +200,6 @@ async function upload(event: Event) {
   finally { uploading.value = '' }
 }
 watch(() => props.panel.id, () => {
-  editing.value = false
   settings.value = undefined
   menuId.value = ''
   toolbarMenu.value = false
@@ -220,8 +215,7 @@ watch(settingsFrame, frame => {
       <div><strong>{{ title }}</strong><span class="frame-count" :class="{ complete: frames.length > 0 && !missingVideoFrames }"><i />{{ frames.length - missingVideoFrames }} / {{ frames.length }} 张已就绪</span></div>
       <button type="button" class="btn btn-sm frame-add" :disabled="!canAdd" :title="`每个镜头最多 ${FRAME_COUNT_MAX} 张画面`" @click="add"><ImagePlus :size="13" />添加画面</button>
     </header>
-    <div v-if="!integrated || showPlanning" class="frame-editor-tools">
-      <button v-if="!integrated && frames.length" type="button" class="btn btn-sm frame-view-toggle" :aria-pressed="editing" @click="editing = !editing"><SlidersHorizontal :size="12" />{{ editing ? '返回宫格' : '编辑规划' }}</button>
+    <div v-if="!integrated" class="frame-editor-tools">
       <button v-if="integrated" type="button" class="btn btn-sm frame-add" :disabled="!canAdd" @click="add"><ImagePlus :size="13" />添加画面</button>
       <button v-if="!integrated" type="button" class="btn btn-sm frame-fill" :disabled="!canGenerateMissing"
         :title="missingFrames.some(frame => !frameReferenceUrls(frame).length) ? '请先在生成设置中选择参考素材' : '生成所有缺失画面'"
@@ -236,7 +230,7 @@ watch(settingsFrame, frame => {
     </div>
     <input ref="fileInput" class="frame-upload-input" type="file" accept="image/*" aria-label="上传分镜画面" @change="upload">
 
-    <StoryboardContactSheet v-if="frames.length && !showPlanning" :panel="panel" :sheet="contactSheet" :active-frame-id="activeFrameId"
+    <StoryboardContactSheet v-if="frames.length && integrated" :panel="panel" :sheet="contactSheet" :active-frame-id="activeFrameId"
       @select="selectSheetFrame" @retry="emit('retry-sheet')" />
     <div v-else-if="frames.length" class="frame-editor-grid">
       <article v-for="(frame, index) in frames" :key="frameKey(frame)" class="frame-card" :class="{ selected: activeFrameId === frameKey(frame) }">
@@ -289,7 +283,7 @@ watch(settingsFrame, frame => {
       </div>
     </div>
     <footer v-if="usesStoryboardFrames || showVideoAction" class="frame-editor-video">
-      <div><Film :size="14" /><span>{{ usesStoryboardFrames ? (videoReady ? `全部 ${frames.length} 张画面已就绪` : videoInputError || (frames.length ? `还需完成 ${missingVideoFrames} 张画面` : '先添加分镜画面')) : '当前为直接生成模式' }}<small>{{ usesStoryboardFrames ? '视频按时间顺序使用全部画面' : '这些画面仅用于预演和审核，不作为当前视频输入' }}</small></span></div>
+      <div><Film :size="14" /><span>{{ videoReady ? `全部 ${frames.length} 张画面已就绪` : videoInputError || (frames.length ? `还需完成 ${missingVideoFrames} 张画面` : '先添加分镜画面') }}<small>视频按时间顺序使用全部画面</small></span></div>
       <button v-if="showVideoAction" type="button" class="btn btn-primary btn-sm" :disabled="!videoReady" @click="emit('video')"><Film :size="13" />生成视频</button>
     </footer>
     <FrameSettingsDialog
@@ -324,8 +318,6 @@ watch(settingsFrame, frame => {
 .frame-editor .frame-add { flex-shrink: 0; background: var(--surface-raised); border: 1px solid var(--border); color: var(--text-2); box-shadow: none; }
 .frame-editor .frame-add:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text-0); }
 .frame-editor-tools { display: flex; align-items: center; gap: 6px; }
-.frame-editor .frame-view-toggle { border: 1px solid var(--border); background: var(--surface-raised); color: var(--text-1); box-shadow: none; }
-.frame-editor .frame-view-toggle:hover:not(:disabled) { background: var(--surface-muted); }
 .frame-editor .frame-fill { margin-left: auto; flex: 0 1 auto; justify-content: center; border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border)); background: var(--accent-bg); color: var(--accent-text); box-shadow: none; }
 .frame-editor .frame-fill:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 18%, var(--surface-raised)); border-color: var(--accent); }
 .frame-fill span { display: inline-flex; align-items: center; justify-content: center; min-width: 17px; height: 17px; border-radius: 4px; padding: 0 4px; background: color-mix(in srgb, var(--accent) 13%, transparent); font: 10px var(--font-mono); }

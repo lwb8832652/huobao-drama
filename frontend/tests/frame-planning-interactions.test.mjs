@@ -22,6 +22,8 @@ function evaluate(source, dependencies = {}, globals = {}) {
   })
   return module.exports
 }
+// usePrevis.ts 依赖 useApi.ts 的 withNetworkRetry；useApi 自身无 import，直接跑真模块。
+const useApi = evaluate(read('../app/composables/useApi.ts'))
 const domain = evaluate(read('../../backend/src/services/previs-domain.ts'))
 const reference = evaluate(read('../../backend/src/services/previs-video-reference-domain.ts'), { './previs-domain.js': domain })
 const contract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
@@ -110,10 +112,11 @@ test('integrated overview stays on the sheet when details open and routes one gu
     '~/composables/usePrevis': { ...domain, ...contract },
   }).default
   const changes = [], target = panel(); target.frames = [{ ...domain.makeFrame('one'), url: '/static/current.png' }]
-  const props = { panel: target, editable: true, tasks: [], integrated: true, planning: false, canRefineGrid: true, canRefineFrame: true }
+  const props = { panel: target, editable: true, tasks: [], integrated: true, canRefineGrid: true, canRefineFrame: true }
   const setup = component.setup(props, { expose() {}, emit: (event, ...args) => changes.push({ event, args }) })
   setup.selectSheetFrame('one', { currentTarget: {} })
-  assert.equal(setup.editing.value, false); assert.equal(setup.showPlanning.value, false)
+  // 宫格（联络表）是唯一展示模式：不再存在「编辑规划 / 返回宫格」切换
+  assert.doesNotMatch(descriptor.template.content, /frame-view-toggle|编辑规划|返回宫格/)
   setup.refineFrame({ frameId: 'one', mode: 'grid_edit', instruction: '调整视线' })
   assert.equal(changes.filter(change => change.event === 'refine').length, 1)
   assert.equal(setup.settings.value, undefined)
@@ -149,6 +152,7 @@ function harness({ results = [complete()], saveResult = true, requestError } = {
   const requests = [], notices = [], disposers = []
   const toast = Object.fromEntries(['error', 'success', 'info'].map(kind => [kind, message => notices.push({ kind, message })]))
   const api = evaluate(read('../app/composables/usePrevis.ts'), {
+    '~/composables/useApi': useApi,
     vue: { ...vue, onUnmounted: fn => disposers.push(fn) },
     'vue-sonner': { toast },
     '../../../backend/src/services/previs-domain': domain,
@@ -185,6 +189,7 @@ test('workbench connects the AI split event and the plan dialog', () => {
 test('description planning works without crypto.randomUUID on HTTP and preserves existing images', () => {
   const notices = [], changes = []
   const api = evaluate(read('../app/composables/usePrevis.ts'), {
+    '~/composables/useApi': useApi,
     vue, 'vue-sonner': { toast: {} }, '../../../backend/src/services/previs-domain': domain,
     '../../../backend/src/services/previs-frame-contract': contract,
     '../../../backend/src/services/previs-video-reference-domain': reference,
@@ -286,6 +291,7 @@ test('generate resubmits with the refreshed revision after the service rejects a
     id: 4, revision: serverRevision, status: 'draft', busy: false, isCurrent: true, timeline: { panels: [panel()] },
   })
   const api = evaluate(read('../app/composables/usePrevis.ts'), {
+    '~/composables/useApi': useApi,
     vue, 'vue-sonner': { toast }, '../../../backend/src/services/previs-domain': domain,
     '../../../backend/src/services/previs-frame-contract': contract,
     '../../../backend/src/services/previs-video-reference-domain': reference,
@@ -384,6 +390,7 @@ test('adopted versions reset saved history and keep the old autosave timer cance
   const timers = new Set(), writes = []
   const payload = { id: 4, revision: 2, status: 'draft', busy: false, timeline: { panels: [panel()], groups: [], audio: [] } }
   const api = evaluate(read('../app/composables/usePrevis.ts'), {
+    '~/composables/useApi': useApi,
     vue: { ...vue, onUnmounted() {} }, 'vue-sonner': { toast: {} },
     '../../../backend/src/services/previs-domain': domain,
     '../../../backend/src/services/previs-frame-contract': contract,
@@ -406,6 +413,7 @@ test('late adoption responses cannot replace dirty edits or a newer accepted rev
   const notices = []
   const payload = { id: 4, revision: 2, status: 'draft', busy: false, timeline: { panels: [panel()], groups: [], audio: [] } }
   const api = evaluate(read('../app/composables/usePrevis.ts'), {
+    '~/composables/useApi': useApi,
     vue: { ...vue, onUnmounted() {} }, 'vue-sonner': { toast: { error: message => notices.push(message) } },
     '../../../backend/src/services/previs-domain': domain,
     '../../../backend/src/services/previs-frame-contract': contract,

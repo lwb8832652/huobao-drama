@@ -1,4 +1,5 @@
 import { frameKey, orderedFrames, type Panel } from './previs-domain.js'
+import { gridLayoutForCount } from './previs-frame-contract.js'
 
 export type ContactSheetStatus = 'none' | 'composing' | 'ready' | 'stale' | 'failed'
 export interface ContactSheetCell {
@@ -35,15 +36,17 @@ export interface ContactSheetView {
   totalFrames: number
   error: string | null
 }
-export function contactSheetLayout(count: number) {
+/**
+ * 联络表与分镜画面拆分共用同一套宫格布局（横屏基准 1×2/2×2/1×3/2×3/3×3），
+ * 竖屏按画面比例翻转列行，保证每个分格与画面同向；非标准数量向上取最近宫格留白。
+ */
+export function contactSheetLayout(count: number, aspectRatio?: string) {
   if (!Number.isInteger(count) || count < 1 || count > 9) throw new RangeError('宫格支持 1～9 张画面')
-  return count === 1 ? { columns: 1, rows: 1 }
-    : count === 2 ? { columns: 2, rows: 1 }
-    : count <= 4 ? { columns: 2, rows: 2 }
-    : count <= 6 ? { columns: 3, rows: 2 } : { columns: 3, rows: 3 }
+  const { columns, rows } = gridLayoutForCount(count, aspectRatio)
+  return { columns, rows }
 }
 export function contactSheetDescriptor(panel: Panel, aspectRatio: string): ContactSheetDescriptor {
-  const { columns, rows } = contactSheetLayout(panel.frames.length)
+  const { columns, rows } = contactSheetLayout(panel.frames.length, aspectRatio)
   const match = /^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/.exec(aspectRatio)
   if (!match || Number(match[1]) <= 0 || Number(match[2]) <= 0) throw new Error('项目画布比例无效')
   const ratio = Number(match[1]) / Number(match[2])

@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
-import { Check, Grid2X2, Loader2, RefreshCw, SlidersHorizontal, Sparkles, Trash2, Upload, X } from 'lucide-vue-next'
-import { uploadAPI } from '~/composables/useApi'
-import { FRAME_COUNT_MAX, frameKey, mediaUrl, orderedFrames, previsRequest,
+import { toast } from 'vue-sonner'
+import { Check, Eye, Grid2X2, History, Images, Loader2, RefreshCw, Scissors, Settings2, SlidersHorizontal, Sparkles, Trash2, Upload, X } from 'lucide-vue-next'
+import { isStaleChunkError, reloadStaleBundle, uploadAPI } from '~/composables/useApi'
+import { mapError } from '~/composables/useToast'
+import { i18n } from '~/composables/i18n'
+import { FRAME_COUNT_MAX, frameKey, gridLayoutForCount, mediaUrl, orderedFrames, previsRequest,
   type AnimaticVersion, type GridCandidate, type GridCapabilities, type GridMode, type Panel } from '~/composables/usePrevis'
 
 const props = defineProps<{
@@ -14,19 +17,26 @@ const props = defineProps<{
   aspectRatio?: string
   editable: boolean
   managementEditable?: boolean
+  /** 拆分任务提交中或排队中：与「分镜画面」的其他生成入口一致，按钮转圈并禁用。 */
+  splitting?: boolean
+  /** 视频输入的参考策略（逐张画面 / 整组宫格），在生成设置弹窗中调整。 */
+  referenceStrategy?: string
   beforeAction: () => Promise<{ versionId: number; revision: number } | false>
   commitAdoption: (versionId: number, candidateId: number, revision: number) => Promise<AnimaticVersion | false>
 }>()
-const emit = defineEmits<{ adopted: [version: AnimaticVersion]; busy: [value: boolean] }>()
+const emit = defineEmits<{ adopted: [version: AnimaticVersion]; busy: [value: boolean]; split: [options?: { force?: boolean }]; 'update:referenceStrategy': [value: string] }>()
 const capabilities = ref<GridCapabilities>()
 const candidates = ref<GridCandidate[]>([])
 const error = ref(''), submitting = ref(false), loading = ref(false)
-const resolution = ref('2K')
-const modal = ref<'review' | 'edit' | 'records' | ''>('')
-const planning = ref(false)
-const more = ref<HTMLDetailsElement>()
+/** 分辨率默认值：优先 1K；当前模型不支持时回退到其首个可用档位。 */
+const DEFAULT_RESOLUTION = '1K'
+/** 存储键带版本后缀：默认值调整后旧偏好一次性失效，确保新默认真正生效。 */
+const RESOLUTION_STORAGE_KEY = 'previs.grid-resolution.v2'
+const resolution = ref(DEFAULT_RESOLUTION)
+const modal = ref<'review' | 'edit' | 'settings' | ''>('')
 const review = ref<GridCandidate>()
-const confirmedReview = ref(false)
+/** 分镜画面预览：当前放大查看的画面格（frameId）；undefined 时取第一格 */
+const previewFrameId = ref<string>()
 const editMode = ref<GridMode>('grid_edit'), baseCandidate = ref<GridCandidate>()
 const selectedFrameIds = ref<string[]>([]), instruction = ref(''), instructions = ref<Record<string, string>>({})
 const dialog = ref<HTMLDialogElement>(), fileInput = ref<HTMLInputElement>()
@@ -40,19 +50,21 @@ const projectRatio = computed(() => props.aspectRatio || '16:9')
 const supportedResolutions = computed(() => [...new Set((capabilities.value?.sizes || [])
   .filter(size => size.aspectRatio === projectRatio.value).map(size => size.resolution))])
 const selectedSize = computed(() => capabilities.value?.sizes?.find(size => size.aspectRatio === projectRatio.value && size.resolution === resolution.value))
-const gridSide = computed(() => frames.value.length === 1 ? 1 : frames.value.length <= 4 ? 2 : 3)
-const predictedCell = computed(() => selectedSize.value && ({ width: Math.floor(selectedSize.value.width / gridSide.value), height: Math.floor(selectedSize.value.height / gridSide.value) }))
+const gridLayout = computed(() => gridLayoutForCount(frames.value.length, projectRatio.value))
+const predictedCell = computed(() => selectedSize.value && ({ width: Math.floor(selectedSize.value.width / gridLayout.value.columns), height: Math.floor(selectedSize.value.height / gridLayout.value.rows) }))
 const canSubmit = computed(() => props.editable && validFrameCount.value && !!capabilities.value?.enabled && !!selectedSize.value && !paidBusy.value)
 const canGenerate = computed(() => canSubmit.value && frames.value.every(frame => !frame.locked))
 const canGridEdit = computed(() => canSubmit.value && !!capabilities.value?.supportsEdit && frames.value.every(frame => frame.url) && frames.value.some(frame => !frame.locked))
 const canFrameEdit = computed(() => canSubmit.value && !!capabilities.value?.supportsEdit && frames.value.some(frame => frame.url && !frame.locked))
+/** 重新拆分分镜画面：与生成/微调解耦，只要求版本可编辑且已有画面。 */
+const canResplit = computed(() => props.editable && !props.splitting && validFrameCount.value)
 const editFrames = computed(() => baseCandidate.value
   ? [...baseCandidate.value.grid.cells].sort((a, b) => a.index - b.index)
     .map(cell => frames.value.find(frame => frameKey(frame) === cell.frameId)).filter((frame): frame is NonNullable<typeof frame> => !!frame)
   : frames.value)
-const currentGridSlots = computed(() => Array.from({ length: gridSide.value ** 2 }, (_, index) => ({ index, frame: frames.value[index] })))
-const currentGridStyle = computed(() => ({ gridTemplateColumns: `repeat(${gridSide.value}, minmax(0, 1fr))`,
-  gridTemplateRows: `repeat(${gridSide.value}, minmax(0, 1fr))`, aspectRatio: projectRatio.value.replace(':', ' / ') }))
+const currentGridSlots = computed(() => Array.from({ length: gridLayout.value.columns * gridLayout.value.rows }, (_, index) => ({ index, frame: frames.value[index] })))
+const currentGridStyle = computed(() => ({ gridTemplateColumns: `repeat(${gridLayout.value.columns}, minmax(0, 1fr))`,
+  gridTemplateRows: `repeat(${gridLayout.value.rows}, minmax(0, 1fr))`, aspectRatio: projectRatio.value.replace(':', ' / ') }))
 function editFrameNumber(frame: Panel['frames'][number]) {
   return (baseCandidate.value?.grid.cells.find(cell => cell.frameId === frameKey(frame))?.index ?? frames.value.findIndex(item => frameKey(item) === frameKey(frame))) + 1
 }
@@ -63,19 +75,79 @@ const editValid = computed(() => selectedFrameIds.value.length > 0 && selectedFr
   && (editMode.value !== 'frame_edit' || (selectedFrameIds.value.length === 1 && !!selectedFrames.value[0]?.url))
   && selectedFrameIds.value.every(id => instruction.value.trim() || instructions.value[id]?.trim()))
 const visibleCandidates = computed(() => candidates.value.filter(candidate => candidate.status !== 'discarded'))
-const activeCandidates = computed(() => visibleCandidates.value.filter(candidate => candidate.status !== 'adopted'))
-const reviewCells = computed(() => !review.value ? [] : review.value.mode === 'frame_edit'
-  ? review.value.grid.cells.filter(cell => review.value!.targetFrameIds.includes(cell.frameId)).map(cell => ({ ...cell, index: 0, number: cell.index + 1 }))
-  : review.value.grid.cells.map(cell => ({ ...cell, number: cell.index + 1 })))
+const activeCandidates = computed(() => visibleCandidates.value.filter(candidate => candidate.status !== 'adopted'
+  // 整组生成完成即自动采用，ready 只是瞬时状态；仅当自动采用失败（带上错误）才需要人工介入
+  && !(candidate.mode === 'generate' && candidate.status === 'ready' && !candidate.error)))
+/**
+ * 生成记录按「版本」分组（新版本在上）：一版 = 一次整组生成/上传替换及其后续微调，
+ * 同版本内候选画面结构相同、可自由切换采用；跨版本采用也可，只要画面规划结构未变。
+ */
+const candidateBatches = computed(() => {
+  const groups = new Map<number, GridCandidate[]>()
+  for (const candidate of [...visibleCandidates.value].sort((a, b) => b.id - a.id))
+    groups.set(candidate.batchNo, [...(groups.get(candidate.batchNo) || []), candidate])
+  return [...groups.entries()].sort((a, b) => b[0] - a[0]).map(([batchNo, items]) => ({ batchNo, items }))
+})
+/** 版本号标签（batch_no 的展示）：V1/V2/… = 第几次整组生成；0 = 版本概念上线前的历史候选 */
+const versionLabel = (batchNo: number) => batchNo > 0 ? `V${batchNo}` : '历史生成'
+/** 分镜画面预览的格列表：frame_edit 为单格（整图即该画面），其余按宫格 index 排序 */
+const reviewThumbs = computed(() => {
+  if (!review.value) return []
+  if (review.value.mode === 'frame_edit') {
+    const cell = review.value.grid.cells.find(cell => review.value!.targetFrameIds.includes(cell.frameId)) || review.value.grid.cells[0]
+    // 单格精修保留该格在原宫格中的编号，便于对照
+    return cell ? [{ frameId: cell.frameId, number: cell.index + 1 }] : []
+  }
+  return [...review.value.grid.cells].sort((a, b) => a.index - b.index)
+    .map(cell => ({ frameId: cell.frameId, number: cell.index + 1 }))
+})
+/** 预览大图选中的格；未选中时回退到第一格 */
+const activePreviewThumb = computed(() => reviewThumbs.value.find(thumb => thumb.frameId === previewFrameId.value) || reviewThumbs.value[0])
+function previewCellStyle(candidate: GridCandidate, frameId: string) {
+  if (candidate.mode === 'frame_edit') {
+    return { backgroundImage: `url("${mediaUrl(candidate.previewUrl || '')}")`, backgroundSize: 'cover',
+      backgroundPosition: 'center', aspectRatio: `${candidate.width || 1} / ${candidate.height || 1}` }
+  }
+  return candidateCropStyle(candidate, frameId)
+}
+/** 放大格对应的画面标题（若该格映射到当前画面） */
+const activePreviewFrame = computed(() => activePreviewThumb.value && frames.value.find(frame => frameKey(frame) === activePreviewThumb.value!.frameId))
 let token = 0, mounted = false, disposed = false
 let polling: ReturnType<typeof setTimeout> | undefined
 let previousFocus: HTMLElement | null = null
 const discardedIds = new Set<number>()
+/** 候选上一次可见的状态，用于识别「整组生成 → 服务端自动采用」的完成时刻 */
+const candidateStatuses = new Map<number, string>()
 let contextKey = ''
 const currentContextKey = () => `${props.versionId}:${props.panel.id}:${props.configId || ''}:${props.model || ''}:${props.aspectRatio || ''}`
 const path = () => `/animatic-versions/${props.versionId}/grid-candidates`
 const active = (requestToken: number, versionId: number, panelId: number) => !disposed && requestToken === token && props.versionId === versionId && props.panel.id === panelId
-function failure(cause: unknown, fallback: string) { error.value = cause instanceof Error ? cause.message : (cause as { message?: string })?.message || fallback }
+/** mapError 认不出时的兜底文案；用于区分「有分类的友好文案」与「语境化兜底」。 */
+const UNKNOWN_ERROR_TEXT = i18n.global.t('errors.unknown')
+/**
+ * 内联错误的唯一出口：统一走 mapError，把网络层失败显示成「无法连接服务器…」这类可读文案，
+ * 而不是把浏览器裸的英文 `Failed to fetch` 直接印在界面上（那是排障信息，不该给用户看）。
+ * 原始错误连端点一起进 DevTools——并发打多个接口时，要能一眼看出是哪一条挂了。
+ *
+ * 陈旧 bundle（部署后停留在旧页面）是特例：动态 import 的 chunk 已被新构建删除，重试接口、
+ * 刷新数据都没有意义，直接整页重载自愈；冷却期内仍失败才展示文案，且不拼端点——
+ * 失败与具体接口无关，拼上只会把排障方向带偏。
+ */
+function failure(cause: unknown, fallback: string, endpoint = '') {
+  if (isStaleChunkError(cause)) {
+    console.error(`[grid] 检测到已失效的前端资源${endpoint ? `（操作 ${endpoint.split('?')[0]}）` : ''}`, cause)
+    if (reloadStaleBundle()) return
+    error.value = mapError(cause)
+    return
+  }
+  const friendly = mapError(cause)
+  // 端点拼进可见文案（去掉 query 只留路径）。网络层失败本身不带任何定位信息，排障时
+  // 最要紧的是知道「哪一条接口挂了」——此前只能开 DevTools 看 console，门槛太高。
+  // 其余对 error.value 的赋值都是整串替换，因此不会残留上一个端点的后缀。
+  const where = endpoint ? `（${endpoint.split('?')[0]}）` : ''
+  error.value = (friendly === UNKNOWN_ERROR_TEXT ? fallback : friendly) + where
+  console.error(`[grid] ${fallback}${endpoint ? ` ← ${endpoint}` : ''}`, cause)
+}
 function stopPolling() { clearTimeout(polling); polling = undefined }
 function schedulePolling(requestToken: number, versionId: number, panelId: number) {
   stopPolling()
@@ -87,6 +159,13 @@ async function refreshCandidates(requestToken = token, versionId = props.version
     const result = await previsRequest<{ items: GridCandidate[] }>(`/animatic-versions/${versionId}/grid-candidates?panel_id=${panelId}`)
     if (!active(requestToken, versionId, panelId)) return
     candidates.value = result.items.filter(candidate => !discardedIds.has(candidate.id))
+    for (const candidate of candidates.value) {
+      const previous = candidateStatuses.get(candidate.id)
+      candidateStatuses.set(candidate.id, candidate.status)
+      // 整组生成无需审核：服务端完成后自动切分写入画面，这里只提示结果
+      if (candidate.mode === 'generate' && previous && ['pending', 'processing'].includes(previous)
+        && candidate.status === 'adopted') toast.success('宫格已生成，画面已自动拆分')
+    }
     if (review.value) review.value = result.items.find(candidate => candidate.id === review.value!.id) || review.value
   } catch (cause) {
     if (active(requestToken, versionId, panelId)) failure(cause, '候选图进度读取失败，可点击刷新重试')
@@ -104,19 +183,26 @@ async function loadContext() {
   const query = new URLSearchParams()
   if (props.configId) query.set('config_id', String(props.configId))
   if (props.model) query.set('model', props.model)
+  // 两条请求各自带上「人话 + 端点」：并发发出去，报错时要能指认是哪一条挂的
+  const requests = [
+    { path: `/previs/grid-capabilities?${query}`, fallback: '宫格能力读取失败' },
+    { path: `/animatic-versions/${versionId}/grid-candidates?panel_id=${panelId}`, fallback: '候选图读取失败' },
+  ]
   const results = await Promise.allSettled([
-    previsRequest<GridCapabilities>(`/previs/grid-capabilities?${query}`),
-    previsRequest<{ items: GridCandidate[] }>(`/animatic-versions/${versionId}/grid-candidates?panel_id=${panelId}`),
+    previsRequest<GridCapabilities>(requests[0].path),
+    previsRequest<{ items: GridCandidate[] }>(requests[1].path),
   ])
   if (!active(requestToken, versionId, panelId)) return
   for (const [index, result] of results.entries()) {
-    if (result.status === 'rejected') { failure(result.reason, '宫格能力或候选图读取失败'); continue }
+    if (result.status === 'rejected') { failure(result.reason, requests[index].fallback, requests[index].path); continue }
     if (index === 0) {
       capabilities.value = result.value as GridCapabilities
       const supported = supportedResolutions.value
-      if (!supported.includes(resolution.value)) resolution.value = supported[0] || '2K'
+      if (!supported.includes(resolution.value)) resolution.value = supported.includes(DEFAULT_RESOLUTION) ? DEFAULT_RESOLUTION : (supported[0] || DEFAULT_RESOLUTION)
     } else candidates.value = (result.value as { items: GridCandidate[] }).items
   }
+  // 初次载入的状态是基线，不触发完成提示
+  for (const candidate of candidates.value) candidateStatuses.set(candidate.id, candidate.status)
   loading.value = false
   schedulePolling(requestToken, versionId, panelId)
 }
@@ -156,13 +242,18 @@ async function submitCandidate(mode: GridMode) {
     const result = await previsRequest<{ items: GridCandidate[] }>(`/animatic-versions/${versionId}/grid-candidates`, 'POST',
       { revision: saved.revision, panelIds: [panelId], mode, ...chosenModel, ...(mode === 'generate' ? {} : edit) })
     if (!active(requestToken, versionId, panelId)) return
-    for (const candidate of result.items) candidates.value = [candidate, ...candidates.value.filter(item => item.id !== candidate.id)]
-    if (result.items[0]) reviewCandidate(result.items[0])
+    for (const candidate of result.items) {
+      candidates.value = [candidate, ...candidates.value.filter(item => item.id !== candidate.id)]
+      candidateStatuses.set(candidate.id, candidate.status)
+    }
+    // 整组生成免审核：完成后服务端直接切分写入画面，不再弹审核窗口；微调仍需人工确认
+    if (result.items[0] && mode !== 'generate') reviewCandidate(result.items[0])
     schedulePolling(requestToken, versionId, panelId)
   } catch (cause) { if (active(requestToken, versionId, panelId)) failure(cause, '宫格任务提交失败') }
   finally { if (active(requestToken, versionId, panelId)) submitting.value = false }
 }
 function generateGrid() { return submitCandidate('generate') }
+function resplit() { if (canResplit.value) emit('split', { force: true }) }
 function submitEdit() { return submitCandidate(editMode.value) }
 function refineFrame(edit: { frameId: string; mode: 'grid_edit' | 'frame_edit'; instruction: string }) {
   const frame = frames.value.find(frame => frameKey(frame) === edit.frameId)
@@ -172,16 +263,11 @@ function refineFrame(edit: { frameId: string; mode: 'grid_edit' | 'frame_edit'; 
   selectedFrameIds.value = [edit.frameId]; instruction.value = edit.instruction.trim(); instructions.value = {}
   return submitCandidate(edit.mode)
 }
-function togglePlanning() {
-  planning.value = !planning.value
-  if (more.value) more.value.open = false
-}
-function openModal(kind: 'review' | 'edit' | 'records') {
-  if (more.value) more.value.open = false
+function openModal(kind: 'review' | 'edit' | 'settings') {
   if (!modal.value && typeof document !== 'undefined') previousFocus = document.activeElement as HTMLElement
   modal.value = kind
 }
-function reviewCandidate(candidate: GridCandidate) { confirmedReview.value = false; review.value = candidate; openModal('review') }
+function reviewCandidate(candidate: GridCandidate) { previewFrameId.value = undefined; review.value = candidate; openModal('review') }
 function closeModal() {
   modal.value = ''; review.value = undefined; baseCandidate.value = undefined
   dialog.value?.close()
@@ -223,7 +309,7 @@ function modeLabel(candidate: GridCandidate) { return candidate.mode === 'genera
 function statusLabel(candidate: GridCandidate) { return ({ pending: '排队中', processing: '生成中', ready: '待采用', failed: '失败', adopted: '已采用', discarded: '已丢弃' })[candidate.status] }
 async function adoptCandidate() {
   const candidate = review.value
-  if (!props.editable || submitting.value || !confirmedReview.value || !candidate || candidate.status !== 'ready' || !candidate.previewUrl) return
+  if (!props.editable || submitting.value || !candidate || candidate.status !== 'ready' || !candidate.previewUrl) return
   const requestToken = token, versionId = props.versionId, panelId = props.panel.id
   submitting.value = true; error.value = ''
   try {
@@ -232,7 +318,8 @@ async function adoptCandidate() {
     const result = await props.commitAdoption(versionId, candidate.id, saved.revision)
     if (!active(requestToken, versionId, panelId)) return
     if (!result) { error.value = '候选已在服务端采用，请保留本地草稿并刷新工作版'; return }
-    candidates.value = candidates.value.map(item => item.id === candidate.id ? { ...item, status: 'adopted' } : item)
+    // 与服务端一致：同一分镜只保留一个采用结果，旧采用记录回退为待采用
+    candidates.value = candidates.value.map(item => item.id === candidate.id ? { ...item, status: 'adopted' } : item.status === 'adopted' ? { ...item, status: 'ready' } : item)
     emit('adopted', result); closeModal()
   } catch (cause) { if (active(requestToken, versionId, panelId)) failure(cause, '采用失败，请刷新候选图后重试') }
   finally {
@@ -277,18 +364,21 @@ async function uploadGrid(event: Event) {
     const result = await previsRequest<GridCandidate>(`/animatic-versions/${versionId}/grid-candidates/upload`, 'POST',
       { revision: saved.revision, panelId, url: uploaded.path || uploaded.url })
     if (!active(requestToken, versionId, panelId)) return
-    candidates.value = [result, ...candidates.value]
-    reviewCandidate(result)
+    candidates.value = [result, ...candidates.value.filter(item => item.id !== result.id)]
+    candidateStatuses.set(result.id, result.status)
+    // 上传替换同样免审核：服务端已自动切分；未自动采用时回退到人工确认
+    if (result.status === 'adopted') toast.success('宫格已上传，画面已自动拆分')
+    else reviewCandidate(result)
   } catch (cause) { if (active(requestToken, versionId, panelId)) failure(cause, '宫格上传失败') }
   finally { if (active(requestToken, versionId, panelId)) submitting.value = false }
 }
 watch(modal, async value => { if (value) { await nextTick(); if (modal.value && !dialog.value?.open) dialog.value?.showModal() } })
 watch(paidBusy, value => emit('busy', value), { flush: 'sync' })
-watch(resolution, value => { try { localStorage.setItem('previs.grid-resolution', value) } catch {} })
+watch(resolution, value => { try { localStorage.setItem(RESOLUTION_STORAGE_KEY, value) } catch {} })
 watch(() => [props.versionId, props.panel.id, props.configId, props.model, props.aspectRatio], () => { if (mounted) void loadContext() })
 onMounted(() => {
   mounted = true
-  try { resolution.value = localStorage.getItem('previs.grid-resolution') || '2K' } catch {}
+  try { resolution.value = localStorage.getItem(RESOLUTION_STORAGE_KEY) || DEFAULT_RESOLUTION } catch {}
   return loadContext()
 })
 onBeforeUnmount(() => { disposed = true; token++; stopPolling(); closeModal(); emit('busy', false) })
@@ -299,22 +389,15 @@ onBeforeUnmount(() => { disposed = true; token++; stopPolling(); closeModal(); e
     <header class="grid-toolbar">
       <div class="grid-heading"><Grid2X2 :size="15" /><strong>分镜画面</strong><small>{{ frames.filter(frame => frame.url).length }} / {{ frames.length }} 张已就绪</small></div>
       <div class="grid-actions">
-        <button type="button" class="btn btn-primary btn-sm" data-testid="grid-generate" :disabled="!canGenerate" @click="generateGrid"><Loader2 v-if="paidBusy" :size="13" class="grid-spin" /><Sparkles v-else :size="13" />{{ frames.some(frame => frame.url) ? '重新生成宫格' : '生成宫格' }}</button>
+        <button type="button" class="btn btn-primary btn-sm" data-testid="grid-generate" :disabled="!canGenerate" @click="generateGrid"><Loader2 v-if="paidBusy" :size="13" class="grid-spin" /><Sparkles v-else :size="13" />{{ frames.some(frame => frame.url) ? '重新生成' : '生成宫格' }}</button>
         <button type="button" class="btn btn-sm" data-testid="grid-edit" :disabled="!canGridEdit" @click="openEdit('grid_edit')"><SlidersHorizontal :size="12" />微调画面</button>
-        <details ref="more" class="grid-more">
-          <summary class="btn btn-sm" aria-label="更多分镜操作">更多</summary>
-          <div class="grid-more-content">
-            <button type="button" class="btn btn-sm" data-testid="grid-edit-planning" @click="togglePlanning">{{ planning ? '返回宫格' : '编辑规划' }}</button>
-            <label class="grid-resolution"><span>生成设置 · 分辨率</span><select v-model="resolution" aria-label="宫格生成分辨率" :disabled="paidBusy || !editable || !supportedResolutions.length"><option v-for="option in supportedResolutions" :key="option" :value="option">{{ option }}</option></select></label>
-            <p v-if="validFrameCount && selectedSize && predictedCell" class="grid-hint">{{ gridSide }} × {{ gridSide }} 宫格 · {{ projectRatio }} · 原生输出 {{ selectedSize.width }} × {{ selectedSize.height }}px · 每格约 {{ predictedCell.width }} × {{ predictedCell.height }}px<template v-if="gridSide * gridSide > frames.length"> · {{ gridSide * gridSide - frames.length }} 个留白格</template></p>
-            <button type="button" class="btn btn-sm" :disabled="!editable || paidBusy || !validFrameCount || frames.some(frame => frame.locked)" @click="fileInput?.click()"><Upload :size="12" />上传替换宫格</button>
-            <button type="button" class="btn btn-sm" data-testid="grid-records" @click="openModal('records')">生成记录 {{ visibleCandidates.length || '' }}</button>
-            <button type="button" class="btn btn-sm" aria-label="刷新宫格候选" :disabled="loading || submitting" @click="loadContext"><RefreshCw :size="13" />刷新候选</button>
-          </div>
-        </details>
+        <button type="button" class="btn btn-sm" data-testid="grid-resplit" :disabled="!canResplit"
+          :title="splitting ? '拆分任务进行中' : (!editable ? '当前版本不可编辑（已锁定或任务执行中）' : '按新方案重新拆分本镜头的分镜画面，已生成的图片保留在画面历史中')"
+          @click="resplit"><Loader2 v-if="splitting" :size="12" class="grid-spin" /><Scissors v-else :size="12" />{{ splitting ? '拆分中' : '重新拆分画面' }}</button>
+        <button type="button" class="btn btn-sm" data-testid="grid-settings" :disabled="loading && !capabilities" @click="openModal('settings')"><Settings2 :size="12" />生成设置</button>
       </div>
     </header>
-    <slot :planning="planning" :refine-frame="refineFrame" :can-refine-grid="canGridEdit" :can-refine-frame="canFrameEdit" />
+    <slot :refine-frame="refineFrame" :can-refine-grid="canGridEdit" :can-refine-frame="canFrameEdit" />
     <input ref="fileInput" class="grid-file-input" type="file" accept="image/*" aria-label="上传整组宫格" @change="uploadGrid">
     <p v-if="!validFrameCount" class="grid-hint">先规划 1–9 张画面，再生成宫格。</p>
     <p v-else-if="capabilities && !capabilities.enabled" class="grid-hint">{{ capabilities.reason || '当前图片模型不支持整组宫格，请切换模型' }}</p>
@@ -333,17 +416,53 @@ onBeforeUnmount(() => { disposed = true; token++; stopPolling(); closeModal(); e
   </section>
 
   <Teleport to="body">
-    <dialog v-if="modal" ref="dialog" class="grid-dialog" :aria-labelledby="titleId" @cancel.prevent="closeModal" @click.self="closeModal" @keydown.stop>
-      <header><div><h2 :id="titleId">{{ modal === 'edit' ? '微调画面' : modal === 'records' ? '生成记录' : '宫格候选审核' }}</h2><p>{{ modal === 'edit' ? '选择要修改的画面，每次提交生成一个候选' : modal === 'records' ? '查看历史候选与采用记录' : '关闭窗口会保留候选；确认采用后更新对应画面' }}</p></div><button type="button" class="btn btn-icon" aria-label="关闭宫格窗口" @click="closeModal"><X :size="18" /></button></header>
+    <dialog v-if="modal" ref="dialog" class="grid-dialog" :class="{ 'grid-dialog-settings': modal === 'settings', 'grid-dialog-review': modal === 'review' }" :aria-labelledby="titleId" @cancel.prevent="closeModal" @click.self="closeModal" @keydown.stop>
+      <header><div><h2 :id="titleId">{{ modal === 'settings' ? '生成设置' : modal === 'edit' ? '微调画面' : '分镜画面预览' }}</h2><p>{{ modal === 'settings' ? '画面参考、分辨率与生成记录，设置即刻生效并沿用' : modal === 'edit' ? '选择要修改的画面，每次提交生成一个候选' : '逐格预览候选画面；采用后更新对应分镜画面' }}</p></div><button type="button" class="btn btn-icon" aria-label="关闭宫格窗口" @click="closeModal"><X :size="18" /></button></header>
       <div class="grid-dialog-body">
-        <div v-if="modal === 'records'" class="grid-candidates" data-testid="grid-candidate-records">
-          <p v-if="!visibleCandidates.length" class="grid-hint">暂无生成记录。</p>
-          <button v-for="candidate in visibleCandidates" :key="candidate.id" type="button" class="grid-candidate" :data-candidate-id="candidate.id" @click="reviewCandidate(candidate)">
-            <img v-if="candidate.previewUrl && candidate.status !== 'failed'" :src="mediaUrl(candidate.previewUrl)" alt="宫格候选缩略图">
-            <span v-else class="grid-candidate-placeholder"><Grid2X2 :size="18" /></span>
-            <span><strong>{{ modeLabel(candidate) }} · {{ statusLabel(candidate) }}</strong><small>{{ candidate.error || `${candidate.resolution || ''}${perCellPixels(candidate) ? ` · 每格 ${perCellPixels(candidate)!.width} × ${perCellPixels(candidate)!.height}px` : ''}` }}</small></span>
-          </button>
-        </div>
+        <template v-if="modal === 'settings'">
+          <section class="grid-settings-section">
+            <h3><Eye :size="13" />画面预览</h3>
+            <div class="grid-settings-preview-wrap">
+              <div class="grid-settings-preview" :style="{ ...currentGridStyle, height: 'min(300px, 58vw)' }" data-testid="grid-settings-preview">
+                <div v-for="slot in currentGridSlots" :key="slot.index" class="grid-settings-preview-cell">
+                  <img v-if="slot.frame?.url" :src="mediaUrl(slot.frame.url)" :alt="`画面 ${slot.index + 1}`">
+                  <span v-else class="grid-settings-preview-empty">{{ slot.index + 1 }}</span>
+                </div>
+              </div>
+            </div>
+            <p class="grid-hint">当前分镜 {{ frames.filter(frame => frame.url).length }} / {{ frames.length }} 张画面已就绪<template v-if="gridLayout.count > frames.length"> · {{ gridLayout.count - frames.length }} 个留白格</template>。</p>
+          </section>
+          <section v-if="referenceStrategy !== undefined" class="grid-settings-section">
+            <h3><Images :size="13" />画面参考</h3>
+            <label class="grid-reference-select">参考方式<select :value="referenceStrategy || 'auto'" aria-label="画面参考方式" :disabled="!editable" @change="emit('update:referenceStrategy', ($event.target as HTMLSelectElement).value)"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
+            <p class="grid-hint">决定生成视频时按逐张画面还是整组宫格提供参考；设置即刻生效并沿用。</p>
+          </section>
+          <section class="grid-settings-section">
+            <h3><SlidersHorizontal :size="13" />输出设置</h3>
+            <label class="grid-resolution"><span>分辨率</span><select v-model="resolution" aria-label="宫格生成分辨率" :disabled="paidBusy || !editable || !supportedResolutions.length"><option v-for="option in supportedResolutions" :key="option" :value="option">{{ option }}</option></select></label>
+            <p v-if="validFrameCount && selectedSize && predictedCell" class="grid-hint">{{ gridLayout.label }} 宫格 · {{ projectRatio }} · 原生输出 {{ selectedSize.width }} × {{ selectedSize.height }}px · 每格约 {{ predictedCell.width }} × {{ predictedCell.height }}px<template v-if="gridLayout.count > frames.length"> · {{ gridLayout.count - frames.length }} 个留白格</template></p>
+            <p v-else-if="capabilities && !supportedResolutions.length" class="grid-hint">当前模型未提供 {{ projectRatio }} 的原生输出尺寸，请切换图片模型。</p>
+          </section>
+          <section class="grid-settings-section">
+            <h3><History :size="13" />生成记录<em class="grid-settings-count">{{ visibleCandidates.length }}</em></h3>
+            <div class="grid-settings-actions">
+              <button type="button" class="btn btn-sm" :disabled="!editable || paidBusy || !validFrameCount || frames.some(frame => frame.locked)" @click="fileInput?.click()"><Upload :size="12" />上传替换宫格</button>
+              <button type="button" class="btn btn-sm" aria-label="刷新宫格候选" :disabled="loading || submitting" @click="loadContext"><RefreshCw :size="13" />刷新候选</button>
+            </div>
+            <div class="grid-candidates" data-testid="grid-candidate-records">
+              <p v-if="!visibleCandidates.length" class="grid-hint">暂无生成记录。</p>
+              <template v-for="batch in candidateBatches" :key="batch.batchNo">
+                <p class="grid-batch-head">{{ versionLabel(batch.batchNo) }} · {{ batch.items.length }} 个候选<em v-if="batch.items.some(c => c.status === 'adopted')" class="grid-batch-current">当前采用中</em></p>
+                <button v-for="candidate in batch.items" :key="candidate.id" type="button" class="grid-candidate" :class="{ current: candidate.status === 'adopted' }" :data-candidate-id="candidate.id" @click="reviewCandidate(candidate)">
+                  <img v-if="candidate.previewUrl && candidate.status !== 'failed'" :src="mediaUrl(candidate.previewUrl)" alt="宫格候选缩略图">
+                  <span v-else class="grid-candidate-placeholder"><Grid2X2 :size="18" /></span>
+                  <span><strong>{{ modeLabel(candidate) }} · {{ statusLabel(candidate) }}</strong><small>{{ candidate.error || `${candidate.resolution || ''}${perCellPixels(candidate) ? ` · 每格 ${perCellPixels(candidate)!.width} × ${perCellPixels(candidate)!.height}px` : ''}` }}</small></span>
+                  <em v-if="candidate.status === 'adopted'" class="grid-candidate-current">当前</em>
+                </button>
+              </template>
+            </div>
+          </section>
+        </template>
         <template v-else-if="modal === 'edit'">
           <p class="grid-hint">{{ baseCandidate ? '输入为此候选整图。仅选择的格子会在采用时更新。' : editMode === 'frame_edit' ? '输入为选中画面的当前原图。其余画面不参与本次精修。' : '输入为当前所有原图重新拼成的宫格。采用时只更新选择的画面。' }}</p>
           <div v-if="baseCandidate" class="grid-preview" :style="{ aspectRatio: `${baseCandidate.width || 1} / ${baseCandidate.height || 1}` }"><img :src="mediaUrl(baseCandidate.previewUrl || '')" alt="微调输入宫格"><button v-for="cell in baseCandidate.grid.cells" :key="cell.frameId" type="button" class="grid-cell selectable" :class="{ selected: selectedFrameIds.includes(cell.frameId) }" :disabled="submitting || !editable || !frames.some(frame => frameKey(frame) === cell.frameId && !frame.locked)" :style="cellStyle(baseCandidate, cell.index)" :aria-pressed="selectedFrameIds.includes(cell.frameId)" :aria-label="`选择宫格画面 ${cell.index + 1}`" @click="toggleFrame(cell.frameId)"><span>{{ cell.index + 1 }}</span><Check v-if="selectedFrameIds.includes(cell.frameId)" :size="18" /></button></div>
@@ -369,44 +488,92 @@ onBeforeUnmount(() => { disposed = true; token++; stopPolling(); closeModal(); e
           <p class="grid-hint">已选 {{ selectedFrameIds.length }} 张画面 · {{ resolution }} / {{ projectRatio }}。{{ editMode === 'frame_edit' ? '单格精修只允许选择 1 张已有原图的画面。' : '留白格不参与选择，每张选中画面都需要共同或单独指令。' }}</p>
         </template>
         <template v-else-if="review">
-          <div class="grid-review-meta"><strong>{{ modeLabel(review) }} · {{ statusLabel(review) }}</strong><span>{{ review.resolution }}<template v-if="review.width && review.height"> · {{ review.width }} × {{ review.height }}px</template></span></div>
-          <p v-if="perCellPixels(review)" class="grid-hint">实际每格 {{ perCellPixels(review)!.width }} × {{ perCellPixels(review)!.height }}px · 采用会更新 {{ review.adoptFrameIds.length }} 张画面</p>
-          <p v-if="review.error" role="alert" class="grid-error">{{ review.error }}</p>
-          <div v-if="review.status !== 'failed' && review.previewUrl" class="grid-comparison">
-            <figure v-if="review.baseUrl"><figcaption>修改前</figcaption><img :src="mediaUrl(review.baseUrl)" alt="修改前原图"></figure>
-            <figure><figcaption>{{ review.mode === 'generate' ? '待采用宫格' : '修改后候选' }}</figcaption><div class="grid-preview" :style="{ aspectRatio: `${review.width || 1} / ${review.height || 1}` }"><img :src="mediaUrl(review.previewUrl)" alt="待采用宫格"><span v-for="cell in reviewCells" :key="cell.frameId" class="grid-cell" :style="cellStyle(review, cell.index)"><span>{{ cell.number }}</span></span></div></figure>
+          <div class="grid-preview-shell">
+            <aside class="grid-preview-panel">
+              <div class="grid-preview-section-title"><span>分镜画面预览</span><span class="grid-preview-state" :class="{ 'is-ready': review.status === 'adopted', 'is-failed': review.status === 'failed' }">{{ review.status === 'adopted' ? '当前采用中' : statusLabel(review) }}</span></div>
+              <div v-if="review.status !== 'failed' && review.previewUrl && activePreviewThumb" class="grid-preview-main" :style="previewCellStyle(review, activePreviewThumb.frameId)" :data-preview-frame="activePreviewThumb.frameId">
+                <span class="grid-preview-main-badge">画面 {{ activePreviewThumb.number }}<template v-if="activePreviewFrame?.title"> · {{ activePreviewFrame.title }}</template></span>
+              </div>
+              <div v-else-if="['pending', 'processing'].includes(review.status)" class="grid-preview-main grid-preview-main-wait"><Loader2 :size="26" class="grid-spin" /><strong>{{ statusLabel(review) }}…</strong></div>
+              <div v-else class="grid-preview-main grid-preview-main-empty">生成失败，暂无画面</div>
+              <div v-if="reviewThumbs.length > 1" class="grid-preview-thumbs" data-testid="grid-preview-thumbs">
+                <button v-for="thumb in reviewThumbs" :key="thumb.frameId" type="button" class="grid-preview-thumb" :class="{ current: thumb.frameId === activePreviewThumb?.frameId }" :aria-pressed="thumb.frameId === activePreviewThumb?.frameId" @click="previewFrameId = thumb.frameId">
+                  <span class="grid-preview-thumb-media" :style="previewCellStyle(review, thumb.frameId)" />
+                  <span class="grid-preview-thumb-number">{{ thumb.number }}</span>
+                </button>
+              </div>
+              <div class="grid-preview-meta-row">
+                <div class="grid-preview-meta-item"><span>生成模式</span><strong>{{ modeLabel(review) }}</strong></div>
+                <div class="grid-preview-meta-item"><span>分辨率</span><strong>{{ review.resolution || '—' }}<template v-if="perCellPixels(review)"> · 每格 {{ perCellPixels(review)!.width }} × {{ perCellPixels(review)!.height }}px</template></strong></div>
+              </div>
+            </aside>
+            <section class="grid-preview-side">
+              <div class="grid-preview-section-title"><span>候选信息</span><span v-if="review.width && review.height" class="dim">{{ review.width }} × {{ review.height }}px · {{ review.adoptFrameIds.length }} 张画面 · {{ versionLabel(review.batchNo) }}</span></div>
+              <p v-if="review.error" role="alert" class="grid-error">{{ review.error }}</p>
+              <p v-if="review.status === 'ready'" class="grid-hint">采用后该候选会切分并更新对应画面，原画面保留在画面历史中。</p>
+              <p v-else-if="review.status === 'adopted'" class="grid-hint">该候选正在使用中，即为当前分镜画面。</p>
+              <p v-else-if="['pending', 'processing'].includes(review.status)" class="grid-hint">候选生成中，可以关闭窗口，进度会继续更新；取消后已提交给模型的请求可能仍产生费用。</p>
+              <template v-if="review.status === 'failed'">
+                <p class="grid-hint">返回的原图未通过检查，暂时无法采用。</p>
+                <img v-if="review.rawUrl" class="grid-preview-raw" :src="mediaUrl(review.rawUrl)" alt="未通过检查的返回原图">
+              </template>
+              <div class="grid-preview-actions">
+                <button v-if="review.status === 'ready'" type="button" class="btn btn-primary btn-sm" data-testid="grid-adopt" :disabled="!editable || submitting || !review.previewUrl" @click="adoptCandidate"><Loader2 v-if="submitting" :size="13" class="grid-spin" /><Check v-else :size="13" />{{ review.mode === 'generate' ? '采用并切分为当前画面' : '采用为当前画面' }}</button>
+                <button v-if="review.status === 'ready' && review.mode !== 'frame_edit'" type="button" class="btn btn-sm" :disabled="!editable || paidBusy || !capabilities?.supportsEdit" @click="openEdit('grid_edit', review)"><SlidersHorizontal :size="13" />基于此候选继续微调</button>
+                <button v-if="review.status === 'failed' && review.rawUrl" type="button" class="btn btn-sm" :disabled="!editable || submitting" @click="processCandidate(review)">重新检查并切分（本地处理）</button>
+                <button v-if="review.status !== 'adopted'" type="button" class="btn btn-sm grid-discard" :disabled="!canManage || submitting" @click="discardCandidate(review)"><Trash2 :size="13" />{{ ['pending', 'processing'].includes(review.status) ? '取消候选' : '丢弃候选' }}</button>
+              </div>
+            </section>
           </div>
-          <div v-else-if="['pending', 'processing'].includes(review.status)" class="grid-wait"><Loader2 :size="26" class="grid-spin" /><strong>{{ statusLabel(review) }}…</strong><p>可以关闭窗口，候选进度会继续更新。</p></div>
-          <div v-else-if="review.status === 'failed' && review.rawUrl" class="grid-failed-raw"><p>返回的原图未通过检查，暂时无法采用。</p><img :src="mediaUrl(review.rawUrl)" alt="未通过检查的返回原图"><button type="button" class="btn btn-sm" :disabled="!editable || submitting" @click="processCandidate(review)">重新检查并切分（本地处理）</button></div>
-          <button v-if="review.status === 'ready' && review.mode !== 'frame_edit'" type="button" class="btn btn-sm" :disabled="!editable || paidBusy || !capabilities?.supportsEdit" @click="openEdit('grid_edit', review)"><SlidersHorizontal :size="13" />基于此候选继续微调</button>
-          <label v-if="review.status === 'ready'" class="grid-review-confirm"><input v-model="confirmedReview" type="checkbox" aria-label="已检查画格边界和顺序">已检查画格边界、顺序和画面内容，确认采用。</label>
-          <p v-if="['pending', 'processing'].includes(review.status)" class="grid-hint">取消候选后会停止等待；已提交给模型的请求可能仍产生费用。</p>
         </template>
         <p v-if="error" role="alert" class="grid-error">{{ error }}</p>
       </div>
-      <footer><button v-if="modal === 'review' && review && review.status !== 'adopted'" type="button" class="btn btn-sm grid-discard" :disabled="!canManage || submitting" @click="discardCandidate(review)"><Trash2 :size="13" />{{ ['pending', 'processing'].includes(review.status) ? '取消候选' : '丢弃候选' }}</button><span class="grid-footer-spacer" /><button type="button" class="btn btn-sm" @click="closeModal">{{ modal === 'review' ? '保留并关闭' : '取消' }}</button><button v-if="modal === 'edit'" type="button" class="btn btn-primary btn-sm" data-testid="grid-submit-edit" :disabled="!canSubmit || !editValid" @click="submitEdit"><Loader2 v-if="submitting" :size="13" class="grid-spin" /><Sparkles v-else :size="13" />提交微调</button><button v-else-if="modal === 'review' && review?.status === 'ready'" type="button" class="btn btn-primary btn-sm" data-testid="grid-adopt" :disabled="!editable || submitting || !confirmedReview || !review.previewUrl" @click="adoptCandidate"><Check :size="13" />{{ review.mode === 'generate' ? '采用并切分' : '采用微调' }}</button></footer>
+      <footer><span class="grid-footer-spacer" /><button type="button" class="btn btn-sm" @click="closeModal">关闭</button><button v-if="modal === 'edit'" type="button" class="btn btn-primary btn-sm" data-testid="grid-submit-edit" :disabled="!canSubmit || !editValid" @click="submitEdit"><Loader2 v-if="submitting" :size="13" class="grid-spin" /><Sparkles v-else :size="13" />提交微调</button></footer>
     </dialog>
   </Teleport>
 </template>
 
 <style scoped>
-.grid-tools { padding: 12px; margin-bottom: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-raised); container: storyboard-grid / inline-size; }
+/* 平铺在 .pv-inspector 内：不画外框（避免卡中卡），不另加内边距——面板 scroll 已有 12px 内容边距，与其他页签一致 */
+.grid-tools { border-radius: var(--radius); background: var(--surface-raised); container: storyboard-grid / inline-size; }
 .grid-tools > header, .grid-tools > header > div, .grid-actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .grid-tools > header { justify-content: space-between; margin-bottom: 8px; }
 .grid-tools strong { font-size: 12px; }
 .grid-tools small, .grid-hint { color: var(--text-2); font-size: 11px; }
 .grid-hint { margin: 7px 0 0; line-height: 1.6; }
+.grid-dialog-settings { width: min(660px, calc(100vw - 32px)); }
 .grid-resolution { display: flex; align-items: center; gap: 5px; color: var(--text-2); font-size: 11px; }
+.grid-settings-section { display: flex; flex-direction: column; align-items: stretch; gap: 11px; padding: 14px 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.grid-settings-section h3 { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 12px; font-weight: 600; color: var(--text-1); }
+.grid-settings-section h3 > svg { color: var(--accent-text); }
+.grid-settings-count { margin-left: auto; padding: 1px 8px; border-radius: 999px; background: var(--surface-muted); color: var(--text-2); font-size: 10px; font-style: normal; font-weight: 500; }
+.grid-settings-section .grid-resolution { justify-content: space-between; width: 100%; font-size: 12px; font-weight: 600; color: var(--text-1); }
+.grid-settings-section .grid-resolution select { min-width: 150px; min-height: 34px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: var(--radius); background: var(--surface-input); color: var(--text-0); font: 12px var(--font-body); }
+.grid-settings-section .grid-hint { margin: 0; }
+.grid-settings-section > .btn { align-self: flex-start; }
+.grid-settings-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.grid-settings-preview-wrap { display: flex; justify-content: center; }
+.grid-settings-preview { display: grid; gap: 3px; padding: 3px; max-width: 100%; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-2); }
+.grid-settings-preview-cell { position: relative; min-width: 0; min-height: 0; overflow: hidden; border-radius: 2px; background: var(--surface-soft); }
+.grid-settings-preview-cell img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.grid-settings-preview-empty { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; color: var(--text-3); font: 11px var(--font-mono); }
+.grid-settings-section :deep(.grid-reference-select) { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; color: var(--text-1); font-size: 12px; font-weight: 600; }
+.grid-settings-section :deep(.grid-reference-select select) { min-width: 150px; min-height: 34px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: var(--radius); background: var(--surface-input); color: var(--text-0); font: 12px var(--font-body); }
 .grid-resolution select { min-height: 28px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0 5px; background: var(--surface); color: var(--text-0); }
 .grid-file-input { display: none; }
 .grid-error { padding: 8px; margin: 8px 0 0; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--error) 9%, transparent); color: var(--error); font-size: 12px; line-height: 1.6; }
-.grid-candidates { display: flex; flex-direction: column; gap: 5px; overflow: auto; margin-top: 9px; }
-.grid-candidate { display: flex; gap: 8px; width: 100%; padding: 5px; text-align: left; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-0); }
+.grid-candidates { display: flex; flex-direction: column; gap: 6px; overflow: auto; margin-top: 2px; }
+.grid-candidate { display: flex; align-items: center; gap: 10px; width: 100%; padding: 7px 9px; text-align: left; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-raised); color: var(--text-0); transition: border-color .12s ease, box-shadow .12s ease; }
 .grid-candidate:hover { background: var(--bg-hover); }
-.grid-candidate > img, .grid-candidate > .grid-candidate-placeholder { width: 56px; height: 40px; object-fit: contain; flex-shrink: 0; }
+.grid-candidate > img, .grid-candidate > .grid-candidate-placeholder { width: 76px; height: 48px; object-fit: cover; flex-shrink: 0; border-radius: var(--radius-sm); overflow: hidden; }
 .grid-candidate > span:last-child { min-width: 0; display: flex; justify-content: center; flex-direction: column; gap: 3px; }
 .grid-candidate small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .grid-candidate-placeholder { display: flex; align-items: center; justify-content: center; color: var(--text-3); background: var(--surface-soft); }
+.grid-candidate.current { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.grid-candidate-current { flex-shrink: 0; padding: 2px 7px; border-radius: 999px; background: var(--accent-bg); color: var(--accent-text); font-size: 10px; font-style: normal; }
+.grid-batch-head { display: flex; align-items: center; gap: 6px; margin: 10px 0 2px; color: var(--text-2); font-size: 11px; font-weight: 600; }
+.grid-batch-head:first-child { margin-top: 0; }
+.grid-batch-current { margin-left: auto; padding: 1px 7px; border-radius: 999px; background: var(--accent-bg); color: var(--accent-text); font-size: 10px; font-style: normal; font-weight: 500; }
 .grid-dialog { width: min(1050px, calc(100vw - 32px)); max-height: 90vh; margin: auto; padding: 0; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-raised); color: var(--text-0); }
 .grid-dialog[open] { display: flex; flex-direction: column; }
 .grid-dialog::backdrop { background: rgb(0 0 0 / 55%); }
@@ -418,10 +585,32 @@ onBeforeUnmount(() => { disposed = true; token++; stopPolling(); closeModal(); e
 .grid-dialog-body { min-height: 0; overflow: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
 .grid-dialog > footer { border-top: 1px solid var(--border); flex-wrap: wrap; }
 .grid-footer-spacer { flex: 1; }
-.grid-review-meta { display: flex; gap: 10px; justify-content: space-between; font-size: 12px; }
-.grid-review-meta span { color: var(--text-2); }
-.grid-review-confirm { display: flex; align-items: center; gap: 7px; font-size: 12px; line-height: 1.6; }
-.grid-review-confirm input { accent-color: var(--accent); }
+/* ===== 分镜画面预览（与资产卡片详情同款布局） ===== */
+.grid-dialog-review { width: min(960px, calc(100vw - 32px)); }
+.grid-preview-shell { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(240px, 300px); gap: 14px; align-items: start; }
+.grid-preview-panel, .grid-preview-side { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+.grid-preview-section-title { min-height: 24px; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text-1); font-size: 12px; font-weight: 820; letter-spacing: 0.02em; }
+.grid-preview-section-title .dim { color: var(--text-3); font-size: 11px; font-weight: 560; letter-spacing: 0; text-align: right; }
+.grid-preview-state { min-height: 20px; display: inline-flex; align-items: center; padding: 0 7px; border-radius: 999px; background: var(--overlay-track); color: var(--text-3); font-size: 10px; font-weight: 760; white-space: nowrap; }
+.grid-preview-state.is-ready { color: var(--success); background: var(--success-bg); }
+.grid-preview-state.is-failed { color: var(--error); background: color-mix(in srgb, var(--error) 12%, transparent); }
+.grid-preview-main { position: relative; width: 100%; border: 1px solid var(--surface-outline); border-radius: var(--radius); background-color: var(--bg-2); background-repeat: no-repeat; overflow: hidden; }
+.grid-preview-main-badge { position: absolute; left: 8px; top: 8px; padding: 3px 8px; border-radius: 999px; background: rgb(0 0 0 / 62%); color: #fff; font-size: 11px; line-height: 1.4; }
+.grid-preview-main-wait, .grid-preview-main-empty { aspect-ratio: 16 / 9; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--text-2); }
+.grid-preview-main-empty { font-size: 12px; }
+.grid-preview-thumbs { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 2px; }
+.grid-preview-thumb { position: relative; flex: 0 0 auto; width: 96px; padding: 0; border: 2px solid transparent; border-radius: var(--radius-sm); background: none; cursor: pointer; }
+.grid-preview-thumb.current { border-color: var(--accent); }
+.grid-preview-thumb-media { display: block; width: 100%; border-radius: calc(var(--radius-sm) - 2px); background-color: var(--bg-2); background-repeat: no-repeat; }
+.grid-preview-thumb-number { position: absolute; left: 4px; top: 4px; min-width: 18px; height: 18px; display: flex; align-items: center; justify-content: center; padding: 0 4px; border-radius: 5px; background: rgb(0 0 0 / 65%); color: #fff; font: 11px var(--font-mono); }
+.grid-preview-meta-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.grid-preview-meta-item { min-width: 0; padding: 9px 10px; border: 1px solid var(--surface-outline); border-radius: var(--radius); background: var(--surface-muted); }
+.grid-preview-meta-item span { display: block; color: var(--text-3); font-size: 10px; font-weight: 780; letter-spacing: 0.04em; }
+.grid-preview-meta-item strong { display: block; margin-top: 4px; min-width: 0; color: var(--text-0); font-size: 12px; line-height: 1.35; }
+.grid-preview-side .grid-hint { margin: 0; }
+.grid-preview-actions { display: flex; flex-direction: column; align-items: stretch; gap: 7px; margin-top: 2px; }
+.grid-preview-raw { display: block; max-width: 100%; max-height: 220px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+@media (max-width: 720px) { .grid-preview-shell { grid-template-columns: 1fr; } }
 .grid-preview { position: relative; width: 100%; overflow: hidden; border: 1px solid var(--border); background: var(--surface-soft); }
 .grid-preview > img { display: block; width: 100%; height: 100%; object-fit: contain; }
 .grid-cell { position: absolute; display: flex; align-items: flex-start; justify-content: space-between; padding: 6px; border: 1px solid rgb(255 255 255 / 40%); background: transparent; }
@@ -449,31 +638,17 @@ onBeforeUnmount(() => { disposed = true; token++; stopPolling(); closeModal(); e
 .grid-single-preview img { display: block; max-width: 100%; max-height: 380px; margin: auto; }
 .grid-instruction { display: flex; flex-direction: column; gap: 5px; font-size: 12px; }
 .grid-instruction textarea { width: 100%; box-sizing: border-box; padding: 8px; resize: vertical; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-0); font: inherit; line-height: 1.6; }
-.grid-comparison { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
-.grid-comparison figure { margin: 0; min-width: 0; }
-.grid-comparison figcaption { margin-bottom: 5px; color: var(--text-2); font-size: 12px; }
-.grid-comparison figure > img { width: 100%; display: block; }
-.grid-wait { display: flex; align-items: center; flex-direction: column; gap: 12px; padding: 40px 12px; color: var(--text-2); }
-.grid-wait p { font-size: 12px; }
-.grid-failed-raw img { display: block; max-width: 100%; max-height: 400px; margin-bottom: 10px; }
-.grid-failed-raw p { color: var(--text-2); font-size: 12px; }
 .grid-discard { color: var(--error); }
 .grid-tools :disabled, .grid-dialog :disabled { opacity: .5; cursor: not-allowed; }
 .grid-tools button:focus-visible, .grid-dialog button:focus-visible, .grid-dialog textarea:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
 .grid-spin { animation: grid-spin 1s linear infinite; }
 @keyframes grid-spin { to { transform: rotate(360deg); } }
-@media (max-width: 600px) { .grid-dialog { width: calc(100vw - 16px); max-height: 94vh; } .grid-dialog-body { padding: 12px; } .grid-comparison { grid-template-columns: 1fr; } .grid-frame-choices { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 600px) { .grid-dialog { width: calc(100vw - 16px); max-height: 94vh; } .grid-dialog-body { padding: 12px; } .grid-frame-choices { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (prefers-reduced-motion: reduce) { .grid-spin { animation: none; } }
 .grid-tools > header > .grid-heading { flex: 1; flex-wrap: nowrap; white-space: nowrap; }
 .grid-heading > svg { flex-shrink: 0; }
 .grid-toolbar { margin-bottom: 12px !important; }
 .grid-heading small { margin-left: auto; }
-.grid-more { position: relative; }
-.grid-more > summary { list-style: none; cursor: pointer; }
-.grid-more > summary::-webkit-details-marker { display: none; }
-.grid-more-content { position: absolute; top: calc(100% + 5px); right: 0; z-index: 20; width: min(280px, 100cqw); box-sizing: border-box; display: flex; flex-direction: column; align-items: stretch; gap: 10px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-raised); box-shadow: var(--shadow-elevated); }
-.grid-more-content .grid-resolution { justify-content: space-between; }
-.grid-more-content .grid-hint { margin: 0; }
 .grid-candidate-notices { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
 .grid-candidate-notice { display: flex; align-items: center; gap: 6px; padding: 7px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); }
 .grid-candidate-notice > span { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
@@ -482,7 +657,6 @@ onBeforeUnmount(() => { disposed = true; token++; stopPolling(); closeModal(); e
   .grid-toolbar { flex-direction: column; align-items: stretch; }
   .grid-tools > header > .grid-heading { flex: none; width: 100%; }
   .grid-actions { width: 100%; gap: 6px; }
-  .grid-actions > button, .grid-more > summary { white-space: nowrap; }
-  .grid-more { margin-left: auto; }
+  .grid-actions > button { white-space: nowrap; }
 }
 </style>

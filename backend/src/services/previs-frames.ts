@@ -15,10 +15,10 @@ import { db, schema } from '../db/index.js'
 import { getActiveConfigId, getConfigById } from './ai.js'
 import { normalizeTimeline, orderedFrames, panelImageFallback, type FrameType, type Panel } from './previs-domain.js'
 import { hashContent, PrevisError, episodeForPrevis, requireEditable, versionRow } from './previs.js'
-import { FRAME_COUNT_MIN, FRAME_COUNT_MAX } from './previs-frame-contract.js'
+import { FRAME_COUNT_MIN, FRAME_COUNT_MAX, gridLayoutForCount } from './previs-frame-contract.js'
 import { readFramePlanningContext } from '../agents/tools/frame-splitter-tools.js'
 
-export { FRAME_COUNT_MIN, FRAME_COUNT_MAX, FRAME_COUNT_OPTIONS } from './previs-frame-contract.js'
+export { FRAME_COUNT_MIN, FRAME_COUNT_MAX, FRAME_COUNT_OPTIONS, FRAME_GRID_LAYOUTS, FRAME_GRID_COUNTS, gridLayoutForCount } from './previs-frame-contract.js'
 const FRAME_PLAN_LEASE_MS = 30 * 60 * 1000
 
 export interface FramePlanDraft {
@@ -76,13 +76,13 @@ const planResultSchema = z.object({
   frames: z.array(planItemSchema).min(1).max(FRAME_COUNT_MAX),
 })
 
-/** 按时长给出默认画面数：短镜头不必拆太碎，长镜头需要更多中间过程。 */
+/** 按时长给出默认画面数：短镜头不必拆太碎，长镜头需要更多中间过程；结果必须是宫格数量（2/3/4/6/9）。 */
 export function suggestedFrameCount(panel: Panel) {
   const seconds = Math.max(1, Math.round((panel.durationMs || 0) / 1000))
   if (seconds <= 3) return 2
-  if (seconds <= 6) return 3
-  if (seconds <= 10) return 4
-  return 5
+  if (seconds <= 6) return 4
+  if (seconds <= 10) return 6
+  return 9
 }
 export function clampCount(value: number | undefined, fallback: number) {
   const next = Math.round(value ?? fallback)

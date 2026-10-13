@@ -40,7 +40,6 @@ const {
 const videoGenerationMode = useVideoGenerationMode()
 const videoReferenceInputStrategy = useVideoReferenceInputStrategy()
 const videoGenerationScope = ref<VideoGenerationScope>('storyboard')
-const videoUsesStoryboardFrames = computed(() => videoGenerationMode.value === 'storyboard_frames')
 const drama = ref<any>(), episode = ref<any>(), error = ref(''), loading = ref(true), enabled = ref(true)
 const groupId = ref(''), panelId = ref(0), currentMs = ref(0)
 const stageView = ref<PrevisStageView>('storyboard'), inspector = ref('frames'), allIssues = ref(true)
@@ -51,7 +50,7 @@ const previewViews: Array<{ key: PrevisStageView; label: string }> = [
 ]
 const player = ref<InstanceType<typeof PrevisPlayer>>()
 const modal = ref(''), dialog = ref<HTMLDialogElement>()
-const framePlanOpen = ref(false), framePlanCount = ref(3)
+const framePlanOpen = ref(false), framePlanCount = ref(4)
 const gridBusy = ref(false)
 const framePlans = ref<PanelFramePlan[]>([])
 const framePlanActive = computed(() => framePlansSummary.value.pending + framePlansSummary.value.processing)
@@ -66,7 +65,7 @@ const sidebarCollapsed = ref((() => {
 })())
 const frameNames: Record<FrameType, string> = { start: '开场画面', middle: '过程画面', end: '结束画面', beat: '分镜画面' }
 const constraintNames: Record<string, string> = {
-  auto: '全部分镜画面', direct: '直接生成', first_last: '首尾帧（历史）',
+  auto: '全部分镜画面', direct: '直传素材（历史）', first_last: '首尾帧（历史）',
   first: '首帧（历史）', reference: '全部分镜画面', text: '纯文本（历史）',
 }
 const statusNames: Record<string, string> = {
@@ -299,7 +298,6 @@ function sheetForPanel(target: Panel) {
 const videoReferenceState = computed(() => {
   const error = videoGenerationScopeError(videoTargetPanels.value, videoGenerationScope.value, videoCapability.value)
   if (error) return { ready: false, error, effective: undefined }
-  if (!videoUsesStoryboardFrames.value) return { ready: true, error: '', effective: undefined }
   const units = videoGenerationScope.value === 'group' ? [videoTargetPanels.value] : videoTargetPanels.value.map(panel => [panel])
   const states = units.map(panels => videoReferenceReadiness(panels, videoReferenceInputStrategy.value, videoCapability.value?.maxImages || 9, version.value?.contactSheets || [], videoGenerationScope.value))
   return states.find(state => !state.ready) || { ready: true, error: '', effective: states[0]?.effective }
@@ -565,7 +563,7 @@ function moveAudio(id: string, startMs: number, duration: number) {
 async function startVideo() {
   const choice = modelChoice('video')
   if (!choice) { toast.error('请先选择视频模型'); return }
-  if (videoUsesStoryboardFrames.value && incompleteVideoPanels.value.length) {
+  if (incompleteVideoPanels.value.length) {
     toast.error(`请先完成 ${incompleteVideoPanels.value.length} 个镜头的全部分镜画面`)
     return
   }
@@ -574,7 +572,7 @@ async function startVideo() {
     panelIds: videoPanelIds.value.length ? videoPanelIds.value : undefined,
     generationMode: videoGenerationMode.value,
     generationScope: videoGenerationScope.value,
-    videoReferenceInputStrategy: videoUsesStoryboardFrames.value ? videoReferenceInputStrategy.value : undefined })
+    videoReferenceInputStrategy: videoReferenceInputStrategy.value })
   modal.value = ''; inspector.value = 'tasks'
 }
 function downloadDraft() {
@@ -805,15 +803,6 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
               <p>{{ groups.length }} 个镜头 · {{ frameCount }} 张画面 · {{ (total / 1000).toFixed(1) }} 秒</p>
             </div>
           </div>
-          <div class="seg pv-video-mode" aria-label="视频生成模式">
-            <button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'direct' }"
-              :aria-pressed="videoGenerationMode === 'direct'" title="使用提示词与已绑定素材直接生成"
-              @click="videoGenerationMode = 'direct'"><Film :size="12" />直接生成</button>
-            <button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'storyboard_frames' }"
-              :aria-pressed="videoGenerationMode === 'storyboard_frames'" title="使用当前镜头的全部分镜画面生成"
-              @click="videoGenerationMode = 'storyboard_frames'"><Images :size="12" />分镜画面</button>
-          </div>
-          <label v-if="videoUsesStoryboardFrames" class="pv-reference-select">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
           <div class="pv-header-actions">
             <button
               class="btn btn-sm"
@@ -879,7 +868,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
         <section class="pv-stage-column">
           <header class="pv-stage-toolbar"><div class="pv-stage-title"><span>{{ String(groups.findIndex(g => g.id === group?.id) + 1).padStart(2, '0') }}</span><div><p class="pv-eyebrow">镜头预览</p><b>{{ panel?.title || group?.title || '镜头预览' }}</b></div></div><div class="seg pv-tabs"><button v-for="view in previewViews" :key="view.key" class="seg-item" :class="{ on: stageView === view.key }" :aria-pressed="stageView === view.key" :title="view.key === 'video' && !hasVideoPreview ? '当前工作版暂无视频，将回退分镜预演' : view.label" @click="setStageView(view.key)">{{ view.label }}</button></div></header>
           <div class="pv-stage-scroll">
-            <PrevisPlayer ref="player" :timeline="timeline" :current-ms="currentMs" :view="stageView" :video-sources="videoSources" :storyboard-is-video-input="videoUsesStoryboardFrames" @seek="seek" />
+            <PrevisPlayer ref="player" :timeline="timeline" :current-ms="currentMs" :view="stageView" :video-sources="videoSources" :storyboard-is-video-input="true" @seek="seek" />
           </div>
         </section>
         <aside class="pv-inspector">
@@ -893,11 +882,14 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
                 :aspect-ratio="drama?.aspect_ratio || drama?.aspectRatio || '16:9'"
                 :editable="editable && !framePlanSubmitting && !framePlanActive"
                 :management-editable="generatable && !working"
+                :splitting="framePlanSubmitting || framePlanActive > 0"
                 :before-action="beforeGridAction" :commit-adoption="adoptGridCandidate" @busy="gridBusy = $event"
+                @split="options => options?.force ? (modal = 'split') : run(splitPanel)"
+                v-model:reference-strategy="videoReferenceInputStrategy"
               >
-                <template #default="{ planning, refineFrame, canRefineGrid, canRefineFrame }">
+                <template #default="{ refineFrame, canRefineGrid, canRefineFrame }">
                   <StoryboardFramesEditor
-                    integrated :planning="planning" :can-refine-grid="canRefineGrid" :can-refine-frame="canRefineFrame"
+                    integrated :can-refine-grid="canRefineGrid" :can-refine-frame="canRefineFrame"
                     @refine="refineFrame"
                     :key="`${version.id}-${panel.id}`"
                     :panel="panel"
@@ -911,7 +903,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
                     :tasks="batches.filter(b => b.type === 'image').flatMap(b => b.items).filter(item => item.panelId === panel!.id)"
                     :video-generation-mode="videoGenerationMode"
                     :active-frame-id="activeFrameId"
-                    :title="videoUsesStoryboardFrames ? '分镜画面 · 视频输入' : '分镜画面 · 仅用于预演'"
+                    title="分镜画面 · 视频输入"
                     show-video-action
                     @change="updateFrames"
                     @split="options => options?.force ? (modal = 'split') : run(splitPanel)"
@@ -1006,9 +998,8 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
         <header><h2>{{ ({ strategy: '模型设置', video: '生成正式视频', audio: '编辑音轨', waiver: '确认连续性提示', lock: '锁定故事版', sync: '同步最新分镜', reload: '重新载入版本', split: '重新拆分分镜画面' } as Record<string, string>)[modal] }}</h2><button aria-label="关闭对话框" @click="modal = ''"><X :size="18" /></button></header>
         <div v-if="modal === 'strategy'" class="pv-form">
           <label>图片模型<select v-model="imageModel"><option value="" disabled>选择图片模型</option><option v-for="o in modelOptions('image')" :key="o.key" :value="o.key">{{ o.label }}</option></select></label>
-          <label v-if="videoUsesStoryboardFrames">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
+          <label>画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
           <label>视频模型<select v-model="videoModel"><option value="" disabled>选择视频模型</option><option v-for="o in modelOptions('video')" :key="o.key" :value="o.key">{{ o.label }}</option></select></label>
-          <label>视频生成模式<div class="seg pv-dialog-mode"><button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'direct' }" @click="videoGenerationMode = 'direct'">直接生成</button><button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'storyboard_frames' }" @click="videoGenerationMode = 'storyboard_frames'">依赖分镜画面</button></div></label>
           <NuxtLink v-if="!modelOptions('image').length || !modelOptions('video').length" to="/settings">前往设置启用生成模型 →</NuxtLink>
           <p v-if="videoCapability" class="pv-help">当前视频服务支持 {{ videoCapability.minSeconds }}–{{ videoCapability.maxSeconds }} 整数秒、每次生成最多 {{ videoCapability.maxImages }} 张参考图。{{ videoCapability.group ? '支持将所选分镜合为一组生成。' : '支持按分镜生成。' }}</p>
           <footer><button class="btn btn-primary" @click="modal = ''">完成</button></footer>
@@ -1019,12 +1010,11 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
           <p>将使用当前工作版 V{{ version?.versionNo }} 生成{{ videoPanelIds.length ? '当前镜头' : '全部镜头' }}。</p>
           <label>生成范围<select v-model="videoGenerationScope"><option value="storyboard">按分镜</option><option value="group">所选分镜合为一组</option></select></label>
           <p class="pv-help">{{ videoGenerationScope === 'group' ? `所选 ${videoTargetPanels.length} 个分镜按时间线顺序合为一个视频，整组 ${videoTargetDuration} 秒，计为一次生成任务。` : `${videoTargetPanels.length} 个分镜各生成一个视频，共 ${videoTargetPanels.length} 次生成任务；总时长 ${videoTargetDuration} 秒。` }}</p>
-          <label>生成模式<div class="seg pv-dialog-mode"><button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'direct' }" @click="videoGenerationMode = 'direct'">直接生成</button><button type="button" class="seg-item" :class="{ on: videoGenerationMode === 'storyboard_frames' }" @click="videoGenerationMode = 'storyboard_frames'">依赖分镜画面</button></div></label>
-          <label v-if="videoUsesStoryboardFrames">画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
+          <label>画面参考<select v-model="videoReferenceInputStrategy"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
           <label>视频模型<select v-model="videoModel"><option value="" disabled>选择模型</option><option v-for="o in modelOptions('video')" :key="o.key" :value="o.key">{{ o.label }}</option></select></label>
-          <p class="pv-help">{{ videoGenerationMode === 'direct' ? '使用视频提示词与已绑定素材直接生成，不依赖分镜画面。' : '全部分镜画面将按时间顺序作为视频参考。' }}</p>
+          <p class="pv-help">全部分镜画面将按时间顺序作为视频参考。</p>
           <p v-if="!videoReferenceState.ready" class="pv-frame-error">{{ videoReferenceState.error }}</p>
-          <p v-if="videoUsesStoryboardFrames && incompleteVideoPanels.length" class="pv-frame-error">还有 {{ incompleteVideoPanels.length }} 个镜头存在未完成画面，请先生成或上传全部画面。</p>
+          <p v-if="incompleteVideoPanels.length" class="pv-frame-error">还有 {{ incompleteVideoPanels.length }} 个镜头存在未完成画面，请先生成或上传全部画面。</p>
           <footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="working || !videoModel || !videoReferenceState.ready" @click="run(startVideo)"><Film :size="14" />提交生成</button></footer>
         </div>
         <div v-else-if="modal === 'split'" class="pv-form"><p>重新拆分会按新方案重写「{{ panel?.title }}」的全部分镜画面，已生成的图片会保留在画面历史中。</p><footer><button class="btn" @click="modal = ''">取消</button><button class="btn btn-primary" :disabled="framePlanSubmitting || !editable" @click="run(async () => { modal = ''; await splitPanel(true) })">重新拆分</button></footer></div>
@@ -1036,6 +1026,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
         :plans="framePlans"
         :count="framePlanCount"
         :editable="editable"
+        :aspect-ratio="drama?.aspect_ratio || drama?.aspectRatio || '16:9'"
         @close="framePlanOpen = false"
         @apply="applyFramePlan"
         @recount="run(recountFramePlan)"

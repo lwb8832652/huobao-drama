@@ -10,10 +10,23 @@ const tile = (color: string, width = 160, height = 90) =>
 const pixel = async (buffer: Buffer) => [
   ...(await sharp(buffer).removeAlpha().raw().toBuffer()).subarray(0, 3),
 ]
-test('one through nine map to square grids and exact non-divisible bounds cover the complete image', () => {
+test('one through nine map to grid layouts and exact non-divisible bounds cover the complete image', () => {
+  // 横屏基准：1×2 / 2×2 / 1×3 / 2×3 / 3×3；非标准数量向上取最近宫格，超出格数留白。
+  const expected: Record<number, [number, number]> = {
+    1: [1, 1],
+    2: [1, 2],
+    3: [1, 3],
+    4: [2, 2],
+    5: [2, 3], // 向上取 2×3，留白 1 格
+    6: [2, 3],
+    7: [3, 3], // 向上取 3×3，留白 2 格
+    8: [3, 3], // 向上取 3×3，留白 1 格
+    9: [3, 3],
+  }
   for (let n = 1; n <= 9; n++) {
     const grid = generationGrid(Array.from({ length: n }, (_, i) => `f${i}`))
-    assert.equal(grid.columns, n === 1 ? 1 : n <= 4 ? 2 : 3)
+    assert.equal(grid.columns, expected[n][0])
+    assert.equal(grid.rows, expected[n][1])
     assert.equal(grid.cells.length, n)
     assert.deepEqual(
       grid.cells.map((c) => c.frameId),
@@ -27,19 +40,36 @@ test('one through nine map to square grids and exact non-divisible bounds cover 
   assert.throws(() => generationGrid(Array(10).fill('a')), /1.*9/)
   assert.throws(() => generationGrid(['a', 'a']), /ID/)
 })
+
+test('portrait aspect ratios flip columns and rows so each cell stays upright', () => {
+  // 竖屏 9:16 翻转列行：1×2→2×1、1×3→3×1、2×3→3×2，方形不变。
+  const portrait: Record<number, [number, number]> = {
+    2: [2, 1], 3: [3, 1], 4: [2, 2], 6: [3, 2], 9: [3, 3],
+  }
+  for (const [count, [columns, rows]] of Object.entries(portrait)) {
+    const grid = generationGrid(Array.from({ length: Number(count) }, (_, i) => `f${i}`), '9:16')
+    assert.equal(grid.columns, columns)
+    assert.equal(grid.rows, rows)
+  }
+  // 横屏 16:9 保持基准（列 ≤ 行）
+  assert.deepEqual(generationGrid(['a', 'b'], '16:9'), {
+    columns: 1, rows: 2,
+    cells: [{ frameId: 'a', index: 0 }, { frameId: 'b', index: 1 }],
+  })
+})
 test('split keeps full cells, does not include placeholders, supports portrait, rejects wrong geometry', async () => {
   for (const [w, h] of [
-    [320, 180],
-    [180, 320],
+    [360, 180],
+    [180, 360],
   ]) {
-    const grid = generationGrid(['a', 'b', 'c'])
-    const images = await Promise.all(['red', 'green', 'blue'].map((c) => tile(c, w / 2, h / 2)))
+    const grid = generationGrid(['a', 'b', 'c']) // 3 帧 → 1×3（1 列 3 行）
+    const images = await Promise.all(['red', 'green', 'blue'].map((c) => tile(c, w, h / 3)))
     const composed = await composeGrid(images, grid, w, h)
     const split = await splitGrid(composed, grid, w / h)
     assert.equal(split.tiles.length, 3)
     assert.deepEqual(await pixel(split.tiles[0]), [255, 0, 0])
     assert.deepEqual(await pixel(split.tiles[2]), [0, 0, 255])
-    assert.equal((await sharp(split.tiles[0]).metadata()).width, w / 2)
+    assert.equal((await sharp(split.tiles[0]).metadata()).height, h / 3)
     await assert.rejects(splitGrid(composed, grid, h / w), /比例/)
   }
 })
