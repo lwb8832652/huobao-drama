@@ -127,3 +127,7 @@ test('timeOfDay and time_of_day changes reset continuity', () => {
   t.groups[0].exit.time_of_day = 'morning'; t.groups[1].entry.time_of_day = 'night'
   assert.equal(resolve(t, 3).status, 'reset')
 })
+test('screenplay day/night scene suffixes reset even with the same bound scene asset', () => {
+  const t = timeline(); t.panels[0].scene = '教室 · 日'; t.panels[1].scene = '教室 · 夜'
+  assert.equal(resolve(t, 3).status, 'reset')
+})

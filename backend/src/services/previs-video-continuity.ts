@@ -29,7 +29,7 @@ export function modelVideoContinuityCapabilities(provider: string, model: string
   const reference = firstLast || (provider === 'volcengine' && model.startsWith('doubao-seedance-2-0')) || (provider === 'nuwax' && /^\d+$/.test(model))
   return { provider, model, firstLast, reference,
     maxImages: provider === 'aliyun' && reference ? 10 : reference ? 9 : 0,
-    reason: firstLast ? '当前适配器和模型支持独立首尾帧。' : reference ? '当前适配器或模型仅声明参考图模式，将使用画面参考。' : '当前服务尚未声明视频连续性能力。' }
+    reason: firstLast ? '当前模型支持独立首尾帧。' : reference ? '当前模型使用参考图模式，不支持首尾帧。' : '当前视频模型尚不支持此输入方式，请更换模型。' }
 }
 export async function videoContinuityCapabilities(configId?: number, model?: string) {
   const { getActiveConfigId, getConfigById } = await import('./ai.js')

@@ -47,6 +47,7 @@ export function resolvePanelContinuity(input: Timeline, panelId: number, version
   const sameScene = Boolean((a.sceneId && b.sceneId && a.sceneId === b.sceneId) || (a.scene && b.scene && a.scene === b.scene))
   if (!sameScene) return reset('缺少相同场景证据，先按当前分镜建立开场状态。')
   const timeQualifier = (scene: string) => scene.match(/凌晨|早晨|清晨|上午|中午|下午|傍晚|黄昏|夜晚|深夜|白天|夜间|\b(?:morning|afternoon|evening|night|day)\b/i)?.[0].toLowerCase()
+    || scene.match(/(?:^|[\s·/|,，:：()（）-])([日夜])(?=$|[\s·/|,，:：()（）-])/u)?.[1]
   const aTime = timeQualifier(a.scene), bTime = timeQualifier(b.scene)
   if (aTime && bTime && aTime !== bTime) return reset('场景时间标记不同，重新建立开场状态。')
   const changes = transition?.allowedChanges || []
