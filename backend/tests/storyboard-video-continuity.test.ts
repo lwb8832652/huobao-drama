@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -22,7 +23,7 @@ const config = (provider: string, model: string) => Number(db.insert(schema.aiSe
 const configId = config('aliyun', 'wan3.0-video'), referenceConfigId = config('volcengine', 'doubao-seedance-2-0-260128'), minimaxConfigId = config('minimax', 'MiniMax-H3')
 const episodeId = Number(db.insert(schema.episodes).values({ dramaId, episodeNumber: 1, title: 'Test', createdAt: ts, updatedAt: ts }).run().lastInsertRowid)
 function panel(id: number, first = 0, last = 1): Panel {
-  return { id, title: `Shot ${id}`, description: 'Walks ahead', atmosphere: '', imagePrompt: '', videoPrompt: 'Raises a cup', durationMs: 4000, sceneId: null, scene: 'Kitchen', shotType: 'medium', angle: 'eye', movement: '', characterIds: [], propIds: [], referenceImages: [], videoUrl: '', frames: [{ ...makeFrame(`${id}-first`), url: `/static/${first}.png`, prompt: 'cup down' }, { ...makeFrame(`${id}-last`, 3999), url: `/static/${last}.png`, prompt: 'cup up' }] }
+  return { id, title: `Shot ${id}`, description: 'Walks ahead', atmosphere: '', imagePrompt: '', videoPrompt: `Shot ${id} raises a cup`, durationMs: 4000, sceneId: null, scene: 'Kitchen', shotType: 'medium', angle: 'eye', movement: '', characterIds: [], propIds: [], referenceImages: [], videoUrl: '', frames: [{ ...makeFrame(`${id}-first`), url: `/static/${first}.png`, prompt: 'cup down' }, { ...makeFrame(`${id}-last`, 3999), url: `/static/${last}.png`, prompt: 'cup up' }] }
 }
 let versionNo = 0
 function version(panels: Panel[], strong = false) {
@@ -44,6 +45,17 @@ async function finish(count: number) {
 function request(versionId: number) {
   const batch = db.select().from(schema.batchRuns).all().find(b => b.versionId === versionId)!
   return db.select().from(schema.batchRunItems).all().filter(i => i.batchId === batch.id).map(i => ({ item: i, data: JSON.parse(i.requestJson) }))
+}
+function wanSubmissionFor(data: any, captured: any[]) {
+  const prompt = data.prompt.trim().replace(/@图片(\d+)/g, '图$1').slice(0, 20_000)
+  const matches = captured.filter(body => body.input?.prompt === prompt)
+  assert.equal(matches.length, 1, `unique actual provider request for panel ${data.storyboardId}`)
+  return matches[0]
+}
+function wanFrameBytes(submission: any, role: 'first_frame' | 'last_frame') {
+  const image = submission.input.media.find((item: any) => item.type === role)
+  assert.ok(image, `provider payload contains ${role}`)
+  return Buffer.from(image.url.split(',')[1], 'base64')
 }
 test('auto endpoint jobs send independent original first/last bytes, planned states and typed provenance', async () => {
   const id = version([panel(90)]), before = submissions.length
@@ -67,8 +79,15 @@ test('strong same scene shares EXACT previous LAST as next FIRST and catches ups
   assert.equal(a.data.videoContinuity.last.digest, b.data.videoContinuity.first.digest)
   assert.equal(a.data.lastFrameUrl, b.data.firstFrameUrl)
   assert.equal(b.data.videoContinuity.first.panelId, 70)
-  const submitted = submissions.slice(-2)
-  assert.equal(submitted[0].input.media[1].url, submitted[1].input.media[0].url)
+  // Provider calls run concurrently: capture order is independent of timeline order.
+  const captured = submissions.slice(before)
+  for (const actualOrder of [captured, [...captured].reverse()]) {
+    const actualA = wanSubmissionFor(a.data, actualOrder), actualB = wanSubmissionFor(b.data, actualOrder)
+    const lastBytes = wanFrameBytes(actualA, 'last_frame'), firstBytes = wanFrameBytes(actualB, 'first_frame')
+    assert.deepEqual(lastBytes, firstBytes)
+    assert.deepEqual(firstBytes, images[1])
+    assert.equal(createHash('sha256').update(firstBytes).digest('hex'), b.data.videoContinuity.first.digest)
+  }
   for (const r of [a, b]) {
     const task = db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, r.item.id)).get()!
     db.update(schema.batchRunItems).set({ status: 'completed' }).where(eq(schema.batchRunItems.id, r.item.id)).run()
@@ -102,7 +121,7 @@ test('incomplete/corrupt later unit queues no earlier endpoint job', async () =>
   await assert.rejects(createBatch(version([panel(30), bad]), opts), /未完成/)
   writeFileSync(path.join(root, 'static', 'corrupt.png'), images[0].subarray(0, images[0].length / 2))
   bad.frames[1].url = '/static/corrupt.png'
-  await assert.rejects(createBatch(version([panel(30), bad]), opts), /pngload|stream|corrupt/)
+  await assert.rejects(createBatch(version([panel(30), bad]), opts), /pngload|stream|corrupt|Warning treated as error due to failOn setting/)
   assert.equal(db.select().from(schema.batchRunItems).all().length, jobs)
 })
 test('dispatch rechecks frozen files; same-url source replacement marks completed output stale', async () => {
@@ -148,7 +167,7 @@ test('normal and scene-change transitions use each current own endpoints instead
     assert.notEqual(a.data.videoContinuity.last.digest, b.data.videoContinuity.first.digest)
     assert.equal(b.data.videoContinuity.first.panelId, 101)
     assert.equal(b.data.videoContinuity.continuity.status, sceneChange ? 'reset' : 'available')
-    assert.deepEqual(Buffer.from(submissions.at(-1).input.media[0].url.split(',')[1], 'base64'), images[2])
+    assert.deepEqual(wanFrameBytes(wanSubmissionFor(b.data, submissions.slice(before)), 'first_frame'), images[2])
   }
 })
 test('absent mode preserves legacy reference jobs and old output schema', async () => {
@@ -161,4 +180,19 @@ test('absent mode preserves legacy reference jobs and old output schema', async 
   const t = getVersion(id).timeline
   t.inheritedOutputs = [{ key: 'old', panelIds: [110], url: '/static/old.mp4', stale: false, referenceInput: data.referenceInput }]
   assert.deepEqual(validateTimeline(t).inheritedOutputs?.[0].referenceInput, data.referenceInput)
+})
+test('strong transition with frame camera reversal sends current own first bytes to the actual provider', async () => {
+  const previous = panel(120, 0, 1), current = panel(121, 2, 3)
+  previous.frames[1].angle = 'high'; previous.frames[1].shotType = 'close'
+  current.frames[0].angle = 'reverse low'; current.frames[0].shotType = 'wide'
+  const id = version([previous, current], true), before = submissions.length
+  await createBatch(id, opts); await finish(before + 2)
+  const [a, b] = request(id)
+  assert.equal(b.data.videoContinuity.continuity.exactVideoBoundary, false)
+  assert.equal(b.data.videoContinuity.first.panelId, 121)
+  assert.notEqual(a.data.videoContinuity.last.digest, b.data.videoContinuity.first.digest)
+  const actual = wanSubmissionFor(b.data, submissions.slice(before))
+  assert.deepEqual(wanFrameBytes(actual, 'first_frame'), images[2])
+  assert.match(actual.input.prompt, /reverse low/)
+  assert.match(actual.input.prompt, /wide/)
 })

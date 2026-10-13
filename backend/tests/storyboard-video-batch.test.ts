@@ -85,7 +85,7 @@ test('a corrupt later source cannot submit an earlier paid unit', async () => {
   const bad = panel(6); bad.frames[0].url = '/static/corrupt.png'
   const { versionId } = insert([panel(5), bad])
   const before = db.select().from(schema.batchRunItems).all().length
-  await assert.rejects(createBatch(versionId, { revision: 1, type: 'video', configId, generationMode: 'storyboard_frames', videoReferenceInputStrategy: 'individual' }), /stream|pngload|corrupt/)
+  await assert.rejects(createBatch(versionId, { revision: 1, type: 'video', configId, generationMode: 'storyboard_frames', videoReferenceInputStrategy: 'individual' }), /stream|pngload|corrupt|Warning treated as error due to failOn setting/)
   assert.equal(db.select().from(schema.batchRunItems).all().length, before)
   assert.equal(requests.length, 3)
 })

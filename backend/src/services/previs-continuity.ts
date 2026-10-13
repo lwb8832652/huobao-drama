@@ -34,7 +34,8 @@ export function resolvePanelContinuity(input: Timeline, panelId: number, version
   const index = segments.findIndex(s => s.panel.id === panelId), current = segments[index], prior = segments[index - 1]
   const transition = prior && current ? timeline.transitions.find(edge => edge.from === prior.groupId && edge.to === current.groupId) : undefined
   const previousGroup = timeline.groups.find(g => g.id === prior?.groupId), currentGroup = timeline.groups.find(g => g.id === current?.groupId)
-  const eligibility = { sceneId: current?.panel.sceneId, scene: current?.panel.scene, angle: current?.panel.angle, shotType: current?.panel.shotType, characterIds: current?.panel.characterIds, propIds: current?.panel.propIds }
+  const currentFirst = current && orderedFrames(current.panel)[0]
+  const eligibility = { firstCamera: currentFirst && { angle: currentFirst.angle, shotType: currentFirst.shotType, composition: currentFirst.composition }, sceneId: current?.panel.sceneId, scene: current?.panel.scene, angle: current?.panel.angle, shotType: current?.panel.shotType, characterIds: current?.panel.characterIds, propIds: current?.panel.propIds }
   const base = { version: 1 as const, panelId, exactVideoBoundary: false, ...(transition ? { transition } : {}) }
   const finish = (state: Omit<PanelContinuity, 'signature'>): PanelContinuity => ({ ...state,
     signature: signature({ ...state, eligibility, previous: state.previous && { ...state.previous, versionId: undefined } }) })
@@ -62,11 +63,15 @@ export function resolvePanelContinuity(input: Timeline, panelId: number, version
       characterIds: a.characterIds, propIds: a.propIds, durationMs: a.durationMs, continuityConstraints: a.continuityConstraints },
       frame: { ...last, history: undefined, locked: undefined }, exit: previousGroup?.exit, entry: currentGroup?.entry }) }
   if (!last?.url) return finish({ ...base, status: 'missing', previous, reason: '前序分镜末画面尚未采用或缺失；可先生成当前分镜，暂不使用前序图片。' })
+  const previousAngle = last.angle || a.angle, currentAngle = currentFirst?.angle || b.angle
+  const previousShot = last.shotType || a.shotType, currentShot = currentFirst?.shotType || b.shotType
+  const sameComposition = !last.composition || !currentFirst?.composition || last.composition === currentFirst.composition
   const exactVideoBoundary = sameScene && transition?.continuity === 'strong'
     && !changes.some(change => /camera|composition|shot|angle|scene|light|character|identity|styling|wardrobe|costume|prop|机位|构图|景别|场景|光|人物|身份|服装|道具/i.test(change))
     && signature([...a.characterIds].sort()) === signature([...b.characterIds].sort())
     && signature([...a.propIds].sort()) === signature([...b.propIds].sort())
-    && (!a.angle || !b.angle || a.angle === b.angle) && (!a.shotType || !b.shotType || a.shotType === b.shotType)
+    && Boolean(previousAngle && currentAngle && previousAngle === currentAngle)
+    && Boolean(previousShot && currentShot && previousShot === currentShot) && sameComposition
   return finish({ ...base, status: 'available', previous, exactVideoBoundary,
     reason: exactVideoBoundary ? '同场景强连续：动作与空间延续，可共用前序末帧作为视频首帧。'
       : '同场景连续：沿用动作阶段、人物位置、视线与持物；当前机位和构图按本分镜规划。' })

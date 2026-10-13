@@ -87,3 +87,18 @@ test('unknown scene resets optional reference and explicit scene time qualifiers
   t.panels[0].sceneId = 1; t.panels[1].sceneId = 1; t.panels[0].scene = '厨房（早晨）'; t.panels[1].scene = '厨房（夜晚）'
   assert.equal(resolve(t, 3).status, 'reset')
 })
+test('strong boundary compares effective frame camera and composition overrides with affirmative camera evidence', () => {
+  const t = timeline(); t.transitions[0].continuity = 'strong'; t.transitions[0].allowedChanges = []
+  assert.equal(resolve(t, 3).exactVideoBoundary, true)
+  t.panels[0].frames[0].angle = 'high'; t.panels[1].frames[1].angle = 'reverse low'
+  assert.equal(resolve(t, 3).exactVideoBoundary, false)
+  t.panels[0].frames[0].angle = ''; t.panels[1].frames[1].angle = ''
+  t.panels[0].frames[0].shotType = 'close'; t.panels[1].frames[1].shotType = 'wide'
+  assert.equal(resolve(t, 3).exactVideoBoundary, false)
+  t.panels[0].frames[0].shotType = ''; t.panels[1].frames[1].shotType = ''
+  t.panels[0].frames[0].composition = 'character left'; t.panels[1].frames[1].composition = 'character right'
+  assert.equal(resolve(t, 3).exactVideoBoundary, false)
+  t.panels[0].frames[0].composition = ''; t.panels[1].frames[1].composition = ''
+  t.panels[0].angle = ''; t.panels[1].angle = ''
+  assert.equal(resolve(t, 3).exactVideoBoundary, false)
+})
