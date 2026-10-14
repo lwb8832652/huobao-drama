@@ -29,6 +29,33 @@ export interface EvaluationTaskPage {
   activeCount: number
   lowScore: number
   items: EvaluationTask[]
+  summary?: { total: number; active: number; completed: number; failed: number }
+}
+/** 不依赖连续性输入/评分结构的列表展示契约，可供其他评测类型复用。 */
+export interface EvaluationListItem {
+  key: string
+  typeLabel: string
+  title: string
+  status: EvaluationTask['status']
+  summary: string
+  meta: string
+  preview: string | null
+  score?: number
+  current: boolean
+  attention: boolean
+}
+export type EvaluationTaskFilter = 'all' | 'active' | 'completed' | 'failed'
+export function evaluationTaskRow(item: EvaluationTask, threshold: number): EvaluationListItem {
+  const time = item.createdAt ? new Date(item.createdAt) : null
+  const formattedTime = time && !Number.isNaN(time.getTime()) ? time.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : ''
+  return {
+    key: String(item.id), typeLabel: '连续性',
+    title: `${item.fromGroupTitle || item.fromGroupId || '前镜头'} → ${item.toGroupTitle || item.toGroupId || '后镜头'}`,
+    status: item.status, summary: item.error || item.result?.summary || ({ pending: '等待评测', processing: '正在对比画面', completed: '未提供摘要', failed: '评测失败' }[item.status]),
+    meta: [item.model || '等待分配模型', formattedTime, `#${item.id}`].filter(Boolean).join(' · '),
+    preview: item.images.from || item.images.to, score: item.result?.overallScore,
+    current: item.current, attention: !!item.result && (item.result.overallScore < threshold || item.result.confidence === 'low'),
+  }
 }
 export interface ContinuityReviewSettings { enabled: boolean; threshold: number }
 export interface ContinuityReviewStatusItem {
@@ -36,6 +63,7 @@ export interface ContinuityReviewStatusItem {
   fromGroupId: string
   toGroupId: string
   inputHash: string
+  hasImages?: boolean
   status: 'idle' | 'missing_images' | 'pending' | 'processing' | 'completed' | 'failed'
   result: ContinuityReviewResult | null
   error: string | null

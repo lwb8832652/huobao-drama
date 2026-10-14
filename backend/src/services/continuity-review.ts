@@ -298,12 +298,11 @@ export function listContinuityReviews(versionId: number): ContinuityReview[] {
 export const continuityReviewTaskPageSchema = z.object({
   page: z.coerce.number().int().min(1).max(1_000_000).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
+  status: z.enum(['all', 'active', 'completed', 'failed']).default('all'),
+  keyword: z.string().trim().max(200).default(''),
 })
 
-export function listContinuityReviewTasks(versionId: number, pagination: unknown = {}) {
-  const { page, pageSize } = continuityReviewTaskPageSchema.parse(pagination)
-  const timeline = normalizeTimeline(JSON.parse(versionRow(versionId).timelineJson))
-  const settings = getContinuityReviewSettings()
+function currentReviewInputs(timeline: Timeline) {
   const inputs = new Map<string, ContinuityReviewInput>()
   for (const edge of timeline.transitions) {
     try {
@@ -311,40 +310,79 @@ export function listContinuityReviewTasks(versionId: number, pagination: unknown
       inputs.set(`${edge.from}:${edge.to}:${hashContent(input)}`, input)
     } catch { /* 已删除或不完整的边界没有有效输入。 */ }
   }
+  return inputs
+}
+
+function reviewTaskResult(row: typeof schema.continuityReviews.$inferSelect) {
+  if (!row.resultJson) return null
+  try {
+    const parsed = continuityReviewResultSchema.safeParse(JSON.parse(row.resultJson))
+    return parsed.success ? parsed.data : null
+  } catch { return null }
+}
+
+function serializeReviewTask(
+  row: typeof schema.continuityReviews.$inferSelect,
+  current: ContinuityReviewInput | undefined,
+) {
+  let input: ContinuityReviewInput | undefined = current
+  if (row.inputJson) {
+    try { input = JSON.parse(row.inputJson) } catch { /* 旧记录仍可读取状态和错误。 */ }
+  }
+  return {
+    id: row.id, type: 'continuity' as const, versionId: row.versionId,
+    status: row.status, current: !!current, inputHash: row.inputHash,
+    result: reviewTaskResult(row), error: row.error, configId: row.configId, model: row.model,
+    createdAt: row.createdAt, startedAt: row.startedAt, finishedAt: row.finishedAt,
+    fromGroupId: row.fromGroupId, toGroupId: row.toGroupId,
+    fromGroupTitle: input?.from?.group?.title ?? null,
+    toGroupTitle: input?.to?.group?.title ?? null,
+    images: { from: input?.from?.frame?.url ?? null, to: input?.to?.frame?.url ?? null },
+  }
+}
+
+export function getContinuityReviewTask(versionId: number, taskId: number) {
+  const version = versionRow(versionId)
+  const row = db.select().from(schema.continuityReviews).where(and(
+    eq(schema.continuityReviews.versionId, versionId), eq(schema.continuityReviews.id, taskId),
+  )).get()
+  if (!row) throw new PrevisError('评测任务不存在', 404)
+  const timeline = normalizeTimeline(JSON.parse(version.timelineJson))
+  const current = currentReviewInputs(timeline).get(`${row.fromGroupId}:${row.toGroupId}:${row.inputHash}`)
+  return serializeReviewTask(row, current)
+}
+
+export function listContinuityReviewTasks(versionId: number, pagination: unknown = {}) {
+  const { page, pageSize, status, keyword } = continuityReviewTaskPageSchema.parse(pagination)
+  const timeline = normalizeTimeline(JSON.parse(versionRow(versionId).timelineJson))
+  const settings = getContinuityReviewSettings()
+  const inputs = currentReviewInputs(timeline)
   const rows = db.select().from(schema.continuityReviews)
     .where(eq(schema.continuityReviews.versionId, versionId))
     .orderBy(desc(schema.continuityReviews.id)).all()
   const currentInput = (row: typeof schema.continuityReviews.$inferSelect) =>
     inputs.get(`${row.fromGroupId}:${row.toGroupId}:${row.inputHash}`)
-  const resultOf = (row: typeof schema.continuityReviews.$inferSelect) => {
-    if (!row.resultJson) return null
-    try {
-      const parsed = continuityReviewResultSchema.safeParse(JSON.parse(row.resultJson))
-      return parsed.success ? parsed.data : null
-    } catch { return null }
+  const summary = {
+    total: rows.length,
+    active: rows.filter(row => row.status === 'pending' || row.status === 'processing').length,
+    completed: rows.filter(row => row.status === 'completed').length,
+    failed: rows.filter(row => row.status === 'failed').length,
   }
+  const query = keyword.toLowerCase()
+  const items = rows.map(row => serializeReviewTask(row, currentInput(row))).filter(item => {
+    const matchesStatus = status === 'all' || (status === 'active'
+      ? item.status === 'pending' || item.status === 'processing'
+      : item.status === status)
+    const matchesKeyword = !query || [String(item.id), item.fromGroupTitle ?? '', item.toGroupTitle ?? '', item.model]
+      .some(value => value.toLowerCase().includes(query))
+    return matchesStatus && matchesKeyword
+  })
   return {
-    type: 'continuity' as const, page, pageSize, total: rows.length,
-    activeCount: rows.filter(row => row.status === 'pending' || row.status === 'processing').length,
+    type: 'continuity' as const, page, pageSize, total: items.length, summary,
+    activeCount: summary.active,
     lowScore: rows.filter(row => currentInput(row) && row.status === 'completed'
-      && (resultOf(row)?.overallScore ?? 100) < settings.threshold).length,
-    items: rows.slice((page - 1) * pageSize, page * pageSize).map(row => {
-      const current = currentInput(row)
-      let input: ContinuityReviewInput | undefined = current
-      if (row.inputJson) {
-        try { input = JSON.parse(row.inputJson) } catch { /* 旧记录仍可读取状态和错误。 */ }
-      }
-      return {
-        id: row.id, type: 'continuity' as const, versionId: row.versionId,
-        status: row.status, current: !!current, inputHash: row.inputHash,
-        result: resultOf(row), error: row.error, configId: row.configId, model: row.model,
-        createdAt: row.createdAt, startedAt: row.startedAt, finishedAt: row.finishedAt,
-        fromGroupId: row.fromGroupId, toGroupId: row.toGroupId,
-        fromGroupTitle: input?.from?.group?.title ?? null,
-        toGroupTitle: input?.to?.group?.title ?? null,
-        images: { from: input?.from?.frame?.url ?? null, to: input?.to?.frame?.url ?? null },
-      }
-    }),
+      && (reviewTaskResult(row)?.overallScore ?? 100) < settings.threshold).length,
+    items: items.slice((page - 1) * pageSize, page * pageSize),
   }
 }
 
@@ -371,6 +409,7 @@ export function readContinuityReviewStatus(versionId: number) {
     const row = rows.find(row => row.fromGroupId === edge.from && row.toGroupId === edge.to && row.inputHash === inputHash)
     const result = row?.status === 'completed' ? continuityReviewResultSchema.parse(JSON.parse(row.resultJson)) : null
     return { id: row?.id ?? null, fromGroupId: edge.from, toGroupId: edge.to, inputHash,
+      hasImages: !!(input.from.frame?.url && input.to.frame?.url),
       status: row?.status ?? (input.from.frame?.url && input.to.frame?.url ? 'idle' : 'missing_images'),
       result, error: row?.error ?? null, lowScore: !!result && result.overallScore < settings.threshold }
   }) }

@@ -7,7 +7,7 @@ import {
 } from '../services/previs.js'
 import { videoContinuityCapabilities } from '../services/previs-video-continuity.js'
 import { createBatch, updateBatch, videoCapabilities } from '../services/previs-batch.js'
-import { listContinuityReviews, listContinuityReviewTasks, reviewContinuity, getContinuityReviewSettings, updateContinuityReviewSettings, readContinuityReviewStatus } from '../services/continuity-review.js'
+import { listContinuityReviews, listContinuityReviewTasks, getContinuityReviewTask, reviewContinuity, getContinuityReviewSettings, updateContinuityReviewSettings, readContinuityReviewStatus } from '../services/continuity-review.js'
 import { scheduleContactSheets, readContactSheets, tickContactSheets } from '../services/previs-contact-sheets.js'
 import { startFramePlan, listFramePlans, retryFramePlans } from '../services/previs-frames.js'
 import { FRAME_COUNT_MIN, FRAME_COUNT_MAX } from '../services/previs-frame-contract.js'
@@ -81,7 +81,13 @@ app.get('/previs/continuity-review-settings', c => success(c, getContinuityRevie
 app.put('/previs/continuity-review-settings', async c => success(c, updateContinuityReviewSettings(await c.req.json())))
 app.get('/animatic-versions/:id/continuity-review-status', c => success(c, readContinuityReviewStatus(Number(c.req.param('id')))))
 app.get('/animatic-versions/:id/continuity-review-tasks', c => success(c, listContinuityReviewTasks(
-  positiveId.parse(Number(c.req.param('id'))), { page: c.req.query('page'), pageSize: c.req.query('pageSize') },
+  positiveId.parse(Number(c.req.param('id'))), {
+    page: c.req.query('page'), pageSize: c.req.query('pageSize'),
+    status: c.req.query('status'), keyword: c.req.query('keyword'),
+  },
+)))
+app.get('/animatic-versions/:id/continuity-review-tasks/:taskId', c => success(c, getContinuityReviewTask(
+  positiveId.parse(Number(c.req.param('id'))), positiveId.parse(Number(c.req.param('taskId'))),
 )))
 app.get('/animatic-versions/:id/continuity-reviews', c =>
   success(c, listContinuityReviews(Number(c.req.param('id')))))
