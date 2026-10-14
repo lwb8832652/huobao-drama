@@ -275,7 +275,7 @@ defineExpose({ confirmGeneration, refresh })
 <template>
   <section class="evaluation-entry" aria-label="连续性评测" data-testid="continuity-review-panel">
     <button type="button" ref="trigger" class="btn evaluation-trigger" data-testid="evaluation-trigger" aria-haspopup="dialog" :aria-expanded="expanded" :title="historyError ? '评测状态查询异常' : '查看评测任务'" @click="expanded = !expanded">
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 5H5v16h14V5h-4M9 3h6v4H9zM8 12h8M8 16h5" /></svg>
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5H5v16h14V5h-4M9 3h6v4H9zM8 12h8M8 16h5" /></svg>
       评测 <span v-if="history.activeCount" class="evaluation-badge" role="status" :aria-label="`${history.activeCount} 项评测排队或执行中`">{{ history.activeCount }}</span><span v-if="historyError" class="evaluation-query-error" aria-label="状态查询异常">!</span>
     </button>
     <Teleport to="body">
@@ -323,7 +323,8 @@ defineExpose({ confirmGeneration, refresh })
 <style scoped>
 .evaluation-entry { display: inline-flex; flex-shrink: 0; }
 .evaluation-trigger { position: relative; gap: 6px; white-space: nowrap; }
-.evaluation-badge { min-width: 17px; padding: 1px 5px; border-radius: 10px; background: var(--accent); color: var(--action-primary-text, #fff); font-size: 10px; line-height: 16px; font-variant-numeric: tabular-nums; }
+.evaluation-trigger:focus-visible { outline: none; box-shadow: 0 0 0 3.5px var(--button-focus); }
+.evaluation-badge { min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px; background: var(--accent); color: var(--action-primary-text, #fff); font-size: 10px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; line-height: 1; font-variant-numeric: tabular-nums; }
 .evaluation-query-error { color: var(--warning, #ad7839); }
 .evaluation-overlay { position: fixed; inset: 0; z-index: 1200; background: var(--scrim, #15203338); backdrop-filter: blur(5px); display: flex; justify-content: flex-end; }
 .evaluation-drawer { width: min(680px, 100vw); height: 100%; min-height: 0; display: flex; flex-direction: column; border-left: 1px solid var(--border, #e5e9f0); background: var(--surface-raised, #fff); color: var(--text-1, #536172); box-shadow: -12px 0 48px #14243b1a; font-size: 13px; animation: evaluation-in .2s ease-out; outline: 0; }

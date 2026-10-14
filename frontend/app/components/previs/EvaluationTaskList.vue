@@ -23,12 +23,11 @@ const emit = defineEmits<{
   create: []
 }>()
 const filters: { key: EvaluationTaskFilter; label: string }[] = [
-  { key: 'all', label: '全部' }, { key: 'active', label: '进行中' }, { key: 'completed', label: '已完成' }, { key: 'failed', label: '失败' },
+  { key: 'active', label: '进行中' }, { key: 'completed', label: '完成' }, { key: 'failed', label: '失败' },
 ]
 function filterCount(key: EvaluationTaskFilter) {
-  if (key === 'all') return props.summary?.total
   if (key === 'active') return props.summary?.active ?? props.activeCount
-  return props.summary?.[key]
+  return key === 'all' ? undefined : props.summary?.[key]
 }
 function toggleFilter(key: EvaluationTaskFilter) { emit('filter', props.filter === key ? 'all' : key) }
 const stateNames = { pending: '排队中', processing: '评测中', completed: '已完成', failed: '失败' }
@@ -40,7 +39,7 @@ function taskAriaLabel(item: EvaluationListItem) {
 <template>
   <div class="evaluation-list-view">
     <div class="evaluation-metrics" role="group" aria-label="筛选评测任务状态">
-      <button v-for="option in filters" :key="option.key" type="button" :class="['metric', `metric-${option.key}`, { on: filter === option.key }]" :aria-pressed="filter === option.key" :title="filter === option.key && option.key !== 'all' ? '再次点击查看全部任务' : `查看${option.label}任务`" @click="toggleFilter(option.key)">{{ option.label }}<b v-if="filterCount(option.key) !== undefined">{{ filterCount(option.key) }}</b></button>
+      <button v-for="option in filters" :key="option.key" type="button" :class="['metric', `metric-${option.key}`, { on: filter === option.key }]" :aria-pressed="filter === option.key" :title="filter === option.key ? '再次点击取消筛选' : `查看${option.label}任务`" @click="toggleFilter(option.key)"><b v-if="filterCount(option.key) !== undefined">{{ filterCount(option.key) }}</b>{{ option.label }}</button>
     </div>
     <div class="evaluation-tools">
       <label class="evaluation-search"><Search :size="14" /><input :value="keyword" aria-label="搜索评测任务" placeholder="搜索镜头、模型或任务编号" maxlength="200" @input="emit('search', ($event.target as HTMLInputElement).value)"><button v-if="keyword" type="button" aria-label="清空搜索" @click="emit('search', '')"><X :size="12" /></button></label>
@@ -61,8 +60,8 @@ function taskAriaLabel(item: EvaluationListItem) {
 
 <style scoped>
 .evaluation-list-view{display:flex;flex-direction:column;min-height:0;flex:1}
-.evaluation-metrics{display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:14px 24px;border-bottom:1px solid var(--border,#e7ebf1)}
-.metric{display:inline-flex;align-items:center;gap:5px;min-height:26px;padding:1px 10px;border:1px solid var(--surface-outline,#e7ebf1);border-radius:999px;background:var(--overlay-track,#f1f3f6);color:var(--text-2,#7a8796);font:inherit;font-size:11px;font-weight:750;white-space:nowrap;cursor:pointer;transition:box-shadow .15s}
+.evaluation-metrics{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:10px 16px;border-bottom:1px solid var(--surface-outline,#e7ebf1)}
+.metric{display:inline-flex;align-items:center;gap:5px;min-height:22px;padding:0 8px;border:1px solid var(--surface-outline,#e7ebf1);border-radius:999px;background:var(--overlay-track,#f1f3f6);color:var(--text-2,#7a8796);font:inherit;font-size:11px;font-weight:750;white-space:nowrap;cursor:pointer;transition:box-shadow .15s}
 .metric b{font-variant-numeric:tabular-nums;font-weight:inherit}
 .metric-active{color:var(--accent-text,#d77b2f);border-color:var(--accent-glow,#ffd9ba);background:var(--accent-bg,#fff0e4)}
 .metric-completed{color:var(--success,#35896b);border-color:var(--success-bg,#edf7f1);background:var(--success-bg,#edf7f1)}
@@ -116,8 +115,7 @@ function taskAriaLabel(item: EvaluationListItem) {
 button:focus-visible{outline:2px solid var(--accent,#f58b36);outline-offset:2px}
 .spin{animation:spin 1.3s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-@media(max-width:480px){.evaluation-metrics{padding:14px 16px}
-.evaluation-tools{padding:15px 16px}
+@media(max-width:480px){.evaluation-tools{padding:15px 16px}
 .evaluation-task-row{gap:10px;padding:14px 6px}
 .evaluation-preview{width:65px;height:51px}
 .evaluation-task-copy strong{font-size:12px}

@@ -3904,12 +3904,6 @@ onMounted(() => setTimeout(() => autoTour('episode', EPISODE_TOUR, t), 900))
   display: flex;
   gap: 6px;
 }
-.studio-topbar .btn {
-  height: 26px;
-  padding: 0 9px;
-  font-size: 10.5px;
-  white-space: nowrap;
-}
 
 .studio-body {
   display: grid;

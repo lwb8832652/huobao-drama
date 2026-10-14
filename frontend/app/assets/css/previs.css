@@ -78,7 +78,6 @@
 .pv-app .studio-model-picks,
 .pv-app .studio-actions { display: flex; align-items: center; gap: 6px; }
 .pv-app .studio-topbar-side { flex-shrink: 0; }
-.pv-app .studio-topbar .btn { height: 26px; padding: 0 9px; font-size: 10.5px; white-space: nowrap; }
 .pv-app .task-drawer-trigger { position: relative; }
 .pv-app .task-drawer-badge {
   min-width: 16px; height: 16px; padding: 0 4px; display: inline-flex; align-items: center; justify-content: center;
