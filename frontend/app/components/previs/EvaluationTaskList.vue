@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ChevronLeft, ChevronRight, Clock3, FileSearch, Loader2, Search, X } from 'lucide-vue-next'
 import type { EvaluationListItem, EvaluationTaskFilter } from '~/composables/useContinuityReview'
-defineProps<{
+const props = defineProps<{
   items: EvaluationListItem[]
   total: number
   summary?: { total: number; active: number; completed: number; failed: number }
@@ -25,6 +25,12 @@ const emit = defineEmits<{
 const filters: { key: EvaluationTaskFilter; label: string }[] = [
   { key: 'all', label: '全部' }, { key: 'active', label: '进行中' }, { key: 'completed', label: '已完成' }, { key: 'failed', label: '失败' },
 ]
+function filterCount(key: EvaluationTaskFilter) {
+  if (key === 'all') return props.summary?.total
+  if (key === 'active') return props.summary?.active ?? props.activeCount
+  return props.summary?.[key]
+}
+function toggleFilter(key: EvaluationTaskFilter) { emit('filter', props.filter === key ? 'all' : key) }
 const stateNames = { pending: '排队中', processing: '评测中', completed: '已完成', failed: '失败' }
 function taskAriaLabel(item: EvaluationListItem) {
   return [`查看${item.typeLabel}评测：${item.title}`, stateNames[item.status], item.score !== undefined ? `${item.score} 分` : '', !item.current ? '历史结果' : '', item.attention ? '需关注' : ''].filter(Boolean).join('，')
@@ -33,16 +39,10 @@ function taskAriaLabel(item: EvaluationListItem) {
 
 <template>
   <div class="evaluation-list-view">
-    <div class="evaluation-metrics" aria-label="全部评测任务统计">
-      <span class="metric metric-active"><i />进行中 <b>{{ summary?.active ?? activeCount }}</b></span>
-      <span v-if="summary" class="metric metric-done"><i />已完成 <b>{{ summary.completed }}</b></span>
-      <span v-if="summary" class="metric metric-failed"><i />失败 <b>{{ summary.failed }}</b></span>
-      <span v-if="summary" class="metric-total">共 {{ summary.total }} 项</span>
+    <div class="evaluation-metrics" role="group" aria-label="筛选评测任务状态">
+      <button v-for="option in filters" :key="option.key" type="button" :class="['metric', `metric-${option.key}`, { on: filter === option.key }]" :aria-pressed="filter === option.key" :title="filter === option.key && option.key !== 'all' ? '再次点击查看全部任务' : `查看${option.label}任务`" @click="toggleFilter(option.key)">{{ option.label }}<b v-if="filterCount(option.key) !== undefined">{{ filterCount(option.key) }}</b></button>
     </div>
     <div class="evaluation-tools">
-      <div class="evaluation-filters" role="group" aria-label="筛选评测任务状态">
-        <button v-for="option in filters" :key="option.key" type="button" :aria-pressed="filter === option.key" :class="{ on: filter === option.key }" @click="emit('filter', option.key)">{{ option.label }}</button>
-      </div>
       <label class="evaluation-search"><Search :size="14" /><input :value="keyword" aria-label="搜索评测任务" placeholder="搜索镜头、模型或任务编号" maxlength="200" @input="emit('search', ($event.target as HTMLInputElement).value)"><button v-if="keyword" type="button" aria-label="清空搜索" @click="emit('search', '')"><X :size="12" /></button></label>
     </div>
     <p v-if="error" class="evaluation-notice" role="alert">{{ error }}<span v-if="items.length"> · 暂时显示上次查询结果</span><button type="button" @click="emit('refresh')">重新加载</button></p>
@@ -61,19 +61,16 @@ function taskAriaLabel(item: EvaluationListItem) {
 
 <style scoped>
 .evaluation-list-view{display:flex;flex-direction:column;min-height:0;flex:1}
-.evaluation-metrics{display:flex;align-items:center;gap:20px;padding:15px 24px;border-bottom:1px solid var(--border,#e7ebf1);background:var(--surface-soft,#fafbfc)}
-.metric{display:inline-flex;align-items:center;gap:6px;color:var(--text-2,#7a8796);font-size:11px;white-space:nowrap}
-.metric i,.evaluation-status i{width:5px;height:5px;border-radius:50%;background:currentColor}
-.metric b{font-variant-numeric:tabular-nums;font-weight:600}
-.metric-active{color:var(--info,#6d80bc)}
-.metric-done{color:var(--success,#35896b)}
-.metric-failed{color:var(--error,#c66161)}
-.metric-total{margin-left:auto;font-size:11px;color:var(--text-3,#98a0ac)}
-.evaluation-tools{padding:17px 24px 15px;display:flex;flex-direction:column;gap:13px}
-.evaluation-filters{display:flex;gap:5px}
-.evaluation-filters button{padding:6px 12px;border-radius:7px;border:0;background:transparent;font:inherit;font-size:12px;color:var(--text-2,#798594);cursor:pointer}
-.evaluation-filters button:hover{background:var(--surface-soft,#f4f6f9)}
-.evaluation-filters button.on{background:var(--accent-bg,#fff0e4);color:var(--accent-text,#d77b2f);font-weight:600}
+.evaluation-metrics{display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:14px 24px;border-bottom:1px solid var(--border,#e7ebf1)}
+.metric{display:inline-flex;align-items:center;gap:5px;min-height:26px;padding:1px 10px;border:1px solid var(--surface-outline,#e7ebf1);border-radius:999px;background:var(--overlay-track,#f1f3f6);color:var(--text-2,#7a8796);font:inherit;font-size:11px;font-weight:750;white-space:nowrap;cursor:pointer;transition:box-shadow .15s}
+.metric b{font-variant-numeric:tabular-nums;font-weight:inherit}
+.metric-active{color:var(--accent-text,#d77b2f);border-color:var(--accent-glow,#ffd9ba);background:var(--accent-bg,#fff0e4)}
+.metric-completed{color:var(--success,#35896b);border-color:var(--success-bg,#edf7f1);background:var(--success-bg,#edf7f1)}
+.metric-failed{color:var(--warning,#bb7c37);border-color:var(--warning-bg,#fff3e5);background:var(--warning-bg,#fff3e5)}
+.metric:hover{box-shadow:0 0 0 2px var(--sel-glow,var(--bg-hover,#f1f3f6))}
+.metric.on{box-shadow:0 0 0 2px var(--accent,#f58b36)}
+.evaluation-status i{width:5px;height:5px;border-radius:50%;background:currentColor}
+.evaluation-tools{padding:15px 24px}
 .evaluation-search{display:flex;align-items:center;gap:9px;padding:9px 12px;background:var(--surface-input,#fafbfc);border:1px solid var(--border,#e5e9ef);border-radius:9px;color:var(--text-3,#939daa)}
 .evaluation-search:focus-within{border-color:var(--accent,#f58b36)}
 .evaluation-search input{border:0;outline:0;width:100%;min-width:0;font:inherit;font-size:12px;color:var(--text-0,#263241);background:transparent}
@@ -119,7 +116,7 @@ function taskAriaLabel(item: EvaluationListItem) {
 button:focus-visible{outline:2px solid var(--accent,#f58b36);outline-offset:2px}
 .spin{animation:spin 1.3s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-@media(max-width:480px){.evaluation-metrics{gap:12px;padding:14px 16px}
+@media(max-width:480px){.evaluation-metrics{padding:14px 16px}
 .evaluation-tools{padding:15px 16px}
 .evaluation-task-row{gap:10px;padding:14px 6px}
 .evaluation-preview{width:65px;height:51px}
@@ -127,5 +124,5 @@ button:focus-visible{outline:2px solid var(--accent,#f58b36);outline-offset:2px}
 .evaluation-task-outcome{min-width:53px}
 .evaluation-pagination{padding:14px 16px}}
 @media(prefers-reduced-motion:reduce){.spin{animation:none}
-.evaluation-task-row{transition:none}}
+.evaluation-task-row,.metric{transition:none}}
 </style>
