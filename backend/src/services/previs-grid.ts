@@ -27,6 +27,7 @@ import {
 import { composeGrid, mergeGridSelection, splitGrid } from './previs-grid-images.js'
 import { freezeReferenceMedia, mediaDigest, readReferenceMedia } from './previs-reference-media.js'
 import { scheduleContactSheets } from './previs-contact-sheets.js'
+import { scheduleContinuityReviews } from './continuity-review.js'
 import { chooseGridSize, gridImageCapabilities } from './previs-grid-capabilities.js'
 import { getDramaStylePrompt } from './style-preset.js'
 import { continuityMatchesTimeline, type PanelContinuity } from './previs-continuity.js'
@@ -823,6 +824,7 @@ export async function adoptGridCandidate(versionId: number, id: number, revision
     mirrorCurrent(versionId, t)
   })
   scheduleContactSheets(versionId, [row.panelId])
+  scheduleContinuityReviews(versionId, [row.panelId])
   return getVersion(versionId)
 }
 export async function startGridWorker() {

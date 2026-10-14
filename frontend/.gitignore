@@ -4,3 +4,5 @@ node_modules/
 .nuxt-build/
 .output/
 dist/
+!tests/continuity-review-panel.test.mjs
+!tests/storyboard-contact-sheet.test.mjs

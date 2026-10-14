@@ -7,7 +7,7 @@ import {
 } from '../services/previs.js'
 import { videoContinuityCapabilities } from '../services/previs-video-continuity.js'
 import { createBatch, updateBatch, videoCapabilities } from '../services/previs-batch.js'
-import { listContinuityReviews, reviewContinuity } from '../services/continuity-review.js'
+import { listContinuityReviews, listContinuityReviewTasks, reviewContinuity, getContinuityReviewSettings, updateContinuityReviewSettings, readContinuityReviewStatus } from '../services/continuity-review.js'
 import { scheduleContactSheets, readContactSheets, tickContactSheets } from '../services/previs-contact-sheets.js'
 import { startFramePlan, listFramePlans, retryFramePlans } from '../services/previs-frames.js'
 import { FRAME_COUNT_MIN, FRAME_COUNT_MAX } from '../services/previs-frame-contract.js'
@@ -77,6 +77,12 @@ app.post('/animatic-versions/:id/contact-sheets/:panelId/retry', async c => {
   void tickContactSheets()
   return success(c, { items: readContactSheets(id) })
 })
+app.get('/previs/continuity-review-settings', c => success(c, getContinuityReviewSettings()))
+app.put('/previs/continuity-review-settings', async c => success(c, updateContinuityReviewSettings(await c.req.json())))
+app.get('/animatic-versions/:id/continuity-review-status', c => success(c, readContinuityReviewStatus(Number(c.req.param('id')))))
+app.get('/animatic-versions/:id/continuity-review-tasks', c => success(c, listContinuityReviewTasks(
+  positiveId.parse(Number(c.req.param('id'))), { page: c.req.query('page'), pageSize: c.req.query('pageSize') },
+)))
 app.get('/animatic-versions/:id/continuity-reviews', c =>
   success(c, listContinuityReviews(Number(c.req.param('id')))))
 app.put('/animatic-versions/:id/timeline', async c => {

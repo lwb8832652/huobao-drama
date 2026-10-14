@@ -8,6 +8,7 @@ import { now } from '../utils/response.js'
 import { getDramaStylePrompt } from './style-preset.js'
 import { FRAME_COUNT_MAX } from './previs-frame-contract.js'
 import { scheduleContactSheets } from './previs-contact-sheets.js'
+import { scheduleContinuityReviews } from './continuity-review.js'
 import { buildVideoReferenceInput, videoReferenceMatchesSource } from './previs-video-reference.js'
 import { normalizeSnapshotImages } from './previs-video-reference-normalizer.js'
 import { freezeReferenceMedia } from './previs-reference-media.js'
@@ -366,7 +367,10 @@ function reconcile() {
                   updatedAt: now(),
                 }).where(eq(schema.storyboards.id, panel.id)).run()
               }
-              if (batch.type === 'image') scheduleContactSheets(row.id)
+              if (batch.type === 'image') {
+                scheduleContactSheets(row.id)
+                scheduleContinuityReviews(row.id, panel ? [panel.id] : undefined)
+              }
             }
           }
         }

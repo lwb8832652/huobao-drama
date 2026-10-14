@@ -25,6 +25,7 @@ import storage from './routes/storage.js'
 import serverUpdate from './routes/serverUpdate.js'
 import previs from './routes/previs.js'
 import { startPrevisWorker } from './services/previs-batch.js'
+import { startContinuityReviewWorker } from './services/continuity-review.js'
 import { startFramePlanWorker } from './services/previs-frames.js'
 import { startGridWorker } from './services/previs-grid.js'
 import { startContactSheetWorker } from './services/previs-contact-sheets.js'
@@ -113,6 +114,7 @@ db.update(schema.sysTask)
 
 serve({ fetch: app.fetch, port })
 void startPrevisWorker().catch(err => console.error('Previs worker startup failed:', err.message))
+void startContinuityReviewWorker().catch(err => console.error('Continuity review worker startup failed:', err.message))
 void startContactSheetWorker().catch(err => console.error('Contact sheet worker startup failed:', err.message))
 void startFramePlanWorker().catch(err => console.error('Frame plan worker startup failed:', err.message))
 

@@ -10,6 +10,7 @@ import {
 } from 'lucide-vue-next'
 import LocaleSwitcher from '~/components/LocaleSwitcher.vue'
 import ThemeToggle from '~/components/ThemeToggle.vue'
+import ContinuityReviewPanel from '~/components/previs/ContinuityReviewPanel.vue'
 import PrevisPlayer from '~/components/previs/PrevisPlayer.vue'
 import PrevisTimeline from '~/components/previs/PrevisTimeline.vue'
 import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.vue'
@@ -21,7 +22,7 @@ import { uploadAPI } from '~/composables/useApi'
 import {
   FRAME_COUNT_MAX, frameCountChangeAllowed, checkContinuity, createFrameId, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl, orderedFrames,
   applyFramePlanToPanel, contactSheetForPanel, videoContinuityReadiness, panelIncomingTransition, useVideoContinuityMode, useVideoContinuityCapabilities, videoGenerationScopeError, planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy,
-  type AudioClip, type ContinuityIssue, type ContinuityReview, type FrameType, type Keyframe,
+  type AudioClip, type ContinuityIssue, type FrameType, type Keyframe,
   type Panel, type PanelFramePlan, type Timeline, type VideoGenerationScope,
 } from '~/composables/usePrevis'
 import '~/assets/css/previs.css'
@@ -79,13 +80,7 @@ const ruleNames: Record<string, string> = {
   scene_bridge: '场景衔接', camera_jump: '机位跳变', audio_overflow: '音频超时',
   empty_group: '空镜头', empty_timeline: '没有分镜',
 }
-const reviewDimensionKeys = ['subject', 'scene', 'action', 'camera'] as const
-const reviewDimensionNames = {
-  subject: '人物与道具', scene: '场景与光线', action: '动作与视线', camera: '构图与机位',
-}
-const continuityReviews = ref<ContinuityReview[]>([])
-const continuityReviewLoading = ref(false), continuityReviewError = ref('')
-let continuityReviewLoadToken = 0
+const continuityPanel = ref<InstanceType<typeof ContinuityReviewPanel>>()
 const groups = computed(() => timeline.value?.groups || [])
 const segments = computed(() => timeline.value ? timelineSegments(timeline.value) : [])
 const total = computed(() => timeline.value ? durationMs(timeline.value) : 0)
@@ -103,19 +98,6 @@ const activeFrameId = computed(() => {
   return frame ? frameKey(frame) : ''
 })
 const edge = computed(() => timeline.value?.transitions.find(e => e.to === group.value?.id))
-const currentReview = computed(() => !dirty.value
-  ? continuityReviews.value.find(item => item.toGroupId === group.value?.id)
-  : undefined)
-const boundaryImages = computed(() => {
-  if (!timeline.value || !edge.value) return { from: '', to: '' }
-  const fromGroup = timeline.value.groups.find(item => item.id === edge.value?.from)
-  const fromPanel = fromGroup ? groupPanels(timeline.value, fromGroup).at(-1) : undefined
-  const toPanel = group.value ? groupPanels(timeline.value, group.value)[0] : undefined
-  return {
-    from: fromPanel ? orderedFrames(fromPanel).filter(item => item.url).at(-1)?.url || '' : '',
-    to: toPanel ? orderedFrames(toPanel).find(item => item.url)?.url || '' : '',
-  }
-})
 const issues = computed(() => timeline.value ? checkContinuity(timeline.value) : [])
 const fails = computed(() => issues.value.filter(i => i.severity === 'fail'))
 const warnings = computed(() => issues.value.filter(i => i.severity === 'warning' && !i.reason))
@@ -375,52 +357,6 @@ function applyWaiver() {
   edit(t => { t.acknowledgements[waiverIssue.value!.id] = waiverReason.value.trim() }); modal.value = ''
 }
 function showStrategy() { modal.value = 'strategy' }
-function confidenceName(value: ContinuityReview['result']['confidence']) {
-  return { high: '高置信度', medium: '中置信度', low: '低置信度' }[value]
-}
-async function loadContinuityReviews() {
-  const target = version.value
-  if (!target) { continuityReviews.value = []; return }
-  const token = ++continuityReviewLoadToken
-  try {
-    const result = await previsRequest<ContinuityReview[]>(`/animatic-versions/${target.id}/continuity-reviews`)
-    if (token === continuityReviewLoadToken && version.value?.id === target.id) continuityReviews.value = result
-  } catch {
-    if (token === continuityReviewLoadToken) continuityReviews.value = []
-  }
-}
-async function scoreContinuity() {
-  if (!version.value || !group.value || !edge.value) return
-  const force = !!currentReview.value
-  if (!await save() || !version.value) return
-  const choice = modelChoice('text')
-  if (!choice) { toast.error('请先选择文本模型'); return }
-  continuityReviewLoading.value = true
-  continuityReviewError.value = ''
-  try {
-    const review = await previsRequest<ContinuityReview>(
-      `/animatic-versions/${version.value.id}/continuity-reviews`,
-      'POST',
-      {
-        revision: version.value.revision,
-        toGroupId: group.value.id,
-        configId: choice.configId,
-        model: choice.model,
-        force,
-      },
-    )
-    continuityReviews.value = [
-      ...continuityReviews.value.filter(item => item.toGroupId !== review.toGroupId),
-      review,
-    ]
-    toast.success(review.cached ? '已读取缓存评分' : '连续性评分已完成')
-  } catch (cause: any) {
-    continuityReviewError.value = cause.message || '连续性评分失败'
-    throw cause
-  } finally {
-    continuityReviewLoading.value = false
-  }
-}
 async function generateFrames(ids?: number[], frameIds?: string[], force = false) {
   const model = modelChoice('image')
   if (!model) { showStrategy(); toast.error('请选择已启用的图片模型'); return }
@@ -572,6 +508,7 @@ async function startVideo() {
     return
   }
   if (!videoReferenceState.value.ready) { toast.error(videoReferenceState.value.error); return }
+  if (!await continuityPanel.value?.confirmGeneration(videoPanelIds.value)) return
   await generate('video', { configId: choice.configId, model: choice.model,
     panelIds: videoPanelIds.value.length ? videoPanelIds.value : undefined,
     generationMode: videoGenerationMode.value,
@@ -602,7 +539,6 @@ watch(modal, async value => {
   if (value) { player.value?.stop(); await nextTick(); if (!dialog.value?.open) dialog.value?.showModal() }
   else dialog.value?.close()
 })
-watch(() => [version.value?.id, version.value?.revision], () => { void loadContinuityReviews() })
 function onKey(event: KeyboardEvent) {
   if (modal.value || /INPUT|TEXTAREA|SELECT|BUTTON/.test((event.target as HTMLElement).tagName)) return
   if (event.code === 'Space') { event.preventDefault(); player.value?.toggle() }
@@ -712,6 +648,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
             {{ t('episode.topbar.tasks') }}
             <span v-if="activeTasks" class="task-drawer-badge">{{ activeTasks }}</span>
           </button>
+          <ContinuityReviewPanel ref="continuityPanel" :version="version" :timeline="timeline" :panel-ids="allIssues ? undefined : panels.map(p => p.id)" :text-model="modelChoice('text')" :save="save" :dirty="dirty" />
         </div>
       </div>
     </header>
@@ -876,7 +813,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
           </div>
         </section>
         <aside class="pv-inspector">
-          <div class="seg pv-inspector-tabs"><button v-for="tab in ['frames', 'issues', 'properties']" :key="tab" class="seg-item" :class="{ on: inspector === tab }" :aria-pressed="inspector === tab" @click="inspector = tab">{{ { frames: '画面', issues: '连续性', properties: '属性' }[tab] }}</button></div>
+          <div class="seg pv-inspector-tabs"><button v-for="tab in ['frames', 'issues', 'properties']" :key="tab" class="seg-item" :class="{ on: inspector === tab }" :aria-pressed="inspector === tab" @click="inspector = tab">{{ { frames: '画面', issues: '连续性评测', properties: '属性' }[tab] }}</button></div>
           <div class="pv-inspector-scroll">
             <template v-if="inspector === 'frames' && panel">
               <StoryboardGridTools
@@ -923,41 +860,6 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
               <p v-if="currentPanelVideo?.videoContinuity" class="pv-frame-note">当前视频：{{ currentPanelVideo.videoContinuity.actual === 'first_last' ? '首尾帧' : '画面参考' }}<template v-if="currentPanelVideo.stale"> · 输入已变化，请检查后重新生成</template><br v-if="currentPanelVideo.videoContinuity.fallbackReason">{{ currentPanelVideo.videoContinuity.fallbackReason }}</p>
             </template>
             <template v-else-if="inspector === 'issues'">
-              <section v-if="edge" class="pv-ai-review">
-                <header>
-                  <div><p class="pv-eyebrow">AI 相邻镜头评分</p><strong>{{ groups.find(item => item.id === edge?.from)?.title }} → {{ group?.title }}</strong></div>
-                  <button :disabled="continuityReviewLoading || working || !textModel" title="调用所选文本模型评分" @click="run(scoreContinuity)">
-                    <Loader2 v-if="continuityReviewLoading" :size="13" class="pv-spin" /><Sparkles v-else :size="13" />
-                    {{ currentReview ? '重新评分' : '开始评分' }}
-                  </button>
-                </header>
-                <div class="pv-ai-review-images">
-                  <figure><img v-if="boundaryImages.from" :src="mediaUrl(boundaryImages.from)" alt="上一镜头尾张"><span v-else><Images :size="18" /></span><figcaption>上一镜头</figcaption></figure>
-                  <ArrowRight :size="14" />
-                  <figure><img v-if="boundaryImages.to" :src="mediaUrl(boundaryImages.to)" alt="当前镜头首张"><span v-else><Images :size="18" /></span><figcaption>当前镜头</figcaption></figure>
-                </div>
-                <div v-if="currentReview" class="pv-ai-review-result">
-                  <div class="pv-ai-review-summary">
-                    <div class="pv-ai-review-score"><b>{{ currentReview.result.overallScore }}</b><span>/ 100</span></div>
-                    <div><span class="pv-confidence" :class="currentReview.result.confidence">{{ confidenceName(currentReview.result.confidence) }}</span><p>{{ currentReview.result.summary }}</p></div>
-                  </div>
-                  <div class="pv-ai-review-dimensions">
-                    <div v-for="key in reviewDimensionKeys" :key="key">
-                      <span>{{ reviewDimensionNames[key] }}</span><progress :value="currentReview.result.dimensions[key].score" max="25" /><b>{{ currentReview.result.dimensions[key].score }}</b>
-                      <small>{{ currentReview.result.dimensions[key].comment }}</small>
-                    </div>
-                  </div>
-                  <div v-if="currentReview.result.issues.length" class="pv-ai-review-list"><strong>发现的问题</strong><p v-for="item in currentReview.result.issues" :key="item">{{ item }}</p></div>
-                  <div v-if="currentReview.result.suggestions.length" class="pv-ai-review-list suggestions"><strong>修改建议</strong><p v-for="item in currentReview.result.suggestions" :key="item">{{ item }}</p></div>
-                  <footer><span>{{ currentReview.images.from && currentReview.images.to ? '双画面评分' : '文字辅助评分' }} · {{ currentReview.model }}</span><time>{{ new Date(currentReview.createdAt).toLocaleString() }}</time></footer>
-                </div>
-                <div v-else class="pv-ai-review-empty">
-                  <Loader2 v-if="continuityReviewLoading" :size="18" class="pv-spin" />
-                  <Sparkles v-else :size="18" />
-                  <span>{{ continuityReviewLoading ? '正在评分…' : continuityReviewError || (!textModel ? '请先配置文本模型' : dirty ? '镜头内容已修改，请保存后重新评分' : '尚未评分') }}</span>
-                </div>
-              </section>
-              <div v-else class="pv-ai-review-empty pv-ai-review-first"><Check :size="18" /><span>首个镜头无前序衔接</span></div>
               <div class="pv-check-summary"><div class="pv-score" :class="{ pass: !fails.length }"><ShieldCheck :size="24" /><b>{{ fails.length ? `${fails.length} 项` : '通过' }}</b></div><div><strong>{{ fails.length ? '镜头衔接需处理' : warnings.length ? '还有提示需要确认' : '已满足锁定条件' }}</strong><p>{{ fails.length }} 项阻断 · {{ warnings.length }} 项待确认</p></div></div>
               <div class="pv-issue-filter"><button :class="{ active: allIssues }" @click="allIssues = true">全部 {{ issues.length }}</button><button :class="{ active: !allIssues }" @click="allIssues = false">当前镜头</button></div>
               <div class="pv-issue-stack"><article v-for="issue in visibleIssues" :key="issue.id" class="pv-issue" :class="[issue.severity, { acknowledged: issue.reason }]"><button class="pv-issue-heading" @click="locateIssue(issue)"><span class="pv-status" :class="issue.reason ? 'pass' : issue.severity"><i />{{ issue.reason ? '已确认' : issue.severity === 'fail' ? '阻断' : '提示' }}</span><strong>{{ ruleNames[issue.rule] || issue.rule }}</strong><ArrowRight :size="13" /></button><p>{{ issue.message }}</p><small v-if="issue.reason">确认原因：{{ issue.reason }}</small><div class="pv-issue-actions"><button v-if="issue.rule === 'missing_frame'" :disabled="!editable" @click="run(() => planAndGenerate([issue.panelId!]))">添加并生成画面</button><button v-if="issue.severity === 'warning' && !issue.reason" :disabled="!editable" @click="waive(issue)">确认并记录原因</button><button @click="locateIssue(issue); inspector = 'properties'">修改属性</button></div></article><div v-if="!visibleIssues.length" class="pv-small-empty"><Check :size="26" /><strong>没有待处理问题</strong><p>可以继续预览或锁定当前版本。</p></div></div>

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { scheduleContinuityReviews } from './continuity-review.js'
 import { readContactSheets, scheduleContactSheets } from './previs-contact-sheets.js'
 import { videoContinuityMatchesTimeline, type VideoContinuitySnapshot } from './previs-video-continuity.js'
 import type { VideoReferenceInput } from './previs-video-reference-domain.js'
@@ -533,10 +534,15 @@ export function requireEditable(versionId: number, revision: number) {
   return row
 }
 export function saveTimeline(versionId: number, revision: number, input: unknown) {
+  const changedImages: number[] = []
   db.transaction(tx => {
     const row = requireEditable(versionId, revision)
     const original = normalizeTimeline(JSON.parse(row.timelineJson))
     const timeline = validateTimeline(input, original)
+    for (const panel of timeline.panels) {
+      const before = original.panels.find(item => item.id === panel.id)
+      if (hashContent(panel.frames.map(frame => [frameKey(frame), frame.url])) !== hashContent(before?.frames.map(frame => [frameKey(frame), frame.url]))) changedImages.push(panel.id)
+    }
     timeline.inheritedOutputs = original.inheritedOutputs?.map(o => ({
       ...o, stale: o.stale || videoFingerprint(
         original, original.panels.filter(p => o.panelIds.includes(p.id)), o.generationMode || 'storyboard_frames', o.referenceInput, o.videoContinuity,
@@ -573,6 +579,7 @@ export function saveTimeline(versionId: number, revision: number, input: unknown
     mirrorCurrent(versionId, timeline)
   })
   scheduleContactSheets(versionId)
+  if (changedImages.length) scheduleContinuityReviews(versionId, changedImages)
   return getVersion(versionId)
 }
 export function checkOrLock(versionId: number, revision: number, lock: boolean) {

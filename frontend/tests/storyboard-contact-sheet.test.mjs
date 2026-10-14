@@ -237,6 +237,7 @@ test('workbench and standalone handlers submit the chosen strategy and block una
       const model = { key: 'provider/model', configId: 9, model: 'model' }
       const state = { ready, error: '宫格尚未就绪', effective: 'contact_sheet' }
       const h = evaluate(functions, {}, {
+        continuityPanel: vue.ref({ confirmGeneration: async () => true }),
         videoContinuityMode: vue.ref('auto'), videoReferenceInputStrategy: vue.ref('contact_sheet'), videoUsesStoryboardFrames: vue.ref(true),
         batchVideoGenerationScope: vue.ref(scope), videoGenerationScope: vue.ref(scope),
         batchVideoReferenceState: vue.ref(state),

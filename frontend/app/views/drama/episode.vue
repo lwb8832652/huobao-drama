@@ -66,6 +66,7 @@
             {{ t('episode.topbar.tasks') }}
             <span v-if="genTaskActiveCount" class="task-drawer-badge">{{ genTaskActiveCount }}</span>
           </button>
+          <ContinuityReviewPanel ref="continuityPanel" :version="productionVersion" :timeline="productionTimeline" :text-model="textModelOptions.find(option => option.key === chatModel) || textModelOptions[0]" :save="saveProduction" :dirty="productionDirty" />
         </div>
       </div>
     </header>
@@ -1517,6 +1518,7 @@ import { useAgent } from '~/composables/useAgent'
 import { toastError, mapError, MODERATION_RE } from '~/composables/useToast'
 import LocaleSwitcher from '~/components/LocaleSwitcher.vue'
 import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.vue'
+import ContinuityReviewPanel from '~/components/previs/ContinuityReviewPanel.vue'
 import VideoContinuityControl from '~/components/previs/VideoContinuityControl.vue'
 import StoryboardGridTools from '~/components/previs/StoryboardGridTools.vue'
 import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
@@ -1533,7 +1535,7 @@ const episodeNumber = Number(route.params.episodeNumber)
 
 const drama = ref(null), episode = ref(null), chars = ref([]), scenes = ref([]), propItems = ref([]), sbs = ref([]), mergeData = ref(null)
 const {
-  version: productionVersion, timeline: productionTimeline, editable: productionEditable,
+  version: productionVersion, timeline: productionTimeline, editable: productionEditable, dirty: productionDirty,
   generatable: productionGeneratable, retryContactSheet: retryProductionContactSheet, working: productionWorking, initialize: initializeProduction, create: createProduction,
   edit: editProduction, save: saveProduction, generate: generateProduction, adoptGridCandidate: adoptProductionGridCandidate,
 } = usePrevis()
@@ -1550,6 +1552,7 @@ const videoReferenceInputStrategy = useVideoReferenceInputStrategy()
 const videoContinuityMode = useVideoContinuityMode()
 const videoCapabilities = ref({})
 const productionGridBusy = ref(false)
+const continuityPanel = ref(null)
 // 工作台面板位置记忆（按剧集隔离）：仅页面刷新(reload)时恢复到上次所在步骤；
 // 从列表/详情页点击进入时始终默认「剧本」面板
 const PANEL_STORE_KEY = `huobao:workbench:panel:${dramaId}:${episodeNumber}`
@@ -2394,6 +2397,7 @@ async function confirmBatchVideos() {
   const option = videoGenerationOption.value
   if (!productionVersion.value || !option) { toast.error('请先启用视频模型并载入当前工作版'); return }
   if (!batchVideoReferenceState.value.ready) { toast.error(batchVideoReferenceState.value.error); return }
+  if (!await continuityPanel.value?.confirmGeneration(ids)) return
   batchVideoConfirm.value = { open: false, targets: [] }
   try {
     await generateProduction('video', {
@@ -3625,6 +3629,7 @@ async function genVid(sb, opts = {}) {
   if (!productionVersion.value || !productionPanelById(sb.id)) { toast.error('当前工作版尚未就绪'); return }
   if (!videoCanGenerate(sb.id)) { toast.error(productionReferenceState(sb.id).error); return }
   if (!option) { toast.error('请先启用视频模型'); return }
+  if (!await continuityPanel.value?.confirmGeneration([sb.id])) return
   try {
     delete failedVideoMessages.value[sb.id]
     await generateProduction('video', {
@@ -4527,7 +4532,7 @@ onMounted(() => setTimeout(() => autoTour('episode', EPISODE_TOUR, t), 900))
 .prod-tab.active .prod-tab-badge { background: var(--accent-bg); color: var(--accent-text); }
 
 /* Production content */
-.prod-content { flex: 1; overflow-y: auto; padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 10px; }
+.prod-content { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 10px; }
 .prod-section-bar { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .prod-section-bar > .ml-auto { min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
 
@@ -4950,6 +4955,7 @@ onMounted(() => setTimeout(() => autoTour('episode', EPISODE_TOUR, t), 900))
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(460px, 55%);
+  grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
   border: 1px solid var(--surface-outline);
   border-radius: var(--radius-lg);

@@ -48,6 +48,9 @@ export const continuityReviews = sqliteTable('continuity_reviews', {
   status: text('status').notNull().default('completed'),
   resultJson: text('result_json').notNull().default(''),
   error: text('error'),
+  inputJson: text('input_json'),
+  startedAt: text('started_at'),
+  finishedAt: text('finished_at'),
   createdAt: text('created_at').notNull(),
 }, table => [
   uniqueIndex('idx_continuity_review_input').on(
@@ -155,6 +158,9 @@ export function initPrevisSchema(sqlite: Database.Database) {
   }
   if (!reviewColumns.some(c => c.name === 'error')) {
     sqlite.exec('ALTER TABLE continuity_reviews ADD COLUMN error TEXT')
+  }
+  for (const name of ['input_json', 'started_at', 'finished_at']) {
+    if (!reviewColumns.some(c => c.name === name)) sqlite.exec(`ALTER TABLE continuity_reviews ADD COLUMN ${name} TEXT`)
   }
   const columns = sqlite.prepare('PRAGMA table_info(sys_task)').all() as { name: string }[]
   for (const [name, type] of [['animatic_version_id', 'INTEGER'], ['previs_item_key', 'TEXT']]) {

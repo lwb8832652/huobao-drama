@@ -1,7 +1,9 @@
-import { Agent } from '@mastra/core/agent'
+import { RequestContext } from '@mastra/core/request-context'
 import { and, desc, eq } from 'drizzle-orm'
 import { z } from 'zod'
-import { resolveTextModel } from '../agents/index.js'
+import { agentRegistry } from '../agents/index.js'
+import { loadBasePromptFile } from '../agents/prompts.js'
+import { getContentLanguage } from './app-settings.js'
 import { db, schema } from '../db/index.js'
 import { now } from '../utils/response.js'
 import { parseDataUrl, readImageAsCompressedDataUrl } from '../utils/storage.js'
@@ -12,22 +14,43 @@ import {
 } from './previs-domain.js'
 import { hashContent, PrevisError, versionRow } from './previs.js'
 
+// 模型输出容错（对齐 storyboard-tools 的 looseBool/looseNum 约定）：
+// qwen 等模型偶尔会省略 comment、把 score 返回成数字字符串、或漏给 summary——
+// 这些不影响评分本质，回退为默认值而不是让整条评测失败。
+const looseNum = <A extends z.ZodTypeAny>(schema: A): A =>
+  z.preprocess((v) => (typeof v === 'string' && v.trim() !== '' && !isNaN(Number(v)) ? Number(v) : v), schema) as unknown as A
+const looseComment = z.preprocess(
+  (v) => (typeof v === 'string' && v.trim() ? v : '未说明'),
+  z.string().trim().min(1).max(1000),
+)
 const dimensionSchema = z.object({
-  score: z.number().min(0).max(25),
-  comment: z.string().trim().min(1).max(1000),
+  score: looseNum(z.number().min(0).max(25)),
+  comment: looseComment,
 })
 export const continuityReviewResultSchema = z.object({
-  overallScore: z.number().min(0).max(100),
-  confidence: z.enum(['high', 'medium', 'low']),
-  summary: z.string().trim().min(1).max(2000),
+  overallScore: looseNum(z.number().min(0).max(100)),
+  confidence: z.preprocess(
+    (v) => (['high', 'medium', 'low'].includes(v as string) ? v : 'low'),
+    z.enum(['high', 'medium', 'low']),
+  ),
+  summary: z.preprocess(
+    (v) => (typeof v === 'string' && v.trim() ? v : '未提供摘要'),
+    z.string().trim().min(1).max(2000),
+  ),
   dimensions: z.object({
     subject: dimensionSchema,
     scene: dimensionSchema,
     action: dimensionSchema,
     camera: dimensionSchema,
   }),
-  issues: z.array(z.string().trim().min(1).max(1000)).max(8),
-  suggestions: z.array(z.string().trim().min(1).max(1000)).max(8),
+  issues: z.preprocess(
+    (v) => (Array.isArray(v) ? v.filter(item => typeof item === 'string' && item.trim()) : []),
+    z.array(z.string().trim().min(1).max(1000)).max(8),
+  ),
+  suggestions: z.preprocess(
+    (v) => (Array.isArray(v) ? v.filter(item => typeof item === 'string' && item.trim()) : []),
+    z.array(z.string().trim().min(1).max(1000)).max(8),
+  ),
 })
 
 interface ReviewPanelContext {
@@ -70,6 +93,7 @@ interface ReviewOptions {
   configId?: number
   model?: string
   force?: boolean
+  expectedInputHash?: string
 }
 
 interface ReviewerOptions {
@@ -82,11 +106,28 @@ export type ContinuityReviewer = (
   options: ReviewerOptions,
 ) => Promise<ContinuityReviewResult>
 
+export const continuityReviewSettingsSchema = z.object({
+  enabled: z.boolean(),
+  threshold: z.number().int().min(0).max(100),
+})
+const SETTINGS_KEY = 'continuity_review_settings'
+export function getContinuityReviewSettings() {
+  const row = db.select().from(schema.appSettings).where(eq(schema.appSettings.key, SETTINGS_KEY)).get()
+  const parsed = continuityReviewSettingsSchema.safeParse(row ? JSON.parse(row.value) : null)
+  return parsed.success ? parsed.data : { enabled: false, threshold: 70 }
+}
+export function updateContinuityReviewSettings(input: unknown) {
+  const settings = continuityReviewSettingsSchema.parse(input)
+  db.insert(schema.appSettings).values({ key: SETTINGS_KEY, value: JSON.stringify(settings), updatedAt: now() })
+    .onConflictDoUpdate({ target: schema.appSettings.key, set: { value: JSON.stringify(settings), updatedAt: now() } }).run()
+  return settings
+}
+
 const activeReviews = new Map<number, Promise<ContinuityReview>>()
 const REVIEW_LEASE_MS = 30 * 60 * 1000
 
 function reviewClaimExpired(row: typeof schema.continuityReviews.$inferSelect) {
-  const claimedAt = Date.parse(row.createdAt)
+  const claimedAt = Date.parse(row.startedAt || row.createdAt)
   return !Number.isFinite(claimedAt) || Date.now() - claimedAt >= REVIEW_LEASE_MS
 }
 
@@ -193,21 +234,12 @@ async function imagePart(url: string) {
   }
 }
 
-const reviewerInstructions = `你是影视制作中的镜头连续性审核员。请比较上一镜头的结束状态与当前镜头的开始状态。
-只依据给定图片和文字资料判断，不得臆造画外信息。场景切换、建立镜头、声音桥及明确允许的变化不应被误判为穿帮。
-四项各 0-25 分：subject=人物与关键道具，scene=场景、时间与光线，action=动作、姿态、视线与方向，camera=构图、景别与机位衔接。
-overallScore 必须等于四项之和。图片缺失时仍可依据文字评分，但 confidence 必须为 low，并在 summary 中说明依据有限。
-issues 只列明确问题，没有则返回空数组；suggestions 给出可直接修改分镜或提示词的建议。
-只输出一个 JSON 对象，不要 Markdown，不要代码围栏，不要补充解释。`
-
 export const runContinuityReviewer: ContinuityReviewer = async (input, options) => {
-  const model = await resolveTextModel(options.model, options.configId)
-  const agent = new Agent({
-    id: 'continuity-reviewer',
-    name: '镜头连续性审核',
-    instructions: reviewerInstructions,
-    model,
-  })
+  const agent = agentRegistry['continuity-reviewer']
+  const requestContext = new RequestContext()
+  requestContext.set('modelOverride', options.model)
+  requestContext.set('textConfigId', options.configId)
+  requestContext.set('language', getContentLanguage())
   const content: any[] = [{
     type: 'text',
     text: `请评估以下相邻镜头。结构化资料：\n${JSON.stringify(input, null, 2)}`,
@@ -220,7 +252,7 @@ export const runContinuityReviewer: ContinuityReviewer = async (input, options) 
     content.push({ type: 'text', text: '当前镜头的第一张可用画面：' })
     content.push(await imagePart(input.to.frame.url))
   }
-  const response = await agent.generate([{ role: 'user', content }], { maxSteps: 1 })
+  const response = await agent.generate([{ role: 'user', content }], { maxSteps: 1, requestContext })
   return parseReview(response.text)
 }
 
@@ -263,16 +295,128 @@ export function listContinuityReviews(versionId: number): ContinuityReview[] {
   })
 }
 
+export const continuityReviewTaskPageSchema = z.object({
+  page: z.coerce.number().int().min(1).max(1_000_000).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+})
+
+export function listContinuityReviewTasks(versionId: number, pagination: unknown = {}) {
+  const { page, pageSize } = continuityReviewTaskPageSchema.parse(pagination)
+  const timeline = normalizeTimeline(JSON.parse(versionRow(versionId).timelineJson))
+  const settings = getContinuityReviewSettings()
+  const inputs = new Map<string, ContinuityReviewInput>()
+  for (const edge of timeline.transitions) {
+    try {
+      const input = reviewInput(timeline, edge.to)
+      inputs.set(`${edge.from}:${edge.to}:${hashContent(input)}`, input)
+    } catch { /* 已删除或不完整的边界没有有效输入。 */ }
+  }
+  const rows = db.select().from(schema.continuityReviews)
+    .where(eq(schema.continuityReviews.versionId, versionId))
+    .orderBy(desc(schema.continuityReviews.id)).all()
+  const currentInput = (row: typeof schema.continuityReviews.$inferSelect) =>
+    inputs.get(`${row.fromGroupId}:${row.toGroupId}:${row.inputHash}`)
+  const resultOf = (row: typeof schema.continuityReviews.$inferSelect) => {
+    if (!row.resultJson) return null
+    try {
+      const parsed = continuityReviewResultSchema.safeParse(JSON.parse(row.resultJson))
+      return parsed.success ? parsed.data : null
+    } catch { return null }
+  }
+  return {
+    type: 'continuity' as const, page, pageSize, total: rows.length,
+    activeCount: rows.filter(row => row.status === 'pending' || row.status === 'processing').length,
+    lowScore: rows.filter(row => currentInput(row) && row.status === 'completed'
+      && (resultOf(row)?.overallScore ?? 100) < settings.threshold).length,
+    items: rows.slice((page - 1) * pageSize, page * pageSize).map(row => {
+      const current = currentInput(row)
+      let input: ContinuityReviewInput | undefined = current
+      if (row.inputJson) {
+        try { input = JSON.parse(row.inputJson) } catch { /* 旧记录仍可读取状态和错误。 */ }
+      }
+      return {
+        id: row.id, type: 'continuity' as const, versionId: row.versionId,
+        status: row.status, current: !!current, inputHash: row.inputHash,
+        result: resultOf(row), error: row.error, configId: row.configId, model: row.model,
+        createdAt: row.createdAt, startedAt: row.startedAt, finishedAt: row.finishedAt,
+        fromGroupId: row.fromGroupId, toGroupId: row.toGroupId,
+        fromGroupTitle: input?.from?.group?.title ?? null,
+        toGroupTitle: input?.to?.group?.title ?? null,
+        images: { from: input?.from?.frame?.url ?? null, to: input?.to?.frame?.url ?? null },
+      }
+    }),
+  }
+}
+
+export function scheduleContinuityReviews(versionId: number, panelIds?: number[]) {
+  if (!getContinuityReviewSettings().enabled) return
+  const timeline = normalizeTimeline(JSON.parse(versionRow(versionId).timelineJson))
+  for (const edge of timeline.transitions) {
+    const input = reviewInput(timeline, edge.to)
+    if (panelIds && !panelIds.includes(input.from.panel.id) && !panelIds.includes(input.to.panel.id)) continue
+    if (!input.from.frame?.url || !input.to.frame?.url) continue
+    db.insert(schema.continuityReviews).values({
+      versionId, fromGroupId: edge.from, toGroupId: edge.to, inputHash: hashContent(input),
+      configId: 0, model: '', status: 'pending', resultJson: '', inputJson: JSON.stringify(input), createdAt: now(),
+    }).onConflictDoNothing().run()
+  }
+}
+
+export function readContinuityReviewStatus(versionId: number) {
+  const settings = getContinuityReviewSettings()
+  const timeline = normalizeTimeline(JSON.parse(versionRow(versionId).timelineJson))
+  const rows = db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.versionId, versionId)).all()
+  return { settings, items: timeline.transitions.map(edge => {
+    const input = reviewInput(timeline, edge.to), inputHash = hashContent(input)
+    const row = rows.find(row => row.fromGroupId === edge.from && row.toGroupId === edge.to && row.inputHash === inputHash)
+    const result = row?.status === 'completed' ? continuityReviewResultSchema.parse(JSON.parse(row.resultJson)) : null
+    return { id: row?.id ?? null, fromGroupId: edge.from, toGroupId: edge.to, inputHash,
+      status: row?.status ?? (input.from.frame?.url && input.to.frame?.url ? 'idle' : 'missing_images'),
+      result, error: row?.error ?? null, lowScore: !!result && result.overallScore < settings.threshold }
+  }) }
+}
+
+let autoReviewTick: Promise<void> | undefined
+export function tickContinuityReviews(reviewer: ContinuityReviewer = runContinuityReviewer): Promise<void> {
+  if (autoReviewTick) return autoReviewTick
+  autoReviewTick = (async () => {
+    if (!getContinuityReviewSettings().enabled) return
+    const pending = db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.status, 'pending'))
+      .orderBy(schema.continuityReviews.id).all()
+    for (const row of pending) {
+      if (!getContinuityReviewSettings().enabled) break
+      try {
+        const version = versionRow(row.versionId)
+        await reviewContinuity(row.versionId, { revision: version.revision, toGroupId: row.toGroupId,
+          expectedInputHash: row.inputHash }, reviewer)
+      } catch (error: any) {
+        db.update(schema.continuityReviews).set({ status: 'failed', error: error?.message || '连续性评分失败', finishedAt: now() })
+          .where(and(eq(schema.continuityReviews.id, row.id), eq(schema.continuityReviews.status, 'pending'))).run()
+      }
+    }
+  })().finally(() => { autoReviewTick = undefined })
+  return autoReviewTick
+}
+
+export async function startContinuityReviewWorker() {
+  // 中断的付费请求可能已执行，不自动重试，以免重复计费；可通过手动评分重试。
+  db.update(schema.continuityReviews).set({ status: 'failed', error: '服务重启中断评分，请手动重试', finishedAt: now() })
+    .where(eq(schema.continuityReviews.status, 'processing')).run()
+  await tickContinuityReviews()
+  setInterval(() => { void tickContinuityReviews().catch(error => console.error('Continuity review worker:', error.message)) }, 1500).unref()
+}
+
 export async function reviewContinuity(
   versionId: number,
   options: ReviewOptions,
   reviewer: ContinuityReviewer = runContinuityReviewer,
 ): Promise<ContinuityReview> {
   const row = versionRow(versionId)
-  if (row.revision !== options.revision) throw new PrevisError('版本已更新，请刷新后重新评分', 409)
+  if (!options.expectedInputHash && row.revision !== options.revision) throw new PrevisError('版本已更新，请刷新后重新评分', 409)
   const timeline = normalizeTimeline(JSON.parse(row.timelineJson))
   const input = reviewInput(timeline, options.toGroupId)
   const inputHash = hashContent(input)
+  if (options.expectedInputHash && options.expectedInputHash !== inputHash) throw new PrevisError('评测输入已过期', 409)
   const identity = and(
     eq(schema.continuityReviews.versionId, versionId),
     eq(schema.continuityReviews.fromGroupId, input.from.group.id),
@@ -281,10 +425,10 @@ export async function reviewContinuity(
   )
   const prior = db.select().from(schema.continuityReviews).where(identity).get()
   if (prior?.status === 'completed' && !options.force) return serializeReview(prior, input, true)
-  if (prior?.status === 'processing' && !reviewClaimExpired(prior)) {
+  if (prior?.status === 'processing') {
     const running = activeReviews.get(prior.id)
     if (running) return { ...await running, cached: true }
-    throw new PrevisError('该镜头边界正在评分，请稍后刷新结果', 409)
+    if (!reviewClaimExpired(prior)) throw new PrevisError('该镜头边界正在评分，请稍后刷新结果', 409)
   }
 
   const configId = options.configId || await getActiveConfigId('text')
@@ -294,8 +438,12 @@ export async function reviewContinuity(
   if (!configRow?.isActive || configRow.serviceType !== 'text') throw new PrevisError('所选文本模型配置不可用')
   const config = await getConfigById(configId)
   if (!config) throw new PrevisError('所选文本模型配置不可用')
-  const model = options.model || config.model
+  const promptFile = await loadBasePromptFile('continuity-reviewer')
+  const model = options.model || promptFile?.model || config.model
   if (!model) throw new PrevisError('所选文本模型没有可用模型')
+  if (hashContent(reviewInput(normalizeTimeline(JSON.parse(versionRow(versionId).timelineJson)), options.toGroupId)) !== inputHash) {
+    throw new PrevisError('评测输入已过期', 409)
+  }
 
   const claim = db.transaction(tx => {
     const current = tx.select().from(schema.continuityReviews).where(identity).get()
@@ -312,14 +460,18 @@ export async function reviewContinuity(
       model,
       status: 'processing',
       error: null,
-      createdAt: now(),
+      resultJson: '',
+      inputJson: JSON.stringify(input),
+      startedAt: now(),
+      finishedAt: null,
+      createdAt: current?.createdAt || now(),
     }
     if (current) {
       tx.update(schema.continuityReviews).set(values)
         .where(eq(schema.continuityReviews.id, current.id)).run()
       return { id: current.id, owner: true, row: null }
     }
-    const id = Number(tx.insert(schema.continuityReviews).values({ ...values, resultJson: '' }).run().lastInsertRowid)
+    const id = Number(tx.insert(schema.continuityReviews).values(values).run().lastInsertRowid)
     return { id, owner: true, row: null }
   })
   if (!claim.owner) {
@@ -336,18 +488,23 @@ export async function reviewContinuity(
         result.confidence = 'low'
         if (!/图片|画面|文字/.test(result.summary)) result.summary = `边界画面不完整；${result.summary}`
       }
-      if (versionRow(versionId).revision !== options.revision) {
-        throw new PrevisError('评分期间版本已更新，本次结果未保存，请重新评分', 409)
+      const currentTimeline = normalizeTimeline(JSON.parse(versionRow(versionId).timelineJson))
+      let currentHash: string | undefined
+      try { currentHash = hashContent(reviewInput(currentTimeline, options.toGroupId)) } catch { /* 边界可能已删除。 */ }
+      if (currentHash !== inputHash) {
+        db.update(schema.continuityReviews).set({ resultJson: JSON.stringify(result) })
+          .where(eq(schema.continuityReviews.id, claim.id)).run()
+        throw new PrevisError('评分期间输入已变化，本次结果仅保留在历史中，请重新评分', 409)
       }
       db.update(schema.continuityReviews).set({
-        status: 'completed', resultJson: JSON.stringify(result), error: null, createdAt: now(),
+        status: 'completed', resultJson: JSON.stringify(result), error: null, finishedAt: now(),
       }).where(eq(schema.continuityReviews.id, claim.id)).run()
       const saved = db.select().from(schema.continuityReviews)
         .where(eq(schema.continuityReviews.id, claim.id)).get()!
       return serializeReview(saved, input, false)
     } catch (error: any) {
       db.update(schema.continuityReviews).set({
-        status: 'failed', error: error?.message || '连续性评分失败',
+        status: 'failed', error: error?.message || '连续性评分失败', finishedAt: now(),
       }).where(eq(schema.continuityReviews.id, claim.id)).run()
       throw error
     }

@@ -1002,6 +1002,7 @@ const agentSaved = ref(null)
 const agentForm = reactive({ system_prompt: '' })
 
 const agentDefs = computed(() => [
+  { type: 'continuity-reviewer', label: '连续性评测', icon: 'AI' },
   { type: 'script_rewriter', label: t('settings.agents.scriptRewriter'), icon: '📝' },
   { type: 'extractor', label: t('settings.agents.extractor'), icon: '🔍' },
   { type: 'storyboard_breaker', label: t('settings.agents.storyboardBreaker'), icon: '🎬' },
