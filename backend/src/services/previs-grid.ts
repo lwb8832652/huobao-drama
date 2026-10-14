@@ -7,6 +7,7 @@ import { STORAGE_ROOT } from '../utils/paths.js'
 import { now } from '../utils/response.js'
 import { getActiveConfigId, getConfigById } from './ai.js'
 import { generateImage, startQueuedPrevisTask, cancelUnsubmittedPrevisTask } from './generation.js'
+import { completeRecoveredQueueJob, getQueueJob } from './task-queue.js'
 import {
   getVersion,
   hashContent,
@@ -568,19 +569,14 @@ export async function tickGridCandidates() {
     for (let row of rows)
       try {
         const s = snapshot(row)
-        if (row.status === 'pending') {
+        if (row.status === 'pending' && !row.taskId) {
           // 任务面板按剧集聚合 sys_task，需要 drama_id + storyboard_id 才能归属到当前集，
           // 生成完成后任务行会直接展示模型返回的原始宫格图。
-          const claim = db
-            .update(table)
-            .set({ status: 'processing', updatedAt: now() })
-            .where(and(eq(table.id, row.id), eq(table.status, 'pending')))
-            .run()
-          if (!claim.changes) continue
           const current = await getConfigById(s.configId)
           if (!current || hashContent(current) !== s.configHash)
             throw new Error('图片配置已变化，请核对后重新提交')
-          const taskId = await generateImage({
+          const existing = db.select().from(schema.sysTask).where(eq(schema.sysTask.previsItemKey, `grid-${row.id}`)).get()
+          const taskId = existing?.id || await generateImage({
             previs: { versionId: row.versionId, itemKey: `grid-${row.id}` },
             storyboardId: row.panelId,
             dramaId: dramaIdOfVersion(row.versionId),
@@ -593,7 +589,7 @@ export async function tickGridCandidates() {
             frozenReferences: [...(s.base ? [s.base] : []), ...s.references],
           })
           db.update(table).set({ taskId }).where(eq(table.id, row.id)).run()
-          row = { ...row, taskId, status: 'processing' }
+          row = { ...row, taskId }
         }
         let task = row.taskId
           ? db.select().from(schema.sysTask).where(eq(schema.sysTask.id, row.taskId)).get()
@@ -604,7 +600,7 @@ export async function tickGridCandidates() {
               .get()
         if (!task) throw new Error('任务提交状态不明，请核对服务商记录后显式重新提交，避免重复扣费')
         if (!row.taskId) db.update(table).set({ taskId: task.id }).where(eq(table.id, row.id)).run()
-        if (candidateRow(row.versionId, row.id).status !== 'processing') {
+        if (!activeStatuses.includes(candidateRow(row.versionId, row.id).status)) {
           cancelUnsubmittedPrevisTask(task.id)
           continue
         }
@@ -635,6 +631,8 @@ export async function retryGridProcessing(versionId: number, id: number) {
     .set({ status: 'completed', errorMsg: null, updatedAt: now(), completedAt: now() })
     .where(eq(schema.sysTask.id, task.id))
     .run()
+  const job = getQueueJob('sys_task', task.id)
+  if (job?.status === 'failed' && job.upstreamDone) completeRecoveredQueueJob(job.id)
   return view(candidateRow(versionId, id))
 }
 export async function uploadGridCandidate(versionId: number, revision: number, panelId: number, url: string) {

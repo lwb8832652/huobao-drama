@@ -5,6 +5,7 @@ import { success, badRequest } from '../utils/response.js'
 import { mergeEpisodeVideos } from '../services/ffmpeg-merge.js'
 import { toSnakeCase } from '../utils/transform.js'
 import { logTaskError, logTaskStart, logTaskSuccess } from '../utils/task-logger.js'
+import { queueJobView } from '../services/task-queue.js'
 
 const app = new Hono()
 
@@ -26,7 +27,7 @@ app.post('/episodes/:id/merge', async (c) => {
     logTaskStart('MergeAPI', 'episode-merge', { episodeId, dramaId: ep.dramaId, storyboardIds })
     const mergeId = await mergeEpisodeVideos(episodeId, ep.dramaId, storyboardIds)
     logTaskSuccess('MergeAPI', 'episode-merge', { episodeId, mergeId })
-    return success(c, { merge_id: mergeId, status: 'processing' })
+    return success(c, { merge_id: mergeId, status: 'pending', ...queueJobView('video_merge', mergeId) })
   } catch (err: any) {
     logTaskError('MergeAPI', 'episode-merge', { episodeId, error: err.message })
     return badRequest(c, err.message)
@@ -43,7 +44,7 @@ app.get('/episodes/:id/merge', async (c) => {
   const latest = merges[merges.length - 1]
   if (!latest) return success(c, null)
 
-  return success(c, toSnakeCase(latest))
+  return success(c, { ...toSnakeCase(latest), ...queueJobView('video_merge', latest.id) })
 })
 
 // GET /episodes/:id/merges — 成片列表(全部拼接记录,新的在前)
@@ -52,7 +53,7 @@ app.get('/episodes/:id/merges', async (c) => {
   const merges = await db.select().from(schema.videoMerges)
     .where(and(eq(schema.videoMerges.episodeId, episodeId), isNull(schema.videoMerges.deletedAt)))
   merges.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
-  return success(c, merges.slice(0, 30).map(toSnakeCase))
+  return success(c, merges.slice(0, 30).map(row => ({ ...toSnakeCase(row), ...queueJobView('video_merge', row.id) })))
 })
 
 export default app

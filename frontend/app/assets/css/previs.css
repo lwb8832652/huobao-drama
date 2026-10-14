@@ -790,3 +790,9 @@
 }
 .pv-reference-select { display: flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 11px; }
 .pv-reference-select select { min-height: 28px; padding: 0 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-raised); color: var(--text-0); font-size: 11px; }
+
+.pv-task-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.pv-task-filters { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 15px; }
+.pv-task-filters button { border: 1px solid var(--surface-outline); border-radius: 999px; padding: 4px 9px; font-size: 11px; background: var(--overlay-track); color: var(--text-2); cursor: pointer; }
+.pv-task-filters button.on { box-shadow: 0 0 0 2px var(--accent); }
+.pv-task-filters button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }

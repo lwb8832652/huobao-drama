@@ -6,6 +6,7 @@
  */
 import type Database from 'better-sqlite3'
 import { initPrevisSchema } from './previs-schema.js'
+import { initTaskQueueSchema } from './task-queue-schema.js'
 
 export const sqliteSchemaStatements = [
   `CREATE TABLE IF NOT EXISTS dramas (
@@ -386,6 +387,7 @@ export function initSqliteSchema(sqlite: Database.Database) {
     sqlite.exec(statement)
   }
   initPrevisSchema(sqlite)
+  initTaskQueueSchema(sqlite)
   const insertSeed = sqlite.prepare(SEED_SQL)
   const upgradeSeed = sqlite.prepare(UPGRADE_SQL)
   const removeSeed = sqlite.prepare(REMOVE_SQL)

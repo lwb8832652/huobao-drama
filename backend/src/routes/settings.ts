@@ -4,8 +4,25 @@
 import { Hono } from 'hono'
 import { getContentLanguage, setContentLanguage, getToursSeen, setToursSeen, CONTENT_LANGUAGES, type ContentLanguage } from '../services/app-settings.js'
 import { success, badRequest } from '../utils/response.js'
+import { readProductionSettings, saveProductionSettings, readEvaluationSettings, saveEvaluationSettings, QueueSettingsError } from '../services/task-queue-settings.js'
+import { queueStats } from '../services/task-queue.js'
 
 const app = new Hono()
+
+app.get('/task-queue', c => success(c, { ...readProductionSettings(), stats: queueStats() }))
+app.put('/task-queue', async c => {
+  try { return success(c, { ...saveProductionSettings(await c.req.json()), stats: queueStats() }) }
+  catch (error: any) {
+    return c.json({ code: error instanceof QueueSettingsError ? error.status : 400, message: error.message || '任务设置无效' }, error instanceof QueueSettingsError && error.status === 409 ? 409 : 400)
+  }
+})
+app.get('/evaluation-tasks', c => success(c, { ...readEvaluationSettings(), globalTotal: readProductionSettings().total, stats: queueStats() }))
+app.put('/evaluation-tasks', async c => {
+  try { return success(c, { ...saveEvaluationSettings(await c.req.json()), globalTotal: readProductionSettings().total, stats: queueStats() }) }
+  catch (error: any) {
+    return c.json({ code: error instanceof QueueSettingsError ? error.status : 400, message: error.message || '评测设置无效' }, error instanceof QueueSettingsError && error.status === 409 ? 409 : 400)
+  }
+})
 
 // GET /content-language — 当前 AI 内容语言
 app.get('/content-language', async (c) => {

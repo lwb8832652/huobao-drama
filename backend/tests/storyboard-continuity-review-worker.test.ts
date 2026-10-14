@@ -214,7 +214,7 @@ test('任务先筛选再分页，状态统计覆盖版本全部任务且保留�
     versionId: otherVersion, fromGroupId: 'g1', toGroupId: 'g2', inputHash: 'other-version',
     configId: 1, model: 'NEEDLE-model', status: 'failed', resultJson: '', createdAt: ts,
   }).run()
-  const summary = { total: 7, active: 2, completed: 3, failed: 2 }
+  const summary = { total: 7, active: 2, pending: 1, processing: 1, completed: 3, failed: 2 }
   const all = service.listContinuityReviewTasks(id)
   assert.equal(all.total, 7); assert.deepEqual(all.summary, summary)
   assert.equal(all.activeCount, 2); assert.equal(all.lowScore, 1)
@@ -262,7 +262,7 @@ test('HTTP 任务筛选搜索冻结名称和模型，改名后仍可查询旧任
     assert.equal(page.total, 1); assert.equal(page.items[0].id, old.id)
     assert.equal(page.items[0].current, false)
     assert.equal(page.items[0].fromGroupTitle, 'Frozen Opening')
-    assert.deepEqual(page.summary, { total: 2, active: 1, completed: 1, failed: 0 })
+    assert.deepEqual(page.summary, { total: 2, active: 1, pending: 1, processing: 0, completed: 1, failed: 0 })
   }
   const renamed = service.listContinuityReviewTasks(id, { keyword: 'current' })
   assert.equal(renamed.total, 1); assert.equal(renamed.items[0].status, 'pending')
@@ -374,7 +374,7 @@ test('旧记录缺少快照仍可读取，不将当前镜头冒充历史图片',
   assert.deepEqual(item.images, { from: null, to: null })
 })
 
-test('关闭开关暂停排队任务，重新启用后恢复，HTTP 设置和状态契约可读写', async () => {
+test('关闭开关取消排队任务，重新启用后可重新安排，HTTP 设置和状态契约可读写', async () => {
   const id = version(); service.scheduleContinuityReviews(id, [1])
   service.updateContinuityReviewSettings({ enabled: false, threshold: 50 })
   let calls = 0
@@ -382,6 +382,7 @@ test('关闭开关暂停排队任务，重新启用后恢复，HTTP 设置和状
   const { default: app } = await import('../src/routes/previs.js')
   const updated = await app.request('/previs/continuity-review-settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: true, threshold: 50 }) })
   assert.equal(updated.status, 200)
+  service.scheduleContinuityReviews(id, [1])
   await service.tickContinuityReviews(async () => { calls++; return result }); assert.equal(calls, 1)
   const response = await app.request(`/animatic-versions/${id}/continuity-review-status`)
   assert.equal(response.status, 200)

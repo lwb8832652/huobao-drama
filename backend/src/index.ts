@@ -25,15 +25,16 @@ import storage from './routes/storage.js'
 import serverUpdate from './routes/serverUpdate.js'
 import previs from './routes/previs.js'
 import { startPrevisWorker } from './services/previs-batch.js'
-import { startContinuityReviewWorker } from './services/continuity-review.js'
-import { startFramePlanWorker } from './services/previs-frames.js'
+import { startContinuityReviewWorker, migrateContinuityQueue } from './services/continuity-review.js'
+import { startFramePlanWorker, migrateFramePlanQueue } from './services/previs-frames.js'
 import { startGridWorker } from './services/previs-grid.js'
-import { startContactSheetWorker } from './services/previs-contact-sheets.js'
+import { startContactSheetWorker, migrateContactSheetQueue } from './services/previs-contact-sheets.js'
+import { migrateVideoMergeQueue } from './services/ffmpeg-merge.js'
+import { recoverPrevisTasks } from './services/generation.js'
+import { startTaskQueueWorker } from './services/task-queue.js'
+import taskQueue from './routes/task-queue.js'
 import { requestLogger, errorHandler } from './middleware/logger.js'
 import { serveStaticRanges } from './middleware/static-range.js'
-import { db, schema } from './db/index.js'
-import { and, eq, isNull } from 'drizzle-orm'
-import { now } from './utils/response.js'
 import { DATA_ROOT } from './utils/paths.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -68,6 +69,7 @@ api.route('/storyboards', storyboards)
 api.route('/scenes', scenes)
 api.route('/characters', characters)
 api.route('/tasks', tasks)
+api.route('/task-queue', taskQueue)
 api.route('/upload', upload)
 api.route('/ai-configs', aiConfigs)
 api.route('/ai-providers', aiProviders)
@@ -101,17 +103,16 @@ app.get('*', serveStatic({ root: distPath, path: 'index.html' }))
 const port = Number(process.env.PORT || 5679)
 console.log(`🚀 Huobao Drama TS server on http://localhost:${port}`)
 
-// 进程重启后内存中的轮询线程全部丢失,残留的 processing 任务永远不会完成,
-// 启动时统一标记为 failed,避免前端一直显示"生成中"
-db.update(schema.sysTask)
-  .set({ status: 'failed', errorMsg: '服务重启，生成任务中断，请重试', updatedAt: now() })
-  .where(and(eq(schema.sysTask.status, 'processing'), isNull(schema.sysTask.previsItemKey)))
-  .then(res => {
-    const affected = res?.changes ?? 0
-    if (affected > 0) console.log(`🔁 已清理 ${affected} 个中断的生成任务`)
-  })
-  .catch(err => console.error('清理中断任务失败:', err?.message))
-
+// Migrate durable links before claiming work. A submitted task is recovered or
+// held for confirmation; restarting the server never blindly reissues it.
+const stopQueue = await startTaskQueueWorker(async () => {
+  await recoverPrevisTasks()
+  await migrateContinuityQueue()
+  await migrateFramePlanQueue()
+  migrateContactSheetQueue()
+  await migrateVideoMergeQueue()
+})
+process.once('exit', stopQueue)
 serve({ fetch: app.fetch, port })
 void startPrevisWorker().catch(err => console.error('Previs worker startup failed:', err.message))
 void startContinuityReviewWorker().catch(err => console.error('Continuity review worker startup failed:', err.message))

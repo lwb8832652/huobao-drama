@@ -17,9 +17,10 @@ import { normalizeTimeline, orderedFrames, panelImageFallback, type FrameType, t
 import { hashContent, PrevisError, episodeForPrevis, requireEditable, versionRow } from './previs.js'
 import { FRAME_COUNT_MIN, FRAME_COUNT_MAX, gridLayoutForCount } from './previs-frame-contract.js'
 import { readFramePlanningContext } from '../agents/tools/frame-splitter-tools.js'
+import { enqueueQueueJob, getQueueJob, getQueueJobById, registerQueueExecutor, updateQueueJob, resetQueueJob, tickTaskQueue, queueJobView, type QueueJob } from './task-queue.js'
+import { httpErrorStatus, retryRejectedRateLimit } from './task-queue-retry.js'
 
 export { FRAME_COUNT_MIN, FRAME_COUNT_MAX, FRAME_COUNT_OPTIONS, FRAME_GRID_LAYOUTS, FRAME_GRID_COUNTS, gridLayoutForCount } from './previs-frame-contract.js'
-const FRAME_PLAN_LEASE_MS = 30 * 60 * 1000
 
 export interface FramePlanDraft {
   id?: string
@@ -208,6 +209,7 @@ export function buildFramePlanningRequestContent(input: {
 }
 
 async function aiFrames(row: PlanRow, panel: Panel, context: PlanningContext): Promise<ReturnType<typeof normalizeFramePlan>> {
+  if (!row.configId) return null
   try {
     const version = versionRow(row.versionId)
     const episode = episodeForPrevis(version.episodeId)
@@ -219,14 +221,35 @@ async function aiFrames(row: PlanRow, panel: Panel, context: PlanningContext): P
       modelOverride: row.model || undefined,
       textConfigId: row.configId || undefined,
     })
-    const response = await agent.generate([{
-      role: 'user',
-      content: buildFramePlanningRequestContent({ versionId: version.id, panelId: panel.id, count: row.count, context }),
-    }], { maxSteps: 3, requestContext })
+    const job = getQueueJob('frame_plan', row.id)
+    const response = await retryRejectedRateLimit(async () => {
+      if (job) {
+        if (getQueueJobById(job.id)?.status !== 'processing') throw new Error('规划已取消')
+        await currentPlanInput(row)
+        const snapshot = JSON.parse(job.snapshotJson), config = await getConfigById(row.configId)
+        if (snapshot.configHash && (!config || hashContent(config) !== snapshot.configHash)) throw new Error('规划模型配置已变化，请重新提交')
+        if (getQueueJobById(job.id)?.status !== 'processing') throw new Error('规划已取消')
+        updateQueueJob(job.id, { submitted: true, phase: 'upstream' })
+      }
+      return agent.generate([{
+        role: 'user',
+        content: buildFramePlanningRequestContent({ versionId: version.id, panelId: panel.id, count: row.count, context }),
+      }], { maxSteps: 3, requestContext })
+    }, () => { if (job) updateQueueJob(job.id, { submitted: false, phase: 'retry_wait' }) })
+    if (job) updateQueueJob(job.id, { upstreamDone: true, phase: 'saving' })
     const parsed = planResultSchema.safeParse(parseJsonObject(response.text))
     if (!parsed.success || !parsed.data.continuityConstraints || parsed.data.frames.some(frame => !frame.continuity)) return null
     return normalizeFramePlan(panel, row.count, parsed.data)
-  } catch {
+  } catch (error: any) {
+    const job = getQueueJob('frame_plan', row.id)
+    const status = httpErrorStatus(error)
+    if (job && status === 429) {
+      updateQueueJob(job.id, { submitted: false })
+      throw error
+    }
+    if (job && !job.submitted && !job.upstreamDone) throw error
+    if (job?.submitted && !job.upstreamDone && (!Number.isInteger(status) || status! >= 500 || status === 408)) throw error
+    if (job?.submitted) updateQueueJob(job.id, { upstreamDone: true })
     return null
   }
 }
@@ -289,25 +312,18 @@ export async function startFramePlan(versionId: number, options: PlanFramesOptio
         }).run()
         taskIds.push(Number(inserted.lastInsertRowid))
       }
+      const id = taskIds.at(-1)!
+      const snapshotJson = JSON.stringify({ configHash: config ? hashContent(config) : null })
+      const queueInput = { ownerType: 'frame_plan' as const, ownerId: id, kind: 'planning' as const,
+        projectId: episode.dramaId, configId, inputHash, snapshotJson }
+      if (getQueueJob('frame_plan', id)) resetQueueJob('frame_plan', id, queueInput)
+      else enqueueQueueJob(queueInput)
       queued++
     }
     return { queued, taskIds }
   })
   void tickFramePlans().catch(err => console.error('Frame plan worker:', err?.message))
   return result
-}
-
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(items.length)
-  let cursor = 0
-  const workers = Array.from({ length: Math.min(limit, Math.max(1, items.length)) }, async () => {
-    while (cursor < items.length) {
-      const index = cursor++
-      results[index] = await fn(items[index])
-    }
-  })
-  await Promise.all(workers)
-  return results
 }
 
 const activePlans = new Map<number, Promise<void>>()
@@ -337,6 +353,10 @@ async function processOne(row: PlanRow) {
   const execution = (async () => {
     try {
       const { panel, context } = await currentPlanInput(row)
+      const job = getQueueJob('frame_plan', row.id)
+      const snapshot = JSON.parse(job?.snapshotJson || '{}')
+      const config = row.configId ? await getConfigById(row.configId) : null
+      if (snapshot.configHash && (!config || snapshot.configHash !== hashContent(config))) throw new Error('规划模型配置已变化，请重新提交')
       const ai = await aiFrames(row, panel, context)
       await currentPlanInput(row)
       const frames = ai?.frames || ruleFrames(panel, row.count)
@@ -349,7 +369,10 @@ async function processOne(row: PlanRow) {
         createdAt: new Date().toISOString(),
       }).where(claimedRow).run()
     } catch (error: any) {
-      db.update(schema.framePlans).set({ status: 'failed', resultJson: '', error: error?.message || '拆分失败' })
+      const job = getQueueJob('frame_plan', row.id)
+      const uncertain = job?.submitted && !job.upstreamDone
+      db.update(schema.framePlans).set({ status: uncertain ? 'processing' : 'failed', resultJson: '',
+        error: uncertain ? `请求结果不确定，请核对服务商记录：${error?.message}` : error?.message || '拆分失败' })
         .where(claimedRow).run()
     }
   })().finally(() => activePlans.delete(row.id))
@@ -357,17 +380,48 @@ async function processOne(row: PlanRow) {
   await execution
 }
 
-/** 处理一轮待拆分任务：先把超时未完成的 processing 重置，再并发 4 处理 pending。 */
-export async function tickFramePlans() {
-  const stuck = db.select().from(schema.framePlans)
-    .where(eq(schema.framePlans.status, 'processing')).all()
-    .filter(row => !activePlans.has(row.id) && Date.now() - Date.parse(row.createdAt) >= FRAME_PLAN_LEASE_MS)
-  for (const row of stuck) {
-    db.update(schema.framePlans).set({ status: 'pending' }).where(eq(schema.framePlans.id, row.id)).run()
+registerQueueExecutor('frame_plan', {
+  execute: async job => {
+    const row = db.select().from(schema.framePlans).where(eq(schema.framePlans.id, job.ownerId)).get()
+    if (!row) return { status: 'failed', error: '画面规划不存在' }
+    await processOne(row)
+    const saved = db.select().from(schema.framePlans).where(eq(schema.framePlans.id, job.ownerId)).get()!
+    const current = getQueueJobById(job.id)!
+    return { status: saved.status === 'completed' ? 'completed' : current.submitted && !current.upstreamDone ? 'needs_confirmation' : 'failed', error: saved.error || undefined }
+  },
+  recover: async job => {
+    const row = db.select().from(schema.framePlans).where(eq(schema.framePlans.id, job.ownerId)).get()
+    if (row?.status === 'completed') return { status: 'completed' }
+    if (job.upstreamDone) {
+      db.update(schema.framePlans).set({ status: 'failed', error: '规划结果未保存完整，请重新规划' }).where(eq(schema.framePlans.id, job.ownerId)).run()
+      return { status: 'failed', error: '规划结果未保存完整，请重新规划' }
+    }
+    return { status: 'needs_confirmation', error: '服务重启，画面规划可能已提交，请核对服务商记录' }
+  },
+  onRequeue: job => { db.update(schema.framePlans).set({ status: 'pending', error: null }).where(eq(schema.framePlans.id, job.ownerId)).run() },
+  onCancel: job => { db.update(schema.framePlans).set({ status: 'cancelled', error: '已取消排队' }).where(eq(schema.framePlans.id, job.ownerId)).run() },
+  onRetry: job => {
+    updateQueueJob(job.id, { submitted: false, externalTaskId: null, upstreamDone: false })
+    db.update(schema.framePlans).set({ status: 'pending', error: null, resultJson: '', createdAt: new Date().toISOString() }).where(eq(schema.framePlans.id, job.ownerId)).run()
+  },
+  onReconcile: job => { db.update(schema.framePlans).set({ status: 'failed', error: '已人工确认服务商任务结束' }).where(eq(schema.framePlans.id, job.ownerId)).run() },
+})
+export async function migrateFramePlanQueue() {
+  for (const row of db.select().from(schema.framePlans).where(inArray(schema.framePlans.status, ['pending', 'processing'])).all()) {
+    if (getQueueJob('frame_plan', row.id)) continue
+    const version = versionRow(row.versionId), episode = episodeForPrevis(version.episodeId)
+    const config = row.configId ? await getConfigById(row.configId) : null
+    enqueueQueueJob({ ownerType: 'frame_plan', ownerId: row.id, kind: 'planning', projectId: episode.dramaId,
+      configId: row.configId, inputHash: row.inputHash, snapshotJson: JSON.stringify({ configHash: config ? hashContent(config) : null }),
+      initialStatus: row.status as 'pending' | 'processing', submitted: row.status === 'processing' && !!row.configId })
   }
-  const pending = db.select().from(schema.framePlans)
-    .where(eq(schema.framePlans.status, 'pending')).all()
-  if (pending.length) await mapLimit(pending, 4, processOne)
+}
+/** 所有规划通过统一调度领取；不再凭本地过期时间重复提交模型。 */
+export async function tickFramePlans() {
+  await migrateFramePlanQueue()
+  await tickTaskQueue()
+  // Keep the manual worker helper awaitable for local tests without holding HTTP requests.
+  await Promise.all([...activePlans.values()])
 }
 
 /** 查询某版本的拆分任务状态与已完成方案。 */
@@ -390,7 +444,7 @@ export function listFramePlans(versionId: number) {
   return {
     items: rows.map(item => ({
       id: item.id, panelId: item.panelId, status: item.status as FramePlanStatus['status'],
-      count: item.count, error: item.error, createdAt: item.createdAt,
+      count: item.count, error: item.error, createdAt: item.createdAt, ...queueJobView('frame_plan', item.id),
     })),
     plans,
     summary: { pending: count('pending'), processing: count('processing'), completed: count('completed'), failed: count('failed') },
@@ -408,13 +462,15 @@ export async function retryFramePlans(versionId: number, panelIds?: number[]) {
     db.update(schema.framePlans).set({ status: 'pending', error: null, createdAt: new Date().toISOString() })
       .where(eq(schema.framePlans.id, row.id)).run()
   }
+  for (const row of rows) resetQueueJob('frame_plan', row.id)
   void tickFramePlans().catch(err => console.error('Frame plan worker:', err?.message))
   return { queued: rows.length }
 }
 
 /** 启动 worker：恢复残留任务后每 1.5s 轮询处理一次。 */
 export async function startFramePlanWorker() {
-  await tickFramePlans()
+  await migrateFramePlanQueue()
+  void tickFramePlans().catch(err => console.error('Frame plan worker:', err?.message))
   const timer = setInterval(() => { void tickFramePlans().catch(err => console.error('Frame plan worker:', err?.message)) }, 1500)
   timer.unref()
   return () => clearInterval(timer)

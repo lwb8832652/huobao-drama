@@ -1,20 +1,28 @@
 /**
  * 统一生成任务服务 — 图片/视频生成共用 sys_task 表与同一条生命周期：
- * 创建(processing) → 适配器构建请求 → 同步完成或异步轮询 → 下载落盘 → 回写业务表
+ * 创建(pending) → 全局队列领取 → 同步完成或等待异步轮询 → 下载落盘 → 回写业务表
  */
 import { db, getInsertId, schema } from '../db/index.js'
 import { hashContent } from './previs.js'
+import { frameKey, normalizeTimeline } from './previs-domain.js'
 import sharp from 'sharp'
-import { readReferenceMedia, mediaDigest } from './previs-reference-media.js'
-import { and, eq, isNotNull } from 'drizzle-orm'
+import { createHash } from 'node:crypto'
+import { createReadStream } from 'node:fs'
+import { realpath } from 'node:fs/promises'
+import path from 'node:path'
+import { STORAGE_ROOT } from '../utils/paths.js'
+import { readReferenceMedia, mediaDigest, freezeReferenceMedia } from './previs-reference-media.js'
+import { and, eq, inArray } from 'drizzle-orm'
 import { Agent } from 'undici'
-import { getActiveConfig, getConfigById } from './ai.js'
+import { getActiveConfigId, getConfigById } from './ai.js'
 import { now } from '../utils/response.js'
 import { downloadFile, fetchImageAsCompressedDataUrl, generateImageThumb, readImageAsCompressedDataUrl, saveBase64Image } from '../utils/storage.js'
 import { extractVideoPoster } from '../utils/video-poster.js'
 import { getImageAdapter, getVideoAdapter } from './adapters/registry'
 import type { AIConfig } from './adapters/types'
 import { logTaskError, logTaskPayload, logTaskProgress, logTaskStart, logTaskSuccess, logTaskWarn, redactUrl } from '../utils/task-logger.js'
+import { retryRejectedRateLimit } from './task-queue-retry.js'
+import { activateQueueJob, cancelQueueJob, enqueueQueueJob, finishQueueJob, getQueueJob, registerQueueExecutor, tickTaskQueue, updateQueueJob, type QueueJob } from './task-queue.js'
 
 type TaskType = 'image' | 'video'
 
@@ -51,6 +59,7 @@ interface GenerateImageParams {
 }
 
 interface GenerateVideoParams {
+  frozenConfigHash?: string
   videoContinuity?: import('./previs-video-continuity.js').VideoContinuitySnapshot
   referenceInput?: import('./previs-video-reference-domain.js').VideoReferenceInput
   previs?: { versionId: number; itemKey: string }
@@ -79,9 +88,7 @@ interface GenerateVideoParams {
 
 export async function generateImage(params: GenerateImageParams): Promise<number> {
   // 指定配置（集锁定）可能已停用/删除/厂商收敛，失效时回退到当前启用配置，避免生成被旧引用卡死
-  const config = params.configId
-    ? (await getConfigById(params.configId)) ?? await getActiveConfig('image')
-    : await getActiveConfig('image')
+  const { config, configId } = await effectiveConfig('image', params.configId)
   if (!config) throw new Error('未配置图片模型，请先到「设置」页添加并启用 AI 服务')
   if (params.frozenConfigHash && hashContent(config) !== params.frozenConfigHash) throw new Error('图片配置已变化，请核对后重新提交')
 
@@ -96,12 +103,13 @@ export async function generateImage(params: GenerateImageParams): Promise<number
     prompt: params.prompt,
     model: params.model || config.model,
   }, {
-    configId: params.configId,
+    configId,
     size: params.size || '1920x1080',
     frameType: params.frameType,
     referenceImages: params.referenceImages,
-    frozenConfigHash: params.frozenConfigHash,
-    frozenReferences: params.frozenReferences,
+    frozenConfigHash: hashContent(config),
+    strictImageSize: !!params.frozenConfigHash && !!params.previs?.itemKey.startsWith('grid-'),
+    frozenReferences: params.frozenReferences || await Promise.all(uniqueReferences(params.referenceImages).slice(0, 6).map(freezeReferenceMedia)),
   })
 
   logTaskStart('ImageTask', 'enqueue', {
@@ -123,10 +131,9 @@ export async function generateImage(params: GenerateImageParams): Promise<number
 
 export async function generateVideo(params: GenerateVideoParams): Promise<number> {
   // 指定配置（集锁定）可能已停用/删除/厂商收敛，失效时回退到当前启用配置
-  const config = params.configId
-    ? (await getConfigById(params.configId)) ?? await getActiveConfig('video')
-    : await getActiveConfig('video')
+  const { config, configId } = await effectiveConfig('video', params.configId)
   if (!config) throw new Error('未配置视频模型，请先到「设置」页添加并启用 AI 服务')
+  if (params.frozenConfigHash && hashContent(config) !== params.frozenConfigHash) throw new Error('视频配置已变化，请核对后重新提交')
 
   const id = await createTask('video', config, {
     animaticVersionId: params.previs?.versionId,
@@ -136,7 +143,12 @@ export async function generateVideo(params: GenerateVideoParams): Promise<number
     prompt: params.prompt,
     model: params.model || config.model,
   }, {
-    configId: params.configId,
+    configId,
+    frozenConfigHash: hashContent(config),
+    frozenVideoImages: await freezeVideoImages(params),
+    frozenMedia: await Promise.all(uniqueReferences([
+      ...(params.referenceVideoUrls || []), ...(params.referenceAudioUrls || []), params.referenceFileUrl || '',
+    ]).map(async url => ({ url, digest: await referenceFileDigest(url) }))),
     referenceMode: params.referenceMode || 'reference',
     imageUrl: params.imageUrl,
     firstFrameUrl: params.firstFrameUrl,
@@ -174,6 +186,52 @@ export async function generateVideo(params: GenerateVideoParams): Promise<number
   return id
 }
 
+async function effectiveConfig(type: TaskType, requestedId?: number) {
+  const requested = requestedId ? await getConfigById(requestedId) : null
+  const configId = requested ? requestedId! : await getActiveConfigId(type)
+  return { configId, config: requested || (configId ? await getConfigById(configId) : null) }
+}
+
+function uniqueReferences(refs?: string[] | null) {
+  return [...new Set((refs || []).map(value => String(value || '').trim()).filter(Boolean))]
+}
+
+async function freezeVideoImages(params: GenerateVideoParams) {
+  const sources = uniqueReferences([
+    params.imageUrl || '', params.firstFrameUrl || '', params.lastFrameUrl || '',
+    ...(params.referenceInput ? [] : params.referenceImageUrls || []),
+  ])
+  return Object.fromEntries(await Promise.all(sources.map(async source => [source, await freezeReferenceMedia(source)])))
+}
+
+/** Video/audio files are streamed, avoiding an image-size limit or buffering large uploads. */
+async function referenceFileDigest(url: string): Promise<string> {
+  const hash = createHash('sha256')
+  if (url.startsWith('data:')) {
+    const match = /^data:[^,]+;base64,(.*)$/s.exec(url)
+    if (!match) throw new Error('参考媒体数据格式无效')
+    return hash.update(Buffer.from(match[1], 'base64')).digest('hex')
+  }
+  if (/^https?:\/\//i.test(url)) {
+    const response = await fetch(url, { signal: AbortSignal.timeout(600_000) })
+    if (!response.ok || !response.body) throw new Error(`读取参考媒体失败：HTTP ${response.status}`)
+    const reader = response.body.getReader()
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        hash.update(value)
+      }
+    } finally { await reader.cancel().catch(() => {}) }
+  } else {
+    const root = await realpath(STORAGE_ROOT)
+    const file = await realpath(path.resolve(STORAGE_ROOT, url.replace(/^\/?static\//, '')))
+    if (!file.startsWith(root + path.sep)) throw new Error('参考媒体文件路径无效')
+    for await (const chunk of createReadStream(file)) hash.update(chunk)
+  }
+  return hash.digest('hex')
+}
+
 async function createTask(
   type: TaskType,
   config: AIConfig,
@@ -191,79 +249,157 @@ async function createTask(
   params: Record<string, unknown>,
 ): Promise<number> {
   const ts = now()
-  const res = await db.insert(schema.sysTask).values({
-    type,
-    ...fields,
-    provider: config.provider,
-    params: JSON.stringify(params),
-    // 故事版任务先排队 pending，由预演 worker 领取后提交，避免重启丢失已提交状态
-    status: fields.previsItemKey ? 'pending' : 'processing',
-    createdAt: ts,
-    updatedAt: ts,
-  })
-
-  const id = getInsertId(res)
-  if (!fields.previsItemKey) processTask(id, config).catch(err => {
-    logTaskError(taskLabel(type), 'process', { id, error: err.message })
-    console.error(`${taskLabel(type)} ${id} failed:`, err)
+  const id = db.transaction(tx => {
+    const res = tx.insert(schema.sysTask).values({
+      type, ...fields, provider: config.provider, params: JSON.stringify(params),
+      status: 'pending', createdAt: ts, updatedAt: ts,
+    }).run()
+    const id = getInsertId(res)
+    const record = tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()!
+    enqueueGenerationTask(record, { ready: !fields.previsItemKey })
+    return id
   })
   return id
 }
 
-/** 故事版任务领取后再提交：先 claim（pending→processing）再执行，避免重启丢任务。 */
+/** Previs parents link their child before opening the queue submission gate. */
 export async function startQueuedPrevisTask(id: number) {
-  const [record] = await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id))
+  const record = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
   if (!record?.previsItemKey || record.status !== 'pending') return
-  const params = parseTaskParams(record.params)
-  const config = await getConfigById(params.configId)
-  if (!config) { await failTask(id, '生成配置已停用，请启用后重试'); return }
-  if (params.frozenConfigHash && hashContent(config) !== params.frozenConfigHash) {
-    await failTask(id, '图片配置已变化，请核对后重新提交'); return
+  let job = getQueueJob('sys_task', id)
+  if (!job) {
+    enqueueGenerationTask(record, { ready: false })
+    job = getQueueJob('sys_task', id)!
   }
-  // Both grid and legacy batches reserve from the same durable slots. The count
-  // and claim have no await gap, so concurrent workers cannot oversubscribe.
-  const claim = db.transaction(tx => {
-    const active = tx.select().from(schema.sysTask).where(eq(schema.sysTask.status, 'processing')).all()
-      .filter(task => task.type === record.type && parseTaskParams(task.params).configId === params.configId)
-    if (active.length >= 2) return { changes: 0 }
-    return tx.update(schema.sysTask).set({ status: 'processing', updatedAt: now() })
-      .where(and(eq(schema.sysTask.id, id), eq(schema.sysTask.status, 'pending'))).run()
-  })
-  if (claim.changes) void processTask(id, config)
+  if (!previsParentReady(record)) return
+  try {
+    await validateQueuedConfig(record)
+    validateTaskSnapshot(record, job)
+    activateQueueJob('sys_task', id)
+    await tickTaskQueue()
+  } catch (error) {
+    const message = (error as Error).message
+    await failTask(id, message)
+    finishQueueJob(job.id, { status: 'failed', error: message })
+  }
 }
 
-/** 服务重启后恢复故事版任务：已取得外部编号的继续轮询，未提交成功的中止为 failed。 */
+/** Legacy task migration only; the global queue owns all restart recovery. */
 export async function recoverPrevisTasks() {
-  const tasks = await db.select().from(schema.sysTask)
-    .where(and(isNotNull(schema.sysTask.previsItemKey), eq(schema.sysTask.status, 'processing')))
+  const tasks = db.select().from(schema.sysTask)
+    .where(inArray(schema.sysTask.status, ['pending', 'processing'])).all()
   for (const task of tasks) {
-    if (task.type === 'image' && task.previsItemKey?.startsWith('grid-') && (task.localPath || task.resultUrl)) {
-      try {
-        if (task.localPath) {
-          await readReferenceMedia(task.localPath)
-          await db.update(schema.sysTask).set({ status: 'completed', errorMsg: null, completedAt: now(), updatedAt: now() }).where(eq(schema.sysTask.id, task.id))
-        } else {
-          const data = /^data:([^;]+);base64,(.+)$/s.exec(task.resultUrl!)
-          if (data) await handleImageCompleteBase64(task, data[2], data[1])
-          else await handleImageComplete(task, task.resultUrl!)
-        }
-      } catch (error) {
-        await failTask(task.id, `已保留模型结果，本地图片恢复失败，可重试处理：${(error as Error).message}`)
-      }
-      continue
-    }
+    if (getQueueJob('sys_task', task.id)) continue
     const params = parseTaskParams(task.params)
-    const config = await getConfigById(params.configId)
-    if (params.frozenConfigHash && (!config || hashContent(config) !== params.frozenConfigHash)) {
-      await failTask(task.id, '恢复任务时图片配置已变化，请先核对服务商任务记录'); continue
+    // Existing accepted tasks keep their original tracking, even if the config is no longer usable.
+    if (!params.configId && task.status === 'pending') {
+      const selected = await effectiveConfig(task.type as TaskType)
+      if (selected.config && selected.configId) {
+        params.configId = selected.configId
+        params.frozenConfigHash = hashContent(selected.config)
+        db.update(schema.sysTask).set({ params: JSON.stringify(params) }).where(eq(schema.sysTask.id, task.id)).run()
+        task.params = JSON.stringify(params)
+      }
     }
-    if (task.taskId && config) {
-      // 保留已确认的外部任务编号，恢复时绝不重复提交付费请求
-      void pollTask(task, config, task.taskId)
-    } else {
-      await failTask(task.id, '服务重启时尚未取得外部任务编号，提交结果待确认；请核对服务商记录后手动重试，避免重复扣费')
-    }
+    enqueueGenerationTask(task, { ready: !task.previsItemKey || previsParentReady(task), legacy: true })
   }
+}
+
+function generationSnapshot(task: SysTaskRecord) {
+  const { submissionStarted: _submitted, submissionRejected: _rejected, ...params } = parseTaskParams(task.params)
+  return { type: task.type, provider: task.provider, prompt: task.prompt, model: task.model,
+    animaticVersionId: task.animaticVersionId, previsItemKey: task.previsItemKey,
+    storyboardId: task.storyboardId, dramaId: task.dramaId, sceneId: task.sceneId,
+    characterId: task.characterId, propId: task.propId, params }
+}
+
+function enqueueGenerationTask(task: SysTaskRecord, options: { ready: boolean; legacy?: boolean }) {
+  const snapshot = generationSnapshot(task), params = snapshot.params
+  return enqueueQueueJob({ ownerType: 'sys_task', ownerId: task.id, kind: task.type as TaskType,
+    projectId: generationProjectId(task), configId: params.configId || undefined,
+    inputHash: hashContent(snapshot), snapshotJson: JSON.stringify(snapshot),
+    source: task.previsItemKey ? 'previs' : 'generation', ready: options.ready,
+    ...(options.legacy ? { initialStatus: task.status === 'processing' ? 'processing' as const : 'pending' as const,
+      initialPhase: task.resultUrl || task.localPath ? 'saving' : task.taskId ? 'polling' : params.submissionStarted ? 'submitting' : 'queued',
+      // Older ordinary tasks never stored a submission boundary. A processing row
+      // without a queue record must be treated as accepted/ambiguous, never resubmitted.
+      submitted: task.status === 'processing' || !!(params.submissionStarted || task.taskId || task.resultUrl || task.localPath),
+      externalTaskId: task.taskId, upstreamDone: !!(task.resultUrl || task.localPath) } : {}),
+  })
+}
+
+function generationProjectId(task: SysTaskRecord): number | undefined {
+  if (task.dramaId) return task.dramaId
+  if (task.characterId) return db.select().from(schema.characters).where(eq(schema.characters.id, task.characterId)).get()?.dramaId
+  if (task.sceneId) return db.select().from(schema.scenes).where(eq(schema.scenes.id, task.sceneId)).get()?.dramaId
+  if (task.propId) return db.select().from(schema.props).where(eq(schema.props.id, task.propId)).get()?.dramaId
+  const storyboard = task.storyboardId ? db.select().from(schema.storyboards).where(eq(schema.storyboards.id, task.storyboardId)).get() : null
+  const version = task.animaticVersionId ? db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, task.animaticVersionId)).get() : null
+  const episodeId = storyboard?.episodeId || version?.episodeId
+  return episodeId ? db.select().from(schema.episodes).where(eq(schema.episodes.id, episodeId)).get()?.dramaId : undefined
+}
+
+function retryPrevisParent(task: SysTaskRecord) {
+  if (!task.previsItemKey) return
+  const version = task.animaticVersionId ? db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, task.animaticVersionId)).get() : null
+  if (!version || (task.type === 'image' && version.status === 'locked')) throw new Error('故事版已锁定或不存在，无法重试生成')
+  const gridId = /^grid-(\d+)$/.exec(task.previsItemKey), batchKey = /^(\d+):(\d+)$/.exec(task.previsItemKey)
+  if (gridId) {
+    const parent = db.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, Number(gridId[1]))).get()
+    if (!parent || parent.taskId !== task.id || parent.status === 'discarded') throw new Error('宫格生成已取消，无法重试')
+    db.update(schema.gridCandidates).set({ status: 'pending', error: null, updatedAt: now() }).where(eq(schema.gridCandidates.id, parent.id)).run()
+  }
+  if (batchKey) {
+    const item = db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, Number(batchKey[1]))).get()
+    const batch = item ? db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, item.batchId)).get() : null
+    if (!item || item.taskId !== task.id || item.attempt !== Number(batchKey[2]) || !batch || batch.status === 'cancelled') throw new Error('批次任务已取消或已替换，无法重试')
+    if (task.type === 'image') {
+      const request = JSON.parse(item.requestJson), timeline = normalizeTimeline(JSON.parse(version.timelineJson))
+      const frame = timeline.panels.find(panel => panel.id === item.panelId)?.frames.find(frame => request.frameId ? frameKey(frame) === request.frameId : frame.type === item.frameType)
+      if (frame?.locked) throw new Error('画面已锁定，请解除画面锁定后再重试')
+    }
+    db.update(schema.batchRunItems).set({ status: 'pending', error: null }).where(eq(schema.batchRunItems.id, item.id)).run()
+    db.update(schema.batchRuns).set({ status: 'pending' }).where(eq(schema.batchRuns.id, batch.id)).run()
+  }
+}
+
+function cancelPrevisParent(task: SysTaskRecord) {
+  const gridId = /^grid-(\d+)$/.exec(task.previsItemKey || ''), batchKey = /^(\d+):(\d+)$/.exec(task.previsItemKey || '')
+  if (gridId) db.update(schema.gridCandidates).set({ status: 'discarded', updatedAt: now() })
+    .where(and(eq(schema.gridCandidates.id, Number(gridId[1])), inArray(schema.gridCandidates.status, ['pending', 'processing']))).run()
+  if (batchKey) db.update(schema.batchRunItems).set({ status: 'cancelled' })
+    .where(and(eq(schema.batchRunItems.id, Number(batchKey[1])), eq(schema.batchRunItems.taskId, task.id), eq(schema.batchRunItems.attempt, Number(batchKey[2])))).run()
+}
+
+function validateTaskSnapshot(task: SysTaskRecord, job: QueueJob) {
+  if (hashContent(generationSnapshot(task)) !== job.inputHash) throw new Error('排队任务输入已变化，请重新提交')
+}
+
+async function validateQueuedConfig(task: SysTaskRecord): Promise<AIConfig> {
+  const params = parseTaskParams(task.params)
+  const config = params.configId ? await getConfigById(params.configId) : null
+  if (!config) throw new Error('生成配置已停用，请启用后重试')
+  if (params.frozenConfigHash && hashContent(config) !== params.frozenConfigHash) {
+    throw new Error('生成配置已变化，请核对后重新提交')
+  }
+  return config
+}
+
+function previsParentReady(task: SysTaskRecord): boolean {
+  const key = task.previsItemKey
+  if (!key) return true
+  const gridId = /^grid-(\d+)$/.exec(key), batchKey = /^(\d+):(\d+)$/.exec(key)
+  if (gridId) {
+    const parent = db.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, Number(gridId[1]))).get()
+    return !!parent && parent.taskId === task.id && ['pending', 'processing'].includes(parent.status || '')
+  }
+  if (batchKey) {
+    const item = db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, Number(batchKey[1]))).get()
+    const batch = item ? db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, item.batchId)).get() : null
+    return !!item && item.taskId === task.id && ['pending', 'processing'].includes(item.status || '')
+      && item.attempt === Number(batchKey[2]) && !!batch && batch.status !== 'cancelled'
+  }
+  return true
 }
 
 function parseTaskParams(raw: string | null | undefined): Record<string, any> {
@@ -277,6 +413,10 @@ function parseTaskParams(raw: string | null | undefined): Record<string, any> {
 
 /** Cancels queued/reference preparation work, but retains submitted task tracking. */
 export function cancelUnsubmittedPrevisTask(id: number) {
+  const record = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
+  if (!record?.previsItemKey || !['pending', 'processing'].includes(record.status || '')) return
+  const job = getQueueJob('sys_task', id)
+  if (job && !job.submitted) { cancelQueueJob(job.id); return }
   return db.transaction(tx => {
     const task = tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
     if (!task?.previsItemKey || !['pending', 'processing'].includes(task.status || '')
@@ -292,9 +432,8 @@ function beginPrevisSubmission(id: number): boolean {
   return db.transaction(tx => {
     const task = tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
     if (!task || task.status !== 'processing') return false
-    if (!task.previsItemKey) return true
-    const gridId = /^grid-(\d+)$/.exec(task.previsItemKey)
-    const batchKey = /^(\d+):(\d+)$/.exec(task.previsItemKey)
+    const gridId = /^grid-(\d+)$/.exec(task.previsItemKey || '')
+    const batchKey = /^(\d+):(\d+)$/.exec(task.previsItemKey || '')
     const item = batchKey ? tx.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, Number(batchKey[1]))).get() : null
     const batch = item ? tx.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, item.batchId)).get() : null
     const cancelledGrid = gridId && tx.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, Number(gridId[1]))).get()?.status !== 'processing'
@@ -305,6 +444,8 @@ function beginPrevisSubmission(id: number): boolean {
     }
     tx.update(schema.sysTask).set({ params: JSON.stringify({ ...parseTaskParams(task.params), submissionStarted: true }), updatedAt: now() })
       .where(eq(schema.sysTask.id, id)).run()
+    const job = getQueueJob('sys_task', id)
+    if (job) updateQueueJob(job.id, { phase: 'submitting', submitted: true })
     return true
   })
 }
@@ -336,20 +477,25 @@ async function processTask(id: number, config: AIConfig) {
         model: record.model,
         prompt: record.prompt,
         size: params.size,
-        strictSize: !!params.frozenConfigHash,
+        strictSize: params.strictImageSize ?? !!(record.previsItemKey && params.frozenConfigHash),
         frameType: params.frameType,
         referenceImages: resolvedReferenceImages.length ? JSON.stringify(resolvedReferenceImages) : null,
       }))
     } else {
       const adapter = getVideoAdapter(config.provider)
-      const resolvedImageUrl = await normalizeVideoReferenceUrl(params.imageUrl)
+      for (const ref of params.frozenMedia || []) {
+        if (await referenceFileDigest(ref.url) !== ref.digest) throw new Error('冻结的参考媒体已变化，停止提交')
+      }
+      const frozenVideoImage = async (value: string | undefined) => value && params.frozenVideoImages?.[value]
+        ? (await normalizeFrozenImageReferences([params.frozenVideoImages[value]]))[0] : await normalizeVideoReferenceUrl(value)
+      const resolvedImageUrl = await frozenVideoImage(params.imageUrl)
       const endpoints = params.videoContinuity?.actual === 'first_last'
         ? await (await import('./previs-video-continuity.js')).normalizeVideoEndpoints(params.videoContinuity) : undefined
-      const resolvedFirstFrameUrl = endpoints?.firstFrameUrl || await normalizeVideoReferenceUrl(params.firstFrameUrl)
-      const resolvedLastFrameUrl = endpoints?.lastFrameUrl || await normalizeVideoReferenceUrl(params.lastFrameUrl)
+      const resolvedFirstFrameUrl = endpoints?.firstFrameUrl || await frozenVideoImage(params.firstFrameUrl)
+      const resolvedLastFrameUrl = endpoints?.lastFrameUrl || await frozenVideoImage(params.lastFrameUrl)
       const resolvedReferenceImageUrls = params.referenceInput
         ? await (await import('./previs-video-reference-normalizer.js')).normalizeSnapshotImages(params.referenceInput)
-        : await normalizeVideoReferenceUrls(params.referenceImageUrls)
+        : (await Promise.all(uniqueReferences(params.referenceImageUrls).map(frozenVideoImage))).filter((value): value is string => !!value)
       if (record.animaticVersionId && ((params.firstFrameUrl && !resolvedFirstFrameUrl)
         || (params.lastFrameUrl && !resolvedLastFrameUrl)
         || resolvedReferenceImageUrls.length !== (params.referenceInput ? params.referenceInput.imageUrls.length : new Set(params.referenceImageUrls || []).size))) {
@@ -397,16 +543,37 @@ async function processTask(id: number, config: AIConfig) {
       body: isMultipart ? `[multipart/form-data: ${[...(body as FormData).keys()].join(', ')}]` : body,
     })
 
-    if (!beginPrevisSubmission(id)) return
-    const resp = await fetch(url, {
-      method,
-      headers,
-      body: isMultipart ? (body as FormData) : JSON.stringify(body),
-      signal: AbortSignal.timeout(600_000),
-      dispatcher: generationDispatcher,
-    } as RequestInit)
-
-    if (!resp.ok) throw new Error(`API error ${resp.status}: ${await resp.text()}`)
+    const resp = await retryRejectedRateLimit(async attempt => {
+      if (attempt) {
+        await validateQueuedConfig(record)
+        for (const ref of params.frozenMedia || []) {
+          if (await referenceFileDigest(ref.url) !== ref.digest) throw new Error('冻结的参考媒体已变化，停止提交')
+        }
+      }
+      if (!beginPrevisSubmission(id)) return null
+      const response = await fetch(url, {
+        method, headers,
+        body: isMultipart ? (body as FormData) : JSON.stringify(body),
+        signal: AbortSignal.timeout(600_000), dispatcher: generationDispatcher,
+      } as RequestInit)
+      if (!response.ok) {
+        const message = `API error ${response.status}: ${await response.text()}`
+        const error = Object.assign(new Error(message), { status: response.status, responseHeaders: response.headers })
+        // Gateways and server errors may occur after an upstream accepted the paid job.
+        if (![400, 401, 403, 404, 405, 413, 415, 422, 429].includes(response.status)) throw error
+        const job = getQueueJob('sys_task', id)
+        const current = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()!
+        db.update(schema.sysTask).set({ params: JSON.stringify({ ...parseTaskParams(current.params), submissionStarted: false, submissionRejected: true }) }).where(eq(schema.sysTask.id, id)).run()
+        if (job) updateQueueJob(job.id, { submitted: false, phase: 'rejected' })
+        throw error
+      }
+      return response
+    }, (_error, retry, delayMs) => {
+      const job = getQueueJob('sys_task', id)
+      if (job) updateQueueJob(job.id, { phase: 'retry_wait' })
+      logTaskWarn(label, 'rate-limit-retry', { id, retry, delayMs })
+    })
+    if (!resp) return
     const result = await resp.json() as any
     logTaskPayload(label, 'response payload', { id, provider: config.provider, result })
 
@@ -432,7 +599,7 @@ async function processTask(id: number, config: AIConfig) {
       }
 
       await markPolling(id, taskId)
-      pollTask(record, config, taskId!)
+      await pollTask(record, config, taskId!)
       return
     }
 
@@ -446,17 +613,24 @@ async function processTask(id: number, config: AIConfig) {
     }
 
     await markPolling(id, taskId)
-    pollTask(record, config, taskId!)
+    await pollTask(record, config, taskId!)
   } catch (err: any) {
     const task = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
-    if (task?.status !== 'cancelled') await failTask(id, err.message)
+    const job = getQueueJob('sys_task', id)
+    if (task?.status !== 'cancelled') {
+      if (job?.submitted && !job.upstreamDone) await needsConfirmation(id, err.message)
+      else await failTask(id, err.message)
+    }
   }
 }
 
 async function markPolling(id: number, taskId: string | undefined) {
+  if (!taskId) throw new Error('上游响应缺少任务编号，请核对服务商记录')
   await db.update(schema.sysTask)
     .set({ taskId, status: 'processing', updatedAt: now() })
     .where(eq(schema.sysTask.id, id))
+  const job = getQueueJob('sys_task', id)
+  if (job) updateQueueJob(job.id, { externalTaskId: taskId, phase: 'polling', submitted: true })
   logTaskProgress('SysTask', 'poll-start', { id, taskId })
 }
 
@@ -469,6 +643,100 @@ async function failTask(id: number, message: string) {
 
 type SysTaskRecord = typeof schema.sysTask.$inferSelect
 
+async function needsConfirmation(id: number, message: string) {
+  const error = `提交结果待确认，请核对服务商记录，避免重复扣费：${message}`
+  db.update(schema.sysTask).set({ status: 'processing', errorMsg: error, updatedAt: now() }).where(eq(schema.sysTask.id, id)).run()
+  const job = getQueueJob('sys_task', id)
+  if (job) updateQueueJob(job.id, { phase: 'needs_confirmation', error })
+}
+
+function upstreamDone(id: number) {
+  const job = getQueueJob('sys_task', id)
+  if (job) updateQueueJob(job.id, { upstreamDone: true, phase: 'saving' })
+}
+
+async function executeGenerationJob(job: QueueJob) {
+  try {
+    const task = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, job.ownerId)).get()
+    if (!task) return { status: 'failed' as const, error: '生成任务不存在' }
+    if (task.status === 'completed') return { status: 'completed' as const }
+    validateTaskSnapshot(task, job)
+    if (!job.submitted && task.previsItemKey && !previsParentReady(task)) throw new Error('预演任务父项已取消或已变化')
+    db.update(schema.sysTask).set({ status: 'processing', errorMsg: null, updatedAt: now() }).where(eq(schema.sysTask.id, task.id)).run()
+    if (!job.submitted && task.previsItemKey) {
+      const grid = /^grid-(\d+)$/.exec(task.previsItemKey), batch = /^(\d+):(\d+)$/.exec(task.previsItemKey)
+      if (grid) db.update(schema.gridCandidates).set({ status: 'processing', updatedAt: now() }).where(eq(schema.gridCandidates.id, Number(grid[1]))).run()
+      if (batch) db.update(schema.batchRunItems).set({ status: 'processing' }).where(eq(schema.batchRunItems.id, Number(batch[1]))).run()
+    }
+    if (task.localPath) {
+      if (task.type === 'image') {
+        await readReferenceMedia(task.localPath)
+        await generateImageThumb(task.localPath)
+        await writeBackImageAssets(task, task.localPath)
+      } else {
+        await referenceFileDigest(task.localPath)
+        await extractVideoPoster(task.localPath)
+        await writeBackVideoAssets(task, task.localPath, parseTaskParams(task.params).duration)
+      }
+      upstreamDone(task.id)
+      db.update(schema.sysTask).set({ status: 'completed', completedAt: now(), updatedAt: now() }).where(eq(schema.sysTask.id, task.id)).run()
+    } else if (task.resultUrl) {
+      const data = /^data:([^;]+);base64,(.+)$/s.exec(task.resultUrl)
+      if (task.type === 'image' && data) await handleImageCompleteBase64(task, data[2], data[1])
+      else if (task.type === 'image') await handleImageComplete(task, task.resultUrl)
+      else await handleVideoComplete(task, task.resultUrl, parseTaskParams(task.params).duration)
+    } else if (task.taskId || job.externalTaskId) {
+      const config = await validateQueuedConfig(task)
+      await pollTask(task, config, task.taskId || job.externalTaskId!)
+    } else if (job.submitted) {
+      await needsConfirmation(task.id, '服务重启或响应中断时尚未取得外部任务编号')
+    } else {
+      const config = await validateQueuedConfig(task)
+      await processTask(task.id, config)
+    }
+  } catch (error) {
+    const current = getQueueJob('sys_task', job.ownerId)
+    if (current?.submitted && !current.upstreamDone) await needsConfirmation(job.ownerId, (error as Error).message)
+    else await failTask(job.ownerId, (error as Error).message)
+  }
+  const task = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, job.ownerId)).get()
+  const current = getQueueJob('sys_task', job.ownerId)
+  return { status: task?.status === 'completed' ? 'completed' as const
+    : current?.phase === 'needs_confirmation' ? 'needs_confirmation' as const : 'failed' as const,
+    error: task?.errorMsg || undefined }
+}
+
+registerQueueExecutor('sys_task', {
+  execute: executeGenerationJob,
+  recover: executeGenerationJob,
+  onRequeue(job) {
+    db.update(schema.sysTask).set({ status: 'pending', errorMsg: null, updatedAt: now() })
+      .where(and(eq(schema.sysTask.id, job.ownerId), eq(schema.sysTask.status, 'processing'))).run()
+  },
+  onCancel(job) {
+    const task = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, job.ownerId)).get()
+    if (task) cancelPrevisParent(task)
+    db.update(schema.sysTask).set({ status: 'cancelled', updatedAt: now() }).where(eq(schema.sysTask.id, job.ownerId)).run()
+  },
+  onReconcile(job) {
+    db.update(schema.sysTask).set({ status: 'failed', errorMsg: '已人工确认上游任务结束，可根据需要重新提交', updatedAt: now() })
+      .where(eq(schema.sysTask.id, job.ownerId)).run()
+  },
+  onRetry(job) {
+    const task = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, job.ownerId)).get()
+    if (!task) return
+    retryPrevisParent(task)
+    const params = parseTaskParams(task.params)
+    if (!task.resultUrl && !task.localPath) {
+      delete params.submissionStarted
+      delete params.submissionRejected
+      updateQueueJob(job.id, { submitted: false, externalTaskId: null, upstreamDone: false })
+    }
+    db.update(schema.sysTask).set({ status: 'pending', errorMsg: null, params: JSON.stringify(params),
+      ...(!task.resultUrl && !task.localPath ? { taskId: null } : {}), updatedAt: now() }).where(eq(schema.sysTask.id, job.ownerId)).run()
+  },
+})
+
 async function pollTask(record: SysTaskRecord, config: AIConfig, taskId: string) {
   const type = record.type as TaskType
   const label = taskLabel(type)
@@ -478,7 +746,7 @@ async function pollTask(record: SysTaskRecord, config: AIConfig, taskId: string)
 
   for (let i = 0; i < profile.attempts; i++) {
     if (profile.maxDurationMs && Date.now() - startedAt >= profile.maxDurationMs) {
-      await failTask(record.id, 'Timeout: Polling exceeded 10 minutes')
+      await needsConfirmation(record.id, 'Timeout: Polling exceeded 10 minutes')
       return
     }
     await new Promise(r => setTimeout(r, profile.intervalMs))
@@ -531,25 +799,32 @@ async function pollTask(record: SysTaskRecord, config: AIConfig, taskId: string)
       }
       if (pollResp.status === 'failed') {
         // 上游明确失败（如内容审核拦截）属终态：立即落库，不重试不等待超时
+        const job = getQueueJob('sys_task', record.id)
+        if (job) updateQueueJob(job.id, { upstreamDone: true, phase: 'upstream_failed' })
         await failTask(record.id, pollResp.error || 'Generation failed')
         return
       }
     } catch (err: any) {
+      if (getQueueJob('sys_task', record.id)?.upstreamDone) {
+        await failTask(record.id, `已保留模型结果，本地保存失败：${err.message}`)
+        return
+      }
       const exhausted = i === profile.attempts - 1
         || (profile.maxDurationMs != null && Date.now() - startedAt >= profile.maxDurationMs)
       if (exhausted) {
-        await failTask(record.id, `Timeout: ${err.message}`)
+        await needsConfirmation(record.id, `Timeout: ${err.message}`)
         return
       }
       logTaskWarn(label, 'poll-retry', { id: record.id, taskId, attempt: i + 1, error: err.message })
     }
   }
-  await failTask(record.id, 'Timeout: polling attempts exhausted')
+  await needsConfirmation(record.id, 'Timeout: polling attempts exhausted')
 }
 
 async function handleImageComplete(record: SysTaskRecord, imageUrl: string) {
   // Persist the paid upstream result before local I/O so download failures can be repaired freely.
   await db.update(schema.sysTask).set({ resultUrl: imageUrl, updatedAt: now() }).where(eq(schema.sysTask.id, record.id))
+  upstreamDone(record.id)
   const localPath = await downloadFile(imageUrl, 'images')
   // 列表页缩略图（前端按命名约定推导地址，失败不影响主流程）
   await generateImageThumb(localPath)
@@ -564,9 +839,8 @@ async function handleImageComplete(record: SysTaskRecord, imageUrl: string) {
 }
 
 async function handleImageCompleteBase64(record: SysTaskRecord, base64Data: string, mimeType: string) {
-  if (record.previsItemKey?.startsWith('grid-')) {
-    await db.update(schema.sysTask).set({ resultUrl: `data:${mimeType};base64,${base64Data}`, updatedAt: now() }).where(eq(schema.sysTask.id, record.id))
-  }
+  await db.update(schema.sysTask).set({ resultUrl: `data:${mimeType};base64,${base64Data}`, updatedAt: now() }).where(eq(schema.sysTask.id, record.id))
+  upstreamDone(record.id)
   const localPath = await saveBase64Image(base64Data, mimeType, 'images')
   await generateImageThumb(localPath)
 
@@ -603,6 +877,8 @@ async function writeBackImageAssets(record: SysTaskRecord, localPath: string) {
 }
 
 async function handleVideoComplete(record: SysTaskRecord, videoUrl: string, duration: number | null | undefined) {
+  await db.update(schema.sysTask).set({ resultUrl: videoUrl, updatedAt: now() }).where(eq(schema.sysTask.id, record.id))
+  upstreamDone(record.id)
   const localPath = await downloadFile(videoUrl, 'videos')
   // 海报帧供列表/封面展示，避免前端为显示首帧缓冲整个视频
   await extractVideoPoster(localPath)
@@ -612,6 +888,10 @@ async function handleVideoComplete(record: SysTaskRecord, videoUrl: string, dura
 
   logTaskSuccess('VideoTask', 'downloaded', { id: record.id, localPath, storyboardId: record.storyboardId, duration })
 
+  await writeBackVideoAssets(record, localPath, duration)
+}
+
+async function writeBackVideoAssets(record: SysTaskRecord, localPath: string, duration: number | null | undefined) {
   if (record.storyboardId && !record.animaticVersionId) {
     await db.update(schema.storyboards)
       .set({ videoUrl: localPath, duration: duration || undefined, updatedAt: now() })

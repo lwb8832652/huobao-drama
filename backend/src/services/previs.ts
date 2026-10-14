@@ -1,3 +1,4 @@
+import { queueJobView } from './task-queue.js'
 import { createHash } from 'node:crypto'
 import { scheduleContinuityReviews } from './continuity-review.js'
 import { readContactSheets, scheduleContactSheets } from './previs-contact-sheets.js'
@@ -362,6 +363,7 @@ export function readBatches(versionId: number): BatchRun[] {
         id: item.id, groupId: item.groupId, panelId: item.panelId, frameType: item.frameType as any,
         status: item.status, taskId: item.taskId, error: item.error, frameId: request.frameId,
         localPath: task?.localPath, resultUrl: task?.resultUrl,
+        ...(item.taskId ? queueJobView('sys_task', item.taskId) : {}),
         actualStrategy: request.actualStrategy, generationMode: request.generationMode,
         panelIds: request.panelIds, inputHash: request.inputHash, referenceInput: request.referenceInput, videoContinuity: request.videoContinuity, generationScope: request.generationScope,
       }

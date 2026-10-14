@@ -171,6 +171,11 @@ export interface VideoOutput {
   stale: boolean
 }
 export interface BatchItem {
+  queueJobId?: number
+  phase?: string
+  queueReason?: string | null
+  canCancel?: boolean
+  canRetry?: boolean
   generationScope?: 'storyboard' | 'group'
   videoContinuity?: VideoContinuitySnapshot
   referenceInput?: VideoReferenceInput

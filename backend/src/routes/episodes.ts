@@ -6,6 +6,7 @@ import { toSnakeCaseArray, toSnakeCase } from '../utils/transform.js'
 import { getActiveConfigId } from '../services/ai.js'
 import { EXTRACT_TARGETS, getExtractionStatus, startExtraction, type ExtractTarget } from '../services/extraction.js'
 import { getVideoPromptBatchStatus, startVideoPromptBatch } from '../services/video-prompts.js'
+import { queueJobView } from '../services/task-queue.js'
 
 const app = new Hono()
 
@@ -251,8 +252,8 @@ app.get('/:id/generation-tasks', async (c) => {
     .slice(0, 20)
 
   return success(c, {
-    tasks: toSnakeCaseArray(tasks),
-    merges: toSnakeCaseArray(merges),
+    tasks: tasks.map(row => ({ ...toSnakeCase(row), ...queueJobView('sys_task', row.id) })),
+    merges: merges.map(row => ({ ...toSnakeCase(row), ...queueJobView('video_merge', row.id) })),
   })
 })
 

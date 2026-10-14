@@ -12,11 +12,18 @@ import { extractVideoPoster } from '../utils/video-poster.js'
 import { ffmpeg, checkFfmpegSuite } from '../utils/ffmpeg.js'
 import { DATA_ROOT, STORAGE_ROOT } from '../utils/paths.js'
 import { getVersion, listVersions } from './previs.js'
+import { createHash } from 'node:crypto'
+import { enqueueQueueJob, getQueueJob, registerQueueExecutor, tickTaskQueue } from './task-queue.js'
 
 function toAbsPath(relativePath: string): string {
   if (path.isAbsolute(relativePath)) return relativePath
   if (relativePath.startsWith('static/')) return path.join(DATA_ROOT, relativePath)
   return path.join(STORAGE_ROOT, relativePath)
+}
+async function clipDigest(url: string) {
+  const hash = createHash('sha256')
+  for await (const chunk of fs.createReadStream(toAbsPath(url))) hash.update(chunk)
+  return hash.digest('hex')
 }
 
 /**
@@ -86,33 +93,76 @@ async function mergeClips(episodeId: number, dramaId: number, clips: { label: st
   }
 
   const videos = clips.map(c => c.url)
+  const digests: string[] = []
+  for (const video of videos) digests.push(await clipDigest(video))
 
   logTaskStart('MergeTask', 'episode-merge', { episodeId, dramaId, clips: videos.length })
 
   // 创建 merge 记录
   const ts = now()
-  const res = await db.insert(schema.videoMerges).values({
-    episodeId,
-    dramaId,
-    title: `Episode ${episodeId} Merge`,
-    provider: 'ffmpeg',
-    model: 'ffmpeg-concat-h264-aac',
-    status: 'processing',
-    scenes: JSON.stringify(videos),
-    createdAt: ts,
-  })
-  const mergeId = getInsertId(res)
+  const mergeId = db.transaction(tx => {
+    const res = tx.insert(schema.videoMerges).values({
+      episodeId,
+      dramaId,
+      title: `Episode ${episodeId} Merge`,
+      provider: 'ffmpeg',
+      model: 'ffmpeg-concat-h264-aac',
+      status: 'pending',
+      scenes: JSON.stringify(videos),
+      createdAt: ts,
+    }).run()
+    const mergeId = getInsertId(res)
 
-  // 异步执行
-  doMerge(mergeId, episodeId, videos).catch(async err => {
-    logTaskError('MergeTask', 'episode-merge', { mergeId, episodeId, error: err.message })
-    console.error(`[Merge] Failed:`, err)
-    await db.update(schema.videoMerges)
-      .set({ status: 'failed', errorMsg: err.message })
-      .where(eq(schema.videoMerges.id, mergeId))
+    enqueueQueueJob({ ownerType: 'video_merge', ownerId: mergeId, kind: 'local', projectId: dramaId,
+      inputHash: createHash('sha256').update(JSON.stringify({ videos, digests })).digest('hex'), snapshotJson: JSON.stringify({ videos, digests }) })
+    return mergeId
   })
+  void tickTaskQueue()
 
   return mergeId
+}
+
+registerQueueExecutor('video_merge', {
+  execute: async job => {
+    const row = db.select().from(schema.videoMerges).where(eq(schema.videoMerges.id, job.ownerId)).get()
+    if (!row) return { status: 'failed', error: '视频拼接记录不存在' }
+    try {
+      const snapshot = JSON.parse(job.snapshotJson), videos = snapshot.videos || JSON.parse(row.scenes || '[]')
+      if (snapshot.digests) {
+        const actual = []
+        for (const video of videos) actual.push(await clipDigest(video))
+        if (JSON.stringify(actual) !== JSON.stringify(snapshot.digests)) throw new Error('拼接素材已变化，请重新提交')
+      }
+      if (getQueueJob('video_merge', row.id)?.status !== 'processing') return { status: 'failed', error: '视频拼接已取消' }
+      db.update(schema.videoMerges).set({ status: 'processing', errorMsg: null }).where(eq(schema.videoMerges.id, row.id)).run()
+      if (!row.episodeId) throw new Error('拼接记录缺少剧集编号')
+      await doMerge(row.id, row.episodeId, videos)
+      return { status: 'completed' }
+    } catch (error: any) {
+      logTaskError('MergeTask', 'episode-merge', { mergeId: row.id, error: error.message })
+      db.update(schema.videoMerges).set({ status: 'failed', errorMsg: error.message }).where(eq(schema.videoMerges.id, row.id)).run()
+      return { status: 'failed', error: error.message }
+    }
+  },
+  onCancel: job => { db.update(schema.videoMerges).set({ status: 'cancelled', errorMsg: '已取消排队' }).where(eq(schema.videoMerges.id, job.ownerId)).run() },
+  onRetry: job => { db.update(schema.videoMerges).set({ status: 'pending', errorMsg: null }).where(eq(schema.videoMerges.id, job.ownerId)).run() },
+})
+export async function migrateVideoMergeQueue() {
+  for (const row of db.select().from(schema.videoMerges).all().filter(row => ['pending','processing'].includes(row.status || ''))) {
+    if (getQueueJob('video_merge', row.id)) continue
+    try {
+      const videos: string[] = JSON.parse(row.scenes || '[]'), digests: string[] = []
+      for (const video of videos) digests.push(await clipDigest(video))
+      db.transaction(() => {
+        if (getQueueJob('video_merge', row.id)) return
+        db.update(schema.videoMerges).set({ status: 'pending' }).where(eq(schema.videoMerges.id, row.id)).run()
+        enqueueQueueJob({ ownerType: 'video_merge', ownerId: row.id, kind: 'local', projectId: row.dramaId || undefined,
+          inputHash: createHash('sha256').update(JSON.stringify({ videos, digests })).digest('hex'), snapshotJson: JSON.stringify({ videos, digests }) })
+      })
+    } catch (error: any) {
+      db.update(schema.videoMerges).set({ status: 'failed', errorMsg: `旧拼接素材无法恢复：${error.message}` }).where(eq(schema.videoMerges.id, row.id)).run()
+    }
+  }
 }
 
 async function doMerge(mergeId: number, episodeId: number, videos: string[]) {

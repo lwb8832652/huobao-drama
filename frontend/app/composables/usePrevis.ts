@@ -1,5 +1,6 @@
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { toast } from 'vue-sonner'
+import type { QueueMetadata } from './useTaskQueue'
 import { withNetworkRetry } from '~/composables/useApi'
 import type { AnimaticVersion, Timeline, FrameType, Panel, Keyframe } from '../../../backend/src/services/previs-domain'
 import { frameKey, makeFrame, orderedFrames, retimeBoundAudio } from '../../../backend/src/services/previs-domain'
@@ -29,7 +30,7 @@ export async function previsRequest<T = any>(path: string, method = 'GET', body?
       body: body === undefined ? undefined : JSON.stringify(body),
     })
     const result = await response.json()
-    if (!response.ok) throw new Error(result.message || `请求失败 (${response.status})`)
+    if (!response.ok) throw Object.assign(new Error(result.message || `请求失败 (${response.status})`), { status: response.status })
     return result.data ?? result
   }, method)
 }
@@ -69,7 +70,7 @@ export interface FramePlanSummary {
   failed: number
 }
 export interface FramePlansResult {
-  items: { id: number; panelId: number; status: 'pending' | 'processing' | 'completed' | 'failed'; count: number; error: string | null; createdAt: string }[]
+  items: (QueueMetadata & { id: number; panelId: number; status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled'; count: number; error: string | null; createdAt: string })[]
   plans: PanelFramePlan[]
   summary: FramePlanSummary
 }

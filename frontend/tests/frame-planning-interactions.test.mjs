@@ -556,8 +556,10 @@ test('split submission identifies both new tasks and cached tasks, and results k
   const names = ['startFramePlan', 'listFramePlans', 'clampCount', 'suggestedFrameCount']
   const functions = ast.statements.filter(statement => ts.isFunctionDeclaration(statement) && names.includes(statement.name?.text))
     .map(statement => statement.getText(ast)).join('\n')
-  for (const status of [null, 'pending', 'completed']) {
+  for (const status of [null, 'pending', 'completed', 'failed']) {
     let row = status && { id: 13, panelId: 7, status, inputHash: 'current-description', count: 4, configId: 9, model: 'selected-text-model', resultJson: JSON.stringify({ source: 'ai', frames: draft().frames }) }
+    const queueCalls = [], queueJobs = new Map()
+    if (status) queueJobs.set(13, { id: 101, ownerType: 'frame_plan', ownerId: 13, status })
     const builder = {
       from() { return this }, where() { return this }, orderBy() { return this },
       get: () => row, all: () => row ? [row] : [],
@@ -578,12 +580,24 @@ test('split submission identifies both new tasks and cached tasks, and results k
       normalizeTimeline: domain.normalizeTimeline,
       getConfigById: async () => ({ model: 'selected-text-model' }),
       planInputHash: () => 'current-description', tickFramePlans: async () => {},
+      hashContent: value => JSON.stringify(value),
+      getQueueJob: (ownerType, id) => { assert.equal(ownerType, 'frame_plan'); return queueJobs.get(id) },
+      enqueueQueueJob: input => { queueCalls.push({ action: 'enqueue', input }); const job = { ...input, id: 102, status: 'pending' }; queueJobs.set(input.ownerId, job); return job },
+      resetQueueJob: (ownerType, id, input) => { assert.equal(ownerType, 'frame_plan'); queueCalls.push({ action: 'reset', input }); Object.assign(queueJobs.get(id), input, { status: 'pending' }) },
+      queueJobView: (ownerType, id) => { assert.equal(ownerType, 'frame_plan'); const job = queueJobs.get(id); return job ? { queueJobId: job.id, phase: job.status === 'pending' ? 'queued' : job.status } : {} },
     })
     const result = await api.startFramePlan(4, { revision: 2, panelIds: [7], configId: 9 })
-    assert.equal(result.queued, status ? 0 : 1)
+    assert.equal(result.queued, status === null || status === 'failed' ? 1 : 0)
     assert.equal(result.taskIds[0], status ? 13 : 22)
+    assert.equal(queueCalls.length, status === null || status === 'failed' ? 1 : 0)
+    if (queueCalls.length) {
+      assert.equal(queueCalls[0].action, status === 'failed' ? 'reset' : 'enqueue')
+      assert.equal(queueCalls[0].input.ownerId, result.taskIds[0]); assert.equal(queueCalls[0].input.kind, 'planning')
+      assert.equal(queueCalls[0].input.configId, 9); assert.ok(JSON.parse(queueCalls[0].input.snapshotJson).configHash)
+    }
     row.status = 'completed'
     row.resultJson = JSON.stringify({ source: 'ai', frames: draft().frames })
-    assert.equal(api.listFramePlans(4).plans[0].taskId, result.taskIds[0])
+    const listed = api.listFramePlans(4)
+    assert.equal(listed.plans[0].taskId, result.taskIds[0]); assert.equal(listed.items[0].queueJobId, queueJobs.get(result.taskIds[0]).id)
   }
 })

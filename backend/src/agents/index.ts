@@ -482,6 +482,7 @@ export const agentRegistry: Record<string, Agent> = Object.fromEntries(
       tools: AGENT_TOOLS[type],
       workspace: skillWorkspaces[type],
       skillsFormat: 'markdown',
+      ...(['frame_splitter', 'continuity-reviewer'].includes(type) ? { maxRetries: 0 } : {}),
     }),
   ]),
 )

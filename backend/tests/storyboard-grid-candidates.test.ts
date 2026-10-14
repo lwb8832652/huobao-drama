@@ -518,7 +518,13 @@ test('restart resumes a known synchronous result without a supplier id or a new 
     .where(eq(schema.sysTask.id, row.id))
     .run()
   const before = calls
+  // A restart preserves both the business result and the queue reservation.
+  db.$client.prepare("UPDATE task_queue_jobs SET status='processing',phase='saving',submitted=1,upstream_done=1 WHERE owner_type='sys_task' AND owner_id=?").run(row.id)
   await recoverPrevisTasks()
+  const { recoverTaskQueue } = await import('../src/services/task-queue.js')
+  await recoverTaskQueue()
+  for (let i = 0; i < 200 && db.select().from(schema.sysTask).where(eq(schema.sysTask.id, row.id)).get()!.status !== 'completed'; i++)
+    await new Promise(resolve => setTimeout(resolve, 5))
   const recovered = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, row.id)).get()!
   assert.equal(recovered.status, 'completed')
   assert.ok(recovered.localPath)

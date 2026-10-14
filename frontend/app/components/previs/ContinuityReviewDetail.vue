@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { AlertCircle, ArrowRight, Check, FileImage, Loader2, RotateCcw } from 'lucide-vue-next'
+import QueueJobActions from '../QueueJobActions.vue'
+import { queueStatusLabel } from '~/composables/useTaskQueue'
 import type { EvaluationTask } from '~/composables/useContinuityReview'
 const props = defineProps<{ item: EvaluationTask; threshold: number; retryDisabledReason: string; busy: boolean }>()
-defineEmits<{ retry: [] }>()
+defineEmits<{ retry: []; changed: [] }>()
 const dimensionNames = { subject: '人物与道具', scene: '场景与光线', action: '动作与视线', camera: '构图与机位' }
 const confidenceNames = { high: '高', medium: '中', low: '低' }
-const stateNames = { pending: '排队中', processing: '评测中', completed: '已完成', failed: '失败' }
 const attention = computed(() => !!props.item.result && (props.item.result.overallScore < props.threshold || props.item.result.confidence === 'low'))
 const brokenImages = ref<string[]>([])
 function dateLabel(value: string | null) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—' }
@@ -14,7 +15,7 @@ function dateLabel(value: string | null) { return value ? new Date(value).toLoca
 
 <template>
   <div class="evaluation-detail" data-testid="evaluation-task-detail">
-    <div class="detail-heading"><div class="detail-heading-copy"><span class="detail-kicker">连续性评测 <span>· #{{ item.id }}</span></span><h2>{{ item.fromGroupTitle || item.fromGroupId || '前镜头' }} <ArrowRight :size="16" /> {{ item.toGroupTitle || item.toGroupId || '后镜头' }}</h2><div class="detail-badges"><span :class="['detail-status', `is-${item.status}`]">{{ stateNames[item.status] }}</span><span v-if="attention" class="detail-attention">需关注</span><span v-if="!item.current" class="detail-stale">历史结果</span></div></div><div class="detail-action"><button type="button" :disabled="!!retryDisabledReason || busy" class="detail-button" @click="$emit('retry')"><RotateCcw :size="13" :class="{ spin: busy }" />{{ busy ? '正在评测…' : item.status === 'failed' ? '重试评测' : '重新评测' }}</button><p>{{ retryDisabledReason || '将调用模型并产生费用' }}</p></div></div>
+    <div class="detail-heading"><div class="detail-heading-copy"><span class="detail-kicker">连续性评测 <span>· #{{ item.id }}</span></span><h2>{{ item.fromGroupTitle || item.fromGroupId || '前镜头' }} <ArrowRight :size="16" /> {{ item.toGroupTitle || item.toGroupId || '后镜头' }}</h2><div class="detail-badges"><span :class="['detail-status', `is-${item.status}`]">{{ queueStatusLabel(item) }}</span><span v-if="attention" class="detail-attention">需关注</span><span v-if="!item.current" class="detail-stale">历史结果</span></div></div><div class="detail-action"><QueueJobActions v-if="item.queueJobId" :job="item" @changed="$emit('changed')" /><button v-if="!item.queueJobId || item.status === 'completed'" type="button" :disabled="!!retryDisabledReason || busy" class="detail-button" @click="$emit('retry')"><RotateCcw :size="13" :class="{ spin: busy }" />{{ busy ? '正在提交…' : item.status === 'failed' ? '重试评测' : '重新评测' }}</button><p v-if="!item.queueJobId || item.status === 'completed'">{{ retryDisabledReason || '将调用模型并产生费用' }}</p></div></div>
     <div v-if="!item.current" class="detail-notice"><AlertCircle :size="15" /><p>画面或时间线已变更。这份记录仅供历史参考，不代表当前版本。</p></div>
     <div class="evaluation-images"><figure v-for="side in (['from', 'to'] as const)" :key="side"><div class="detail-image"><img v-if="item.images[side] && !brokenImages.includes(item.images[side]!)" :src="item.images[side]!" :alt="side === 'from' ? '前镜头边界历史画面' : '后镜头边界历史画面'" loading="lazy" @error="brokenImages.push(item.images[side]!)"><div v-else class="evaluation-no-image"><FileImage :size="27" /><span>{{ item.images[side] ? '历史画面无法读取' : '无历史画面' }}</span></div><span class="detail-image-label">{{ side === 'from' ? '前镜头 · 结束画面' : '后镜头 · 起始画面' }}</span></div><figcaption>{{ (side === 'from' ? item.fromGroupTitle || item.fromGroupId : item.toGroupTitle || item.toGroupId) || '未命名镜头' }}</figcaption></figure></div>
     <template v-if="item.result">
@@ -24,6 +25,7 @@ function dateLabel(value: string | null) { return value ? new Date(value).toLoca
       <p class="detail-confidence">置信度{{ confidenceNames[item.result.confidence] }} · AI 评测供审阅参考{{ item.result.confidence === 'low' ? '，建议结合画面人工检查' : '' }}</p>
     </template>
     <div v-else class="detail-no-result" :class="{ failed: item.status === 'failed' }" role="status"><Loader2 v-if="item.status === 'pending' || item.status === 'processing'" :size="25" class="spin" /><AlertCircle v-else :size="25" /><strong>{{ item.status === 'pending' ? '等待开始评测' : item.status === 'processing' ? '正在分析画面衔接' : item.status === 'failed' ? '这次评测没有完成' : '尚无评分结果' }}</strong><p>{{ item.status === 'pending' || item.status === 'processing' ? '结果会自动更新，可以返回列表继续其他操作。' : '尚无评分结果。请查看任务状态后重试。' }}</p></div>
+    <p v-if="item.queueReason" class="detail-notice">{{ item.queueReason }}</p>
     <p v-if="item.error" class="detail-error" role="alert">{{ item.error }}</p>
     <dl class="detail-metadata"><div><dt>评测模型</dt><dd>{{ item.model || '等待分配模型' }}</dd></div><div><dt>创建时间</dt><dd>{{ dateLabel(item.createdAt) }}</dd></div><div><dt>开始时间</dt><dd>{{ dateLabel(item.startedAt) }}</dd></div><div><dt>完成时间</dt><dd>{{ dateLabel(item.finishedAt) }}</dd></div></dl>
   </div>

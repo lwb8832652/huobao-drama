@@ -5,6 +5,7 @@ import { getActiveConfigId, getConfigById } from './ai.js'
 import { getImageAdapter, getVideoAdapter } from './adapters/registry.js'
 import { generateImage, generateVideo, recoverPrevisTasks, startQueuedPrevisTask, cancelUnsubmittedPrevisTask } from './generation.js'
 import { now } from '../utils/response.js'
+import { getQueueJob, retryQueueJob } from './task-queue.js'
 import { getDramaStylePrompt } from './style-preset.js'
 import { FRAME_COUNT_MAX } from './previs-frame-contract.js'
 import { scheduleContactSheets } from './previs-contact-sheets.js'
@@ -156,7 +157,7 @@ export async function createBatch(versionId: number, options: BatchOptions) {
           items.push({
             groupId: group.id, panelId: panel.id, frameType: type,
             requestJson: JSON.stringify({
-              storyboardId: panel.id, dramaId: ep.dramaId, prompt, model, configId,
+              storyboardId: panel.id, dramaId: ep.dramaId, prompt, model, configId, frozenConfigHash: hashContent(config),
               frameId: frameKey(frame), inputHash: frameFingerprint(frame, panel),
               frameType: type === 'start' ? 'first_frame' : type === 'end' ? 'last_frame' : 'middle',
               size: drama?.aspectRatio === '9:16' ? '1080x1920' : '1920x1080',
@@ -208,7 +209,7 @@ export async function createBatch(versionId: number, options: BatchOptions) {
         const request = { ...inputs, generationScope, storyboardId: generationScope === 'storyboard' ? unit[0].id : undefined,
           panelIds: unit.map(p => p.id), inputHash: videoFingerprint(generationTimeline, unit, generationMode, referenceInput, videoContinuity),
           referenceInput, videoContinuity, videoReferenceInputStrategy: referenceInput?.requested,
-          dramaId: ep.dramaId, prompt, model, configId, aspectRatio: drama?.aspectRatio || '16:9', resolution: ep.resolution || '720p' }
+          dramaId: ep.dramaId, prompt, model, configId, frozenConfigHash: hashContent(config), aspectRatio: drama?.aspectRatio || '16:9', resolution: ep.resolution || '720p' }
         // Validate the contract before persisting any jobs or making a paid call.
         // Static images are converted to data URLs by generation.ts; use web URLs for contract validation only.
         const validationUrl = (url?: string) => url && /^\/?static\//.test(url) ? `https://local.invalid/${url}` : url
@@ -256,7 +257,7 @@ function reconcile() {
   const activeBatches = db.select().from(schema.batchRuns)
     .where(inArray(schema.batchRuns.status, ['pending', 'processing'])).all()
   const processingItems = db.select().from(schema.batchRunItems)
-    .where(eq(schema.batchRunItems.status, 'processing')).all()
+    .where(inArray(schema.batchRunItems.status, ['pending', 'processing'])).all().filter(item => item.taskId)
   const knownBatchIds = new Set(activeBatches.map(batch => batch.id))
   const missingBatchIds = [...new Set(processingItems
     .map(item => item.batchId)
@@ -310,8 +311,12 @@ function reconcile() {
   }
   for (const batch of batches) {
     const batchItems = itemsByBatch.get(batch.id) || []
-    for (const item of batchItems.filter(i => i.status === 'processing')) {
+    for (const item of batchItems.filter(i => i.taskId && ['pending', 'processing'].includes(i.status || ''))) {
       const task = item.taskId ? taskById.get(item.taskId) : null
+      if (task && ['pending', 'processing'].includes(task.status || '') && item.status !== task.status) {
+        db.update(schema.batchRunItems).set({ status: task.status! }).where(eq(schema.batchRunItems.id, item.id)).run()
+        item.status = task.status!
+      }
       if (!task || !['completed', 'failed', 'cancelled'].includes(task.status || '')) continue
       const siblings = task.status === 'completed' ? siblingsFor(batch) : []
       db.transaction(tx => {
@@ -395,24 +400,11 @@ export async function tickPrevisBatches() {
     // Shared configuration slots may leave linked tasks pending. Retry their
     // existing IDs each tick; never recreate a paid job when a slot frees up.
     for (const item of db.select().from(schema.batchRunItems)
-      .where(eq(schema.batchRunItems.status, 'processing')).all().filter(item => item.taskId)) {
+      .where(inArray(schema.batchRunItems.status, ['pending', 'processing'])).all().filter(item => item.taskId)) {
       await startQueuedPrevisTask(item.taskId!)
     }
     const batches = db.select().from(schema.batchRuns)
       .where(inArray(schema.batchRuns.status, ['pending', 'processing'])).all()
-    const processingItems = db.select().from(schema.batchRunItems)
-      .where(eq(schema.batchRunItems.status, 'processing')).all()
-    const processingBatchIds = [...new Set(processingItems.map(item => item.batchId))]
-    const processingBatches = processingBatchIds.length
-      ? db.select().from(schema.batchRuns).where(inArray(schema.batchRuns.id, processingBatchIds)).all()
-      : []
-    const processingBatchById = new Map(processingBatches.map(batch => [batch.id, batch]))
-    const activeByConfig = new Map<number, number>()
-    // Cancelled batches may still have already-submitted work occupying a slot.
-    for (const item of processingItems) {
-      const batch = processingBatchById.get(item.batchId)
-      if (batch) activeByConfig.set(batch.configId, (activeByConfig.get(batch.configId) || 0) + 1)
-    }
     const batchIds = batches.map(batch => batch.id)
     const pendingItems = batchIds.length
       ? db.select().from(schema.batchRunItems).where(and(
@@ -421,7 +413,7 @@ export async function tickPrevisBatches() {
       )).all()
       : []
     const pendingByBatch = new Map<number, typeof pendingItems>()
-    for (const item of pendingItems) {
+    for (const item of pendingItems.filter(item => !item.taskId)) {
       const group = pendingByBatch.get(item.batchId) || []
       group.push(item)
       pendingByBatch.set(item.batchId, group)
@@ -433,7 +425,6 @@ export async function tickPrevisBatches() {
     const existingTaskByKey = new Map(existingTasks.map(task => [task.previsItemKey, task]))
     for (const batch of batches) {
       for (const item of pendingByBatch.get(batch.id) || []) {
-        if ((activeByConfig.get(batch.configId) || 0) >= 2) continue
         if (db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, batch.id)).get()?.status === 'cancelled') break
         if (db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, item.id)).get()?.status !== 'pending') continue
         try {
@@ -444,12 +435,10 @@ export async function tickPrevisBatches() {
           const latestItem = db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, item.id)).get()
           const latestBatch = db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, batch.id)).get()
           if (latestItem?.status !== 'pending' || latestBatch?.status === 'cancelled') {
-            db.update(schema.sysTask).set({ status: 'cancelled' })
-              .where(and(eq(schema.sysTask.id, taskId), eq(schema.sysTask.status, 'pending'))).run()
+            cancelUnsubmittedPrevisTask(taskId)
             continue
           }
-          db.update(schema.batchRunItems).set({ taskId, status: 'processing' }).where(eq(schema.batchRunItems.id, item.id)).run()
-          activeByConfig.set(batch.configId, (activeByConfig.get(batch.configId) || 0) + 1)
+          db.update(schema.batchRunItems).set({ taskId, status: 'pending' }).where(eq(schema.batchRunItems.id, item.id)).run()
           await startQueuedPrevisTask(taskId)
         } catch (e: any) {
           db.update(schema.batchRunItems).set({ status: 'failed', error: e.message }).where(eq(schema.batchRunItems.id, item.id)).run()
@@ -480,11 +469,18 @@ export function updateBatch(batchId: number, action: 'retry' | 'cancel', itemIds
     }
     for (const item of items) {
       if (itemIds?.length && !itemIds.includes(item.id)) continue
-      if (action === 'retry' && item.status === 'failed') tx.update(schema.batchRunItems)
-        .set({ status: 'pending', error: null, taskId: null, attempt: item.attempt + 1 }).where(eq(schema.batchRunItems.id, item.id)).run()
+      if (action === 'retry' && item.status === 'failed') {
+        const task = item.taskId ? tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, item.taskId)).get() : null
+        const job = task ? getQueueJob('sys_task', task.id) : null
+        const localRetry = !!(task && (task.resultUrl || task.localPath) && job?.status === 'failed')
+        tx.update(schema.batchRunItems).set({ status: 'pending', error: null,
+          taskId: localRetry ? item.taskId : null, attempt: localRetry ? item.attempt : item.attempt + 1 })
+          .where(eq(schema.batchRunItems.id, item.id)).run()
+        if (localRetry) retryQueueJob(job!.id)
+      }
       if (action === 'cancel' && item.status === 'pending') tx.update(schema.batchRunItems)
         .set({ status: 'cancelled' }).where(eq(schema.batchRunItems.id, item.id)).run()
-      if (action === 'cancel' && item.status === 'processing' && item.taskId) {
+      if (action === 'cancel' && ['pending', 'processing'].includes(item.status || '') && item.taskId) {
         cancelUnsubmittedPrevisTask(item.taskId)
         if (tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, item.taskId)).get()?.status === 'cancelled')
           tx.update(schema.batchRunItems).set({ status: 'cancelled' }).where(eq(schema.batchRunItems.id, item.id)).run()
@@ -498,7 +494,7 @@ export async function startPrevisWorker() {
   await recoverPrevisTasks()
   // A crash can leave a linked but not yet started task. Resume these without creating a new task.
   for (const item of db.select().from(schema.batchRunItems)
-    .where(eq(schema.batchRunItems.status, 'processing')).all().filter(item => item.taskId)) {
+    .where(inArray(schema.batchRunItems.status, ['pending', 'processing'])).all().filter(item => item.taskId)) {
     await startQueuedPrevisTask(item.taskId!)
   }
   await tickPrevisBatches()

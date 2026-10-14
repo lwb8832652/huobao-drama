@@ -7,7 +7,7 @@ import {
 } from '../services/previs.js'
 import { videoContinuityCapabilities } from '../services/previs-video-continuity.js'
 import { createBatch, updateBatch, videoCapabilities } from '../services/previs-batch.js'
-import { listContinuityReviews, listContinuityReviewTasks, getContinuityReviewTask, reviewContinuity, getContinuityReviewSettings, updateContinuityReviewSettings, readContinuityReviewStatus } from '../services/continuity-review.js'
+import { listContinuityReviews, listContinuityReviewTasks, getContinuityReviewTask, enqueueContinuityReview, getContinuityReviewSettings, updateContinuityReviewSettings, readContinuityReviewStatus } from '../services/continuity-review.js'
 import { scheduleContactSheets, readContactSheets, tickContactSheets } from '../services/previs-contact-sheets.js'
 import { startFramePlan, listFramePlans, retryFramePlans } from '../services/previs-frames.js'
 import { FRAME_COUNT_MIN, FRAME_COUNT_MAX } from '../services/previs-frame-contract.js'
@@ -103,7 +103,7 @@ app.post('/animatic-versions/:id/continuity-reviews', async c => {
     model: z.string().trim().min(1).max(200).optional(),
     force: z.boolean().optional(),
   }).parse(await c.req.json())
-  return created(c, await reviewContinuity(Number(c.req.param('id')), body))
+  return created(c, await enqueueContinuityReview(Number(c.req.param('id')), body))
 })
 app.post('/animatic-versions/:id/frames/plan', async c => {
   const body = z.object({

@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ChevronLeft, ChevronRight, Clock3, FileSearch, Loader2, Search, X } from 'lucide-vue-next'
+import { queueStatusLabel } from '~/composables/useTaskQueue'
 import type { EvaluationListItem, EvaluationTaskFilter } from '~/composables/useContinuityReview'
 const props = defineProps<{
   items: EvaluationListItem[]
   total: number
-  summary?: { total: number; active: number; completed: number; failed: number }
+  summary?: { total: number; active: number; completed: number; failed: number; pending?: number; processing?: number }
   activeCount: number
   page: number
   pageSize: number
@@ -30,9 +31,8 @@ function filterCount(key: EvaluationTaskFilter) {
   return key === 'all' ? undefined : props.summary?.[key]
 }
 function toggleFilter(key: EvaluationTaskFilter) { emit('filter', props.filter === key ? 'all' : key) }
-const stateNames = { pending: '排队中', processing: '评测中', completed: '已完成', failed: '失败' }
 function taskAriaLabel(item: EvaluationListItem) {
-  return [`查看${item.typeLabel}评测：${item.title}`, stateNames[item.status], item.score !== undefined ? `${item.score} 分` : '', !item.current ? '历史结果' : '', item.attention ? '需关注' : ''].filter(Boolean).join('，')
+  return [`查看${item.typeLabel}评测：${item.title}`, queueStatusLabel(item), item.score !== undefined ? `${item.score} 分` : '', !item.current ? '历史结果' : '', item.attention ? '需关注' : ''].filter(Boolean).join('，')
 }
 </script>
 
@@ -41,6 +41,7 @@ function taskAriaLabel(item: EvaluationListItem) {
     <div class="evaluation-metrics" role="group" aria-label="筛选评测任务状态">
       <button v-for="option in filters" :key="option.key" type="button" :class="['metric', `metric-${option.key}`, { on: filter === option.key }]" :aria-pressed="filter === option.key" :title="filter === option.key ? '再次点击取消筛选' : `查看${option.label}任务`" @click="toggleFilter(option.key)"><b v-if="filterCount(option.key) !== undefined">{{ filterCount(option.key) }}</b>{{ option.label }}</button>
     </div>
+    <p v-if="summary?.pending !== undefined && summary?.processing !== undefined" class="evaluation-scope">本版本执行 {{ summary.processing }} · 排队 {{ summary.pending }}</p>
     <div class="evaluation-tools">
       <label class="evaluation-search"><Search :size="14" /><input :value="keyword" aria-label="搜索评测任务" placeholder="搜索镜头、模型或任务编号" maxlength="200" @input="emit('search', ($event.target as HTMLInputElement).value)"><button v-if="keyword" type="button" aria-label="清空搜索" @click="emit('search', '')"><X :size="12" /></button></label>
     </div>
@@ -51,7 +52,7 @@ function taskAriaLabel(item: EvaluationListItem) {
       <button v-for="item in items" :key="item.key" class="evaluation-task-row" type="button" :class="`is-${item.status}`" :aria-label="taskAriaLabel(item)" @click="emit('select', item.key)">
         <span class="evaluation-preview"><img v-if="item.preview" :src="item.preview" alt="" loading="lazy" @error="($event.target as HTMLImageElement).style.visibility = 'hidden'"><Loader2 v-else-if="item.status === 'processing' || item.status === 'pending'" :size="21" :class="{ spin: item.status === 'processing' }" /><FileSearch v-else :size="23" /><span class="evaluation-type">{{ item.typeLabel }}</span></span>
         <span class="evaluation-task-copy"><strong :title="item.title">{{ item.title }}</strong><span class="evaluation-task-meta">{{ item.meta }}</span><span class="evaluation-task-summary" :class="{ 'is-error': item.status === 'failed' }" :title="item.summary">{{ item.summary }}</span><span class="evaluation-task-flags"><span v-if="!item.current" class="evaluation-label">历史结果</span><span v-if="item.attention" class="evaluation-label attention">需关注</span></span></span>
-        <span class="evaluation-task-outcome"><span class="evaluation-status" :class="`is-${item.status}`"><i />{{ stateNames[item.status] }}</span><span v-if="item.score !== undefined" class="evaluation-score" :class="{ attention: item.attention }">{{ item.score }}<small> / 100</small></span><ChevronRight :size="15" class="evaluation-row-arrow" /></span>
+        <span class="evaluation-task-outcome"><span class="evaluation-status" :class="`is-${item.status}`"><i />{{ queueStatusLabel(item) }}</span><span v-if="item.score !== undefined" class="evaluation-score" :class="{ attention: item.attention }">{{ item.score }}<small> / 100</small></span><ChevronRight :size="15" class="evaluation-row-arrow" /></span>
       </button>
     </div>
     <footer class="evaluation-pagination"><span>{{ keyword || filter !== 'all' ? '符合条件 ' : '共 ' }}{{ total }} 项{{ loading && items.length ? ' · 更新中' : '' }}</span><nav v-if="total > pageSize" aria-label="评测历史分页"><button type="button" aria-label="上一页" :disabled="page <= 1 || loading" @click="emit('page', page - 1)"><ChevronLeft :size="15" /></button><span>{{ page }} / {{ Math.max(1, Math.ceil(total / pageSize)) }}</span><button type="button" aria-label="下一页" :disabled="page * pageSize >= total || loading" @click="emit('page', page + 1)"><ChevronRight :size="15" /></button></nav><span v-else class="evaluation-live"><Clock3 :size="11" />状态自动更新</span></footer>
@@ -69,6 +70,7 @@ function taskAriaLabel(item: EvaluationListItem) {
 .metric:hover{box-shadow:0 0 0 2px var(--sel-glow,var(--bg-hover,#f1f3f6))}
 .metric.on{box-shadow:0 0 0 2px var(--accent,#f58b36)}
 .evaluation-status i{width:5px;height:5px;border-radius:50%;background:currentColor}
+.evaluation-scope{margin:12px 24px 0;font-size:11px;color:var(--text-3,#94a0af)}
 .evaluation-tools{padding:15px 24px}
 .evaluation-search{display:flex;align-items:center;gap:9px;padding:9px 12px;background:var(--surface-input,#fafbfc);border:1px solid var(--border,#e5e9ef);border-radius:9px;color:var(--text-3,#939daa)}
 .evaluation-search:focus-within{border-color:var(--accent,#f58b36)}
@@ -115,7 +117,8 @@ function taskAriaLabel(item: EvaluationListItem) {
 button:focus-visible{outline:2px solid var(--accent,#f58b36);outline-offset:2px}
 .spin{animation:spin 1.3s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-@media(max-width:480px){.evaluation-tools{padding:15px 16px}
+@media(max-width:480px){.evaluation-scope{margin:12px 24px 0;font-size:11px;color:var(--text-3,#94a0af)}
+.evaluation-tools{padding:15px 16px}
 .evaluation-task-row{gap:10px;padding:14px 6px}
 .evaluation-preview{width:65px;height:51px}
 .evaluation-task-copy strong{font-size:12px}

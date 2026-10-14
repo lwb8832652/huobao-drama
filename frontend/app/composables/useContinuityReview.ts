@@ -1,11 +1,12 @@
+import { queueStatusLabel, type QueueMetadata, type QueueStats } from './useTaskQueue'
 import type { Timeline, ContinuityReviewResult } from './usePrevis'
 
 export type EvaluationType = 'continuity'
-export interface EvaluationTask {
+export interface EvaluationTask extends QueueMetadata {
   id: number
   type: EvaluationType
   versionId: number
-  status: 'pending' | 'processing' | 'completed' | 'failed'
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled'
   current: boolean
   inputHash: string
   result: ContinuityReviewResult | null
@@ -29,10 +30,10 @@ export interface EvaluationTaskPage {
   activeCount: number
   lowScore: number
   items: EvaluationTask[]
-  summary?: { total: number; active: number; completed: number; failed: number }
+  summary?: { total: number; active: number; completed: number; failed: number; pending?: number; processing?: number }
 }
 /** 不依赖连续性输入/评分结构的列表展示契约，可供其他评测类型复用。 */
-export interface EvaluationListItem {
+export interface EvaluationListItem extends QueueMetadata {
   key: string
   typeLabel: string
   title: string
@@ -51,13 +52,15 @@ export function evaluationTaskRow(item: EvaluationTask, threshold: number): Eval
   return {
     key: String(item.id), typeLabel: '连续性',
     title: `${item.fromGroupTitle || item.fromGroupId || '前镜头'} → ${item.toGroupTitle || item.toGroupId || '后镜头'}`,
-    status: item.status, summary: item.error || item.result?.summary || ({ pending: '等待评测', processing: '正在对比画面', completed: '未提供摘要', failed: '评测失败' }[item.status]),
+    queueJobId: item.queueJobId, phase: item.phase, queueReason: item.queueReason, canCancel: item.canCancel, canRetry: item.canRetry,
+    status: item.status, summary: item.queueReason || item.error || item.result?.summary || (item.status === 'completed' ? '未提供摘要' : queueStatusLabel(item)),
     meta: [item.model || '等待分配模型', formattedTime, `#${item.id}`].filter(Boolean).join(' · '),
     preview: item.images.from || item.images.to, score: item.result?.overallScore,
     current: item.current, attention: !!item.result && (item.result.overallScore < threshold || item.result.confidence === 'low'),
   }
 }
 export interface ContinuityReviewSettings { enabled: boolean; threshold: number }
+export interface EvaluationTaskSettings extends ContinuityReviewSettings { revision: number; concurrency: number; paused: boolean; globalTotal: number; stats: QueueStats }
 export interface ContinuityReviewStatusItem {
   id: number | null
   fromGroupId: string

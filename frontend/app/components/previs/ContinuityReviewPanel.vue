@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { previsRequest, type AnimaticVersion, type Timeline } from '~/composables/usePrevis'
-import { continuityRisks, relevantContinuityEdges, evaluationTaskRow, type ContinuityReviewSettings, type ContinuityReviewStatus, type EvaluationTaskPage, type EvaluationTask, type EvaluationTaskFilter } from '~/composables/useContinuityReview'
+import { continuityRisks, relevantContinuityEdges, evaluationTaskRow, type EvaluationTaskSettings, type ContinuityReviewStatus, type EvaluationTaskPage, type EvaluationTask, type EvaluationTaskFilter } from '~/composables/useContinuityReview'
+import QueueSettingsButton from '../QueueSettingsButton.vue'
 import EvaluationTaskList from './EvaluationTaskList.vue'
 import ContinuityReviewDetail from './ContinuityReviewDetail.vue'
 
@@ -13,7 +14,8 @@ const props = defineProps<{
   save: () => Promise<boolean>
   dirty?: boolean
 }>()
-const settings = ref<ContinuityReviewSettings>({ enabled: false, threshold: 70 })
+const settings = ref<EvaluationTaskSettings>({ revision: 0, concurrency: 1, paused: false, enabled: false, threshold: 70, globalTotal: 6, stats: { active: 0, pending: 0 } })
+const concurrency = ref(1), paused = ref(false), settingsConflict = ref(false)
 const threshold = ref(70), enabled = ref(false), settingsLoaded = ref(false)
 const status = ref<ContinuityReviewStatus>({ settings: settings.value, items: [] })
 const error = ref(''), busy = ref(false), savingSettings = ref(false)
@@ -29,8 +31,8 @@ const page = ref(1), selectedId = ref<number | null>(null), historyLoading = ref
 const selectedRecord = ref<EvaluationTask | null>(null), detailError = ref(''), detailLoading = ref(false)
 const selected = computed(() => selectedRecord.value?.id === selectedId.value ? selectedRecord.value : history.value.items.find(item => item.id === selectedId.value))
 const taskRows = computed(() => history.value.items.map(item => evaluationTaskRow(item, settings.value.threshold)))
-const settingsDirty = computed(() => enabled.value !== settings.value.enabled || threshold.value !== settings.value.threshold)
-let historyToken = 0, detailToken = 0, polling = false
+const settingsDirty = computed(() => enabled.value !== settings.value.enabled || threshold.value !== settings.value.threshold || concurrency.value !== settings.value.concurrency || paused.value !== settings.value.paused)
+let historyToken = 0, detailToken = 0, settingsToken = 0, polling = false
 let correctingPage = false
 let searchTimer: ReturnType<typeof setTimeout> | undefined
 function selectTask(item: EvaluationTask) { selectedRecord.value = item; selectedId.value = item.id; detailError.value = ''; view.value = 'detail'; if (expanded.value) void loadSelectedTask() }
@@ -82,10 +84,20 @@ function trapDrawerFocus(event: KeyboardEvent) {
   const nodes = Array.from(drawer.value?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex="0"]') || []).filter(node => node.getClientRects().length)
   if (!nodes.length) return
   const first = nodes[0]!, last = nodes[nodes.length - 1]!
+  if (!drawer.value?.contains(document.activeElement)) { event.preventDefault(); (event.shiftKey ? last : first).focus(); return }
   if (event.shiftKey && (document.activeElement === first || document.activeElement === drawer.value)) { event.preventDefault(); last.focus() }
   else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
 }
+function handleDrawerKeys(event: KeyboardEvent) {
+  if (!expanded.value || (typeof document !== 'undefined' && document.querySelector('dialog[open]'))) return
+  if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeDrawer() }
+  else if (event.key === 'Tab') { trapDrawerFocus(event); if (event.defaultPrevented) event.stopPropagation() }
+}
 watch(expanded, async open => {
+  if (typeof window !== 'undefined') {
+    if (open) window.addEventListener('keydown', handleDrawerKeys, true)
+    else window.removeEventListener('keydown', handleDrawerKeys, true)
+  }
   if (open) {
     view.value = 'tasks'
     if (typeof document !== 'undefined') { originalBodyOverflow = document.body.style.overflow; document.body.style.overflow = 'hidden' }
@@ -123,7 +135,7 @@ const visibleItems = computed(() => {
   const edges = props.timeline ? relevantContinuityEdges(props.timeline, props.panelIds) : []
   return status.value.items.filter(item => edges.some(edge => edge.from === item.fromGroupId && edge.to === item.toGroupId))
 })
-const stateNames = { idle: '未评测 / 已过期', missing_images: '缺少画面', pending: '排队中', processing: '评测中', completed: '已完成', failed: '失败' }
+const stateNames = { cancelled: '已取消', idle: '未评测 / 已过期', missing_images: '缺少画面', pending: '排队中', processing: '评测中', completed: '已完成', failed: '失败' }
 function groupTitle(id: string) { return props.timeline?.groups.find(group => group.id === id)?.title || id }
 function disabledReason(toGroupId: string) {
   if (!props.version) return '请先加载当前版本'
@@ -165,34 +177,36 @@ async function refresh() {
     if (disposed || id !== props.version?.id || token !== loadToken) return
     status.value = result
     statusLoaded.value = true; statusError.value = ''
-    const keepDraft = settingsLoaded.value && settingsDirty.value
-    settings.value = result.settings
-    if (!keepDraft && !savingSettings.value) { enabled.value = result.settings.enabled; threshold.value = result.settings.threshold }
+
   } catch (cause: any) {
     if (disposed || id !== props.version?.id || token !== loadToken) return
     statusError.value = cause.message || '读取当前状态失败'
     throw cause
   }
 }
-async function loadSettings() {
+async function loadSettings(reload = true) {
+  if (savingSettings.value) return
+  const token = ++settingsToken
   try {
-    const result = await previsRequest<ContinuityReviewSettings>('/previs/continuity-review-settings')
-    if (disposed) return
-    settings.value = result; threshold.value = result.threshold; enabled.value = result.enabled; settingsLoaded.value = true
-  } catch (cause: any) { error.value = cause.message || '读取评测设置失败' }
+    const result = await previsRequest<EvaluationTaskSettings>('/settings/evaluation-tasks')
+    if (disposed || token !== settingsToken) return
+    if (!reload && (settingsDirty.value || settingsConflict.value)) { settings.value.stats = result.stats; settings.value.globalTotal = result.globalTotal; return }
+    settings.value = result; threshold.value = result.threshold; enabled.value = result.enabled; concurrency.value = result.concurrency; paused.value = result.paused; settingsLoaded.value = true; settingsConflict.value = false; error.value = ''
+  } catch (cause: any) { if (!disposed && token === settingsToken) error.value = cause.message || '读取评测设置失败' }
 }
 async function saveSettings() {
-  if (savingSettings.value || !settingsLoaded.value) return
+  if (savingSettings.value || !settingsLoaded.value || settingsConflict.value) return
+  if (!Number.isInteger(concurrency.value) || concurrency.value < 1 || concurrency.value > 32) { error.value = '评测并发须为 1–32 的整数'; return }
   if (!Number.isInteger(threshold.value) || threshold.value < 0 || threshold.value > 100) { error.value = '阈值须在 0–100 之间'; return }
-  savingSettings.value = true; error.value = ''; settingsMessage.value = ''
+  ++settingsToken; savingSettings.value = true; error.value = ''; settingsMessage.value = ''
   try {
-    const result = await previsRequest<ContinuityReviewSettings>('/previs/continuity-review-settings', 'PUT', { enabled: enabled.value, threshold: threshold.value })
+    const result = await previsRequest<EvaluationTaskSettings>('/settings/evaluation-tasks', 'PUT', { revision: settings.value.revision, concurrency: concurrency.value, paused: paused.value, enabled: enabled.value, threshold: threshold.value })
     if (disposed) return
-    settings.value = result; enabled.value = result.enabled; threshold.value = result.threshold
+    settings.value = result; enabled.value = result.enabled; threshold.value = result.threshold; concurrency.value = result.concurrency; paused.value = result.paused
     settingsMessage.value = '设置已保存'
     await refresh()
-  } catch (cause: any) { error.value = cause.message || '保存评测设置失败' }
-  finally { savingSettings.value = false }
+  } catch (cause: any) { settingsConflict.value = cause.status === 409; error.value = settingsConflict.value ? '评测任务设置已被其他页面修改。草稿已保留，请重新载入后再保存。' : cause.message || '保存评测设置失败' }
+  finally { savingSettings.value = false; await nextTick(); if (expanded.value && view.value === 'settings' && typeof document !== 'undefined' && document.activeElement === document.body) drawer.value?.focus() }
 }
 async function score(toGroupId: string) {
   if (busy.value || confirming.value || disabledReason(toGroupId)) return
@@ -211,7 +225,7 @@ async function score(toGroupId: string) {
     if (disposed || props.version?.id !== versionId) return
     if (creating) { taskFilter.value = 'all'; keyword.value = ''; page.value = 1 }
     await Promise.all([refresh(), loadHistory()])
-    taskMessage.value = `评测已完成 · #${result.id || ''}，点击任务查看结果`
+    taskMessage.value = `已加入队列 · #${result.id || ''}，可在任务列表查看进度`
     if (view.value === 'create') view.value = 'tasks'
   } catch (cause: any) { error.value = cause.message || '连续性评测失败' }
   finally { busy.value = false }
@@ -226,7 +240,7 @@ async function confirmGeneration(panelIds?: number[]) {
     try {
       latest = await previsRequest<ContinuityReviewStatus>(`/animatic-versions/${id}/continuity-review-status`)
       if (disposed || props.version?.id !== id || props.version.revision !== revision) return false
-      status.value = latest; settings.value = latest.settings
+      status.value = latest
       riskRows.value = continuityRisks(props.timeline, latest, panelIds)
     } catch (cause: any) {
       if (disposed) return false
@@ -264,11 +278,11 @@ void loadSettings()
 const timer = setInterval(async () => {
   if (disposed || busy.value || polling) return
   polling = true
-  try { await Promise.all([loadHistory(), refresh()]) }
+  try { await Promise.all([loadHistory(), refresh(), ...(expanded.value && view.value === 'settings' ? [loadSettings(false)] : [])]) }
   catch { /* refresh 已记录有效上下文的异常；历史异常由 loadHistory 记录。 */ }
   finally { polling = false }
 }, 4000)
-onUnmounted(() => { disposed = true; ++loadToken; ++historyToken; ++detailToken; clearTimeout(searchTimer); clearInterval(timer); finish(false); if (typeof document !== 'undefined' && originalBodyOverflow !== undefined) document.body.style.overflow = originalBodyOverflow })
+onUnmounted(() => { if (typeof window !== 'undefined') window.removeEventListener('keydown', handleDrawerKeys, true); disposed = true; ++settingsToken; ++loadToken; ++historyToken; ++detailToken; clearTimeout(searchTimer); clearInterval(timer); finish(false); if (typeof document !== 'undefined' && originalBodyOverflow !== undefined) document.body.style.overflow = originalBodyOverflow })
 defineExpose({ confirmGeneration, refresh })
 </script>
 
@@ -282,21 +296,24 @@ defineExpose({ confirmGeneration, refresh })
       <div v-if="expanded" class="evaluation-overlay" @click.self="closeDrawer" @keydown.esc.stop.prevent="closeDrawer">
         <aside ref="drawer" class="evaluation-drawer" :class="{ 'is-detail': view === 'detail' }" @keydown="trapDrawerFocus" role="dialog" aria-modal="true" aria-labelledby="evaluation-title" tabindex="-1">
           <header class="evaluation-head">
-            <div class="evaluation-head-title"><button v-if="view !== 'tasks'" class="evaluation-back evaluation-icon-button" type="button" aria-label="返回评测任务列表" @click="backToTasks"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m14 6-6 6 6 6" /></svg></button><span v-else class="evaluation-head-icon"><svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="5" y="4" width="14" height="17" rx="2" /><path d="M9 4V2h6v2M9 10h6m-6 4h6m-6 4h3" /></svg></span><div><h2 id="evaluation-title">{{ { tasks: '评测任务', detail: '任务详情', create: '发起评测', settings: '评测设置' }[view] }}</h2><p>{{ view === 'tasks' ? '查看评测进度与结果，点击任务查看详情' : view === 'settings' ? '管理自动评测与关注阈值' : view === 'create' ? '选择需要检查的镜头衔接' : '画面对比、评分与改进建议' }}</p></div></div>
-            <div class="evaluation-head-actions"><template v-if="view === 'tasks'"><button class="evaluation-icon-button" type="button" :disabled="historyLoading" aria-label="刷新评测任务" title="刷新" @click="refreshAll"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" :class="{ spin: historyLoading }"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-1l2 6M4 12l2 6a7 7 0 0 0 12-1" /></svg></button><button class="evaluation-icon-button" type="button" aria-label="评测设置" title="评测设置" @click="view = 'settings'; settingsMessage = ''"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h16M4 17h16M8 4v6m8 4v6" /></svg></button><button class="evaluation-button primary evaluation-create" type="button" :disabled="!version" @click="openCreate"><span aria-hidden="true">+</span>发起评测</button></template><button type="button" class="evaluation-icon-button evaluation-close" aria-label="关闭评测抽屉" @click="closeDrawer"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m6 6 12 12M18 6 6 18" /></svg></button></div>
+            <div class="evaluation-head-title"><button v-if="view !== 'tasks'" class="evaluation-back evaluation-icon-button" type="button" aria-label="返回评测任务列表" @click="backToTasks"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m14 6-6 6 6 6" /></svg></button><span v-else class="evaluation-head-icon"><svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="5" y="4" width="14" height="17" rx="2" /><path d="M9 4V2h6v2M9 10h6m-6 4h6m-6 4h3" /></svg></span><div><h2 id="evaluation-title">{{ { tasks: '评测任务', detail: '任务详情', create: '发起评测', settings: '评测任务设置' }[view] }}</h2><p>{{ view === 'tasks' ? '查看评测进度与结果，点击任务查看详情' : view === 'settings' ? '全局设置 · 对所有项目生效' : view === 'create' ? '选择需要检查的镜头衔接' : '画面对比、评分与改进建议' }}</p></div></div>
+            <div class="evaluation-head-actions"><template v-if="view === 'tasks'"><button class="evaluation-icon-button" type="button" :disabled="historyLoading" aria-label="刷新评测任务" title="刷新" @click="refreshAll"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" :class="{ spin: historyLoading }"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-1l2 6M4 12l2 6a7 7 0 0 0 12-1" /></svg></button><QueueSettingsButton label="评测任务设置" @click="view = 'settings'; settingsMessage = ''; loadSettings(false)" /><button class="evaluation-button primary evaluation-create" type="button" :disabled="!version" @click="openCreate"><span aria-hidden="true">+</span>发起评测</button></template><button type="button" class="evaluation-icon-button evaluation-close" aria-label="关闭评测抽屉" @click="closeDrawer"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m6 6 12 12M18 6 6 18" /></svg></button></div>
           </header>
           <p v-if="error" role="alert" class="evaluation-notice">{{ error }}</p>
           <p v-if="view === 'tasks' && taskMessage" role="status" class="evaluation-notice is-success">{{ taskMessage }}</p>
           <p v-if="view === 'detail' && detailError" role="alert" class="evaluation-notice">{{ detailError }} · 暂时显示上次读取的详情<button type="button" @click="loadSelectedTask">重新加载</button></p>
           <p v-if="dirty" class="evaluation-notice">有未保存的修改，发起评测和生成视频前会先保存并检查当前画面。</p>
           <EvaluationTaskList v-if="view === 'tasks'" :items="taskRows" :total="history.total" :summary="history.summary" :active-count="history.activeCount" :page="page" :page-size="history.pageSize" :filter="taskFilter" :keyword="keyword" :loading="historyLoading" :error="historyError" :can-create="!!version" @select="selectRow" @filter="changeFilter" @search="keyword = $event" @page="page = $event" @refresh="loadHistory" @create="openCreate" />
-          <ContinuityReviewDetail v-else-if="view === 'detail' && selected" :key="selected.id" :item="selected" :threshold="settings.threshold" :retry-disabled-reason="retryDisabledReason" :busy="busy || confirming" @retry="retrySelected" />
+          <ContinuityReviewDetail v-else-if="view === 'detail' && selected" :key="selected.id" :item="selected" :threshold="settings.threshold" :retry-disabled-reason="retryDisabledReason" :busy="busy || confirming" @retry="retrySelected" @changed="refreshAll" />
           <div v-else-if="view === 'settings'" class="evaluation-form" data-testid="evaluation-settings">
-            <div class="evaluation-form-intro"><span class="evaluation-type-chip">自动化</span><h3>让评测跟随画面更新</h3><p>开启后，新采用的画面会自动评测相邻镜头的衔接。</p></div>
+            <div class="evaluation-form-intro"><span class="evaluation-type-chip">全局设置 · 对所有项目生效</span><h3>评测任务设置</h3><p>手动与自动评测共享并发。后台任务总并发 {{ settings.globalTotal }}（只读），在任务设置中调整；服务商配额组也可能约束评测。</p><p>全局评测执行 {{ settings.stats.byKind?.evaluation?.active ?? settings.stats.active }} / {{ settings.concurrency }} · 排队 {{ settings.stats.byKind?.evaluation?.pending ?? settings.stats.pending }}</p><p v-if="(settings.stats.byKind?.evaluation?.active ?? settings.stats.active) > settings.concurrency">等待已有任务完成</p></div>
+            <p v-if="settingsConflict" class="evaluation-notice" role="alert">草稿已保留<button type="button" @click="loadSettings()">舍弃草稿并重新载入</button></p>
+            <div class="evaluation-form-row"><div><label for="evaluation-concurrency">评测并发</label><p>评测开始时同时受总上限与配额组上限约束。</p></div><div class="evaluation-number"><input id="evaluation-concurrency" v-model.number="concurrency" type="number" min="1" max="32" step="1" :disabled="!settingsLoaded || savingSettings"></div></div>
+            <div class="evaluation-form-row"><div><label for="evaluation-paused">暂停评测队列</label><p>暂停所有项目尚未开始的评测；执行中评测继续。</p></div><button id="evaluation-paused" type="button" role="switch" :aria-checked="paused" aria-label="暂停评测队列" :class="['evaluation-switch', { on: paused }]" :disabled="!settingsLoaded || savingSettings" @click="paused = !paused"><i /></button></div>
             <div class="evaluation-form-row"><div><label for="evaluation-enabled">自动评测</label><p>默认关闭，仅在画面更新后触发。</p></div><button id="evaluation-enabled" type="button" role="switch" :aria-checked="enabled" aria-label="自动评测" :class="['evaluation-switch', { on: enabled }]" :disabled="!settingsLoaded || savingSettings" @click="enabled = !enabled"><i /></button></div>
             <div class="evaluation-form-row"><div><label for="evaluation-threshold">关注阈值</label><p>当前结果低于此分数时标记为“需关注”。</p></div><div class="evaluation-number"><input id="evaluation-threshold" v-model.number="threshold" type="number" min="0" max="100" step="1" :disabled="!settingsLoaded || savingSettings"><span>/ 100</span></div></div>
             <div class="evaluation-form-info"><strong>模型与费用</strong><p>自动评测使用配置的视觉文本模型，会产生模型调用费用。不会自动修改画面。</p><p>这些设置对所有项目共享；浏览列表和查询状态不会触发模型调用。</p></div>
-            <div class="evaluation-form-footer"><span v-if="!settingsLoaded" class="evaluation-form-muted">设置未载入<button type="button" class="evaluation-button" @click="loadSettings">重新加载</button></span><span v-else-if="settingsMessage && !settingsDirty" class="evaluation-success" role="status">✓ {{ settingsMessage }}</span><span v-else-if="settingsDirty" class="evaluation-form-muted">设置尚未保存</span><span v-else class="evaluation-form-muted">当前设置已生效</span><button type="button" class="evaluation-button primary" :disabled="!settingsLoaded || savingSettings || !settingsDirty" @click="saveSettings">{{ savingSettings ? '保存中…' : '保存设置' }}</button></div>
+            <div class="evaluation-form-footer"><span v-if="!settingsLoaded" class="evaluation-form-muted">设置未载入<button type="button" class="evaluation-button" @click="loadSettings()">重新加载</button></span><span v-else-if="settingsMessage && !settingsDirty" class="evaluation-success" role="status">✓ {{ settingsMessage }}</span><span v-else-if="settingsDirty" class="evaluation-form-muted">设置尚未保存</span><span v-else class="evaluation-form-muted">当前设置已生效</span><button type="button" class="evaluation-button primary" :disabled="!settingsLoaded || savingSettings || !settingsDirty || settingsConflict" @click="saveSettings">{{ savingSettings ? '保存中…' : '保存设置' }}</button></div>
           </div>
           <div v-else-if="view === 'create'" class="evaluation-form evaluation-new" data-testid="evaluation-create-form">
             <div class="evaluation-form-intro"><span class="evaluation-type-chip">连续性评测</span><h3>检查前后镜头是否接得上</h3><p>对比前镜头的结束画面与后镜头的起始画面，检查人物、场景、动作和构图。</p></div>
@@ -305,7 +322,7 @@ defineExpose({ confirmGeneration, refresh })
             <fieldset v-else-if="visibleItems.length" class="evaluation-targets"><legend>选择镜头衔接 <small>{{ visibleItems.length }} 项</small></legend><label v-for="item in visibleItems" :key="`${item.fromGroupId}:${item.toGroupId}`" class="evaluation-target" :class="{ selected: newReviewGroupId === item.toGroupId, disabled: !!disabledReason(item.toGroupId) }"><input v-model="newReviewGroupId" type="radio" name="evaluation-target" :value="item.toGroupId" :disabled="!!disabledReason(item.toGroupId) || busy || confirming"><span><strong>{{ groupTitle(item.fromGroupId) }} → {{ groupTitle(item.toGroupId) }}</strong><small>{{ disabledReason(item.toGroupId) || (item.result ? `最近评分 ${item.result.overallScore} / 100` : '画面已就绪，可以开始评测') }}</small></span><em>{{ stateNames[item.status] }}</em></label></fieldset>
             <div v-else class="evaluation-form-empty"><strong>暂无可评测的镜头衔接</strong><p>请先规划相邻镜头，并生成两侧的边界画面。</p></div>
             <div class="evaluation-form-info"><strong>使用模型</strong><p>{{ textModel?.model || '请先选择支持视觉的文本模型' }}</p><p>每次开始会产生模型调用费用。内容会先保存，再对当前画面发起评测。</p></div>
-            <div class="evaluation-form-footer"><span class="evaluation-form-muted">{{ newReviewGroupId ? disabledReason(newReviewGroupId) || '已选择 1 项衔接' : '请选择要评测的镜头衔接' }}</span><button type="button" class="evaluation-button primary" :disabled="!newReviewGroupId || busy || confirming || !!disabledReason(newReviewGroupId)" @click="score(newReviewGroupId)">{{ busy ? '正在评测…' : '开始评测' }}</button></div>
+            <div class="evaluation-form-footer"><span class="evaluation-form-muted">{{ newReviewGroupId ? disabledReason(newReviewGroupId) || '已选择 1 项衔接' : '请选择要评测的镜头衔接' }}</span><button type="button" class="evaluation-button primary" :disabled="!newReviewGroupId || busy || confirming || !!disabledReason(newReviewGroupId)" @click="score(newReviewGroupId)">{{ busy ? '正在提交…' : '加入评测队列' }}</button></div>
           </div>
           <slot />
         </aside>

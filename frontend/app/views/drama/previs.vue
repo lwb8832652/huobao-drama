@@ -8,6 +8,10 @@ import {
   Download, FileText, Film, Images, Layers, ListTodo, Loader2, Lock, Plus,
   Redo2, RefreshCw, Save, Scissors, ShieldCheck, Sparkles, Undo2, Upload, Users, X,
 } from 'lucide-vue-next'
+import TaskQueueSettings from '~/components/TaskQueueSettings.vue'
+import QueueSettingsButton from '~/components/QueueSettingsButton.vue'
+import QueueJobActions from '~/components/QueueJobActions.vue'
+import { queueStatusLabel, filterQueueRows, type QueueFilter } from '~/composables/useTaskQueue'
 import LocaleSwitcher from '~/components/LocaleSwitcher.vue'
 import ThemeToggle from '~/components/ThemeToggle.vue'
 import ContinuityReviewPanel from '~/components/previs/ContinuityReviewPanel.vue'
@@ -23,7 +27,7 @@ import {
   FRAME_COUNT_MAX, frameCountChangeAllowed, checkContinuity, createFrameId, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl, orderedFrames,
   applyFramePlanToPanel, contactSheetForPanel, videoContinuityReadiness, panelIncomingTransition, useVideoContinuityMode, useVideoContinuityCapabilities, videoGenerationScopeError, planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy,
   type AudioClip, type ContinuityIssue, type FrameType, type Keyframe,
-  type Panel, type PanelFramePlan, type Timeline, type VideoGenerationScope,
+  type Panel, type PanelFramePlan, type FramePlansResult, type Timeline, type VideoGenerationScope,
 } from '~/composables/usePrevis'
 import '~/assets/css/previs.css'
 
@@ -56,6 +60,18 @@ const modal = ref(''), dialog = ref<HTMLDialogElement>()
 const framePlanOpen = ref(false), framePlanCount = ref(4)
 const gridBusy = ref(false)
 const framePlans = ref<PanelFramePlan[]>([])
+const framePlanTaskRows = ref<FramePlansResult['items']>([]), framePlanTaskError = ref('')
+let framePlanTaskToken = 0, framePlanTaskTimer: ReturnType<typeof setInterval> | undefined
+async function loadFramePlanTasks() {
+  const id = version.value?.id, token = ++framePlanTaskToken
+  if (!id) return
+  try { const result = await fetchFramePlans(id); if (token === framePlanTaskToken && version.value?.id === id) { framePlanTaskRows.value = result.items; framePlanTaskError.value = '' } }
+  catch (cause: any) { if (token === framePlanTaskToken) framePlanTaskError.value = cause.message || '读取画面规划任务失败' }
+}
+watch(() => `${inspector.value}:${version.value?.id || ''}`, () => {
+  ++framePlanTaskToken; clearInterval(framePlanTaskTimer)
+  if (inspector.value === 'tasks') { void loadFramePlanTasks(); framePlanTaskTimer = setInterval(loadFramePlanTasks, 4000) }
+})
 const framePlanActive = computed(() => framePlansSummary.value.pending + framePlansSummary.value.processing)
 const videoPanelIds = ref<number[]>([])
 const textModel = ref(''), imageModel = ref(''), videoModel = ref('')
@@ -103,7 +119,25 @@ const fails = computed(() => issues.value.filter(i => i.severity === 'fail'))
 const warnings = computed(() => issues.value.filter(i => i.severity === 'warning' && !i.reason))
 const visibleIssues = computed(() => issues.value.filter(i => allIssues.value || i.groupId === group.value?.id))
 const batches = computed(() => version.value?.batches || [])
-const activeTasks = computed(() => batches.value.flatMap(b => b.items).filter(i => ['pending', 'processing'].includes(i.status)).length)
+const taskQueueSettingsOpen = ref(false), taskFilter = ref<QueueFilter>('all')
+const taskItems = computed(() => batches.value.flatMap(batch => batch.items))
+const activeTasks = computed(() => taskItems.value.filter(item => ['pending', 'processing'].includes(item.status)).length + framePlanActive.value)
+const taskFilters = computed(() => [
+  { key: 'active' as const, label: '进行中', count: activeTasks.value },
+  { key: 'completed' as const, label: '完成', count: taskItems.value.filter(item => item.status === 'completed').length + framePlansSummary.value.completed },
+  { key: 'failed' as const, label: '失败', count: taskItems.value.filter(item => item.status === 'failed').length + framePlansSummary.value.failed },
+])
+const taskExecuting = computed(() => taskItems.value.filter(item => item.status === 'processing').length + framePlansSummary.value.processing)
+const taskQueued = computed(() => taskItems.value.filter(item => item.status === 'pending').length + framePlansSummary.value.pending)
+const filteredBatches = computed(() => batches.value.map(batch => ({ ...batch, items: filterQueueRows(batch.items, taskFilter.value) })).filter(batch => batch.items.length))
+const filteredFramePlanTasks = computed(() => filterQueueRows(framePlanTaskRows.value, taskFilter.value))
+const showPlanningTasks = computed(() => taskFilter.value === 'all' ? framePlanTaskRows.value.length > 0 || framePlanActive.value + framePlansSummary.value.completed + framePlansSummary.value.failed > 0 : taskFilter.value === 'active' ? framePlanActive.value > 0 : taskFilter.value === 'failed' ? framePlansSummary.value.failed > 0 : framePlansSummary.value.completed > 0)
+async function refreshQueueTasks() {
+  if (!version.value) return
+  const latest = await previsRequest<Partial<typeof version.value>>(`/animatic-versions/${version.value.id}/state`)
+  if (latest.batches) version.value.batches = latest.batches
+  await loadFramePlanTasks()
+}
 const frameCount = computed(() => timeline.value?.panels.reduce((n, p) => n + p.frames.filter(f => f.url).length, 0) || 0)
 const characterCount = computed(() => drama.value?.characters?.filter((item: any) => !item.deleted_at && !item.deletedAt).length || 0)
 const assets = computed(() => [
@@ -540,7 +574,7 @@ watch(modal, async value => {
   else dialog.value?.close()
 })
 function onKey(event: KeyboardEvent) {
-  if (modal.value || /INPUT|TEXTAREA|SELECT|BUTTON/.test((event.target as HTMLElement).tagName)) return
+  if (event.defaultPrevented || document.querySelector('dialog[open]') || modal.value || /INPUT|TEXTAREA|SELECT|BUTTON/.test((event.target as HTMLElement).tagName)) return
   if (event.code === 'Space') { event.preventDefault(); player.value?.toggle() }
   if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
     event.preventDefault()
@@ -581,7 +615,7 @@ onMounted(async () => {
   } catch (e: any) { error.value = e.message }
   finally { loading.value = false }
 })
-onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeEventListener('beforeunload', beforeUnload) })
+onUnmounted(() => { ++framePlanTaskToken; clearInterval(framePlanTaskTimer); window.removeEventListener('keydown', onKey); window.removeEventListener('beforeunload', beforeUnload) })
 </script>
 
 <template>
@@ -886,23 +920,28 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
               </div>
             </template>
             <template v-else-if="inspector === 'tasks'">
-              <div class="pv-task-intro"><p class="pv-eyebrow">V{{ String(version.versionNo).padStart(2, '0') }} / 生成记录</p><p>已提交任务继续执行，取消仅停止尚未开始的任务。</p></div>
-              <article v-if="framePlanActive || framePlansSummary.failed || framePlansSummary.completed" class="pv-batch">
-                <header><b>分镜画面拆分</b>
-                  <span><Loader2 v-if="framePlanActive" :size="11" class="pv-spin" /> {{ framePlanActive ? `${framePlanActive} 个拆分中` : framePlansSummary.failed ? `${framePlansSummary.failed} 个失败` : `已完成 ${framePlansSummary.completed} 个` }}</span>
-                </header>
-                <div class="pv-batch-actions">
-                  <button v-if="framePlansSummary.completed" :disabled="working" @click="run(openFramePlans)">查看拆分方案</button>
-                  <button v-if="framePlansSummary.failed" :disabled="working" @click="run(retryFailedFramePlans)">重试失败项</button>
-                </div>
+              <div class="pv-task-intro"><div class="pv-task-heading"><p class="pv-eyebrow">V{{ String(version.versionNo).padStart(2, '0') }} / 生成记录</p><QueueSettingsButton label="任务设置" @click="taskQueueSettingsOpen = true" /></div><p>本版本执行 {{ taskExecuting }} · 排队 {{ taskQueued }}</p></div>
+              <div class="pv-task-filters" role="group" aria-label="筛选制作任务状态"><button v-for="option in taskFilters" :key="option.key" type="button" :class="{ on: taskFilter === option.key }" :aria-pressed="taskFilter === option.key" title="再次点击取消筛选" @click="taskFilter = taskFilter === option.key ? 'all' : option.key">{{ option.count }} {{ option.label }}</button></div>
+              <p v-if="framePlanTaskError" class="pv-frame-error" role="alert">{{ framePlanTaskError }}<button type="button" @click="loadFramePlanTasks">重新加载</button></p>
+              <article v-if="showPlanningTasks" class="pv-batch">
+                <header><b>分镜画面拆分</b><span>执行 {{ framePlansSummary.processing }} · 排队 {{ framePlansSummary.pending }}</span></header>
+                <div class="pv-batch-actions"><button v-if="framePlansSummary.completed" :disabled="working" @click="run(openFramePlans)">查看拆分方案</button><button v-if="framePlansSummary.failed" :disabled="working" @click="run(retryFailedFramePlans)">重试失败项</button></div>
+                <details v-if="filteredFramePlanTasks.length"><summary>查看 {{ filteredFramePlanTasks.length }} 个任务</summary><div v-for="item in filteredFramePlanTasks" :key="item.id" class="pv-task-item"><b>{{ timeline.panels.find(panel => panel.id === item.panelId)?.title || `镜头 #${item.panelId}` }}</b><span>{{ queueStatusLabel(item) }}</span><p v-if="item.queueReason" class="pv-frame-note">{{ item.queueReason }}</p><p v-if="item.error" class="pv-frame-error">{{ item.error }}</p><QueueJobActions :job="item" @changed="loadFramePlanTasks" /></div></details>
               </article>
-              <article v-for="batch in batches" :key="batch.id" class="pv-batch"><header><b>{{ batch.type === 'image' ? '关键帧' : '视频' }} #{{ batch.id }}</b><span>{{ statusNames[batch.status] || batch.status }}</span></header><progress :value="batch.items.filter(i => i.status === 'completed').length" :max="batch.items.length" /><small>{{ batch.items.filter(i => i.status === 'completed').length }} / {{ batch.items.length }} 已完成</small><div class="pv-batch-actions"><button v-if="batch.items.some(i => i.status === 'failed')" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry'))">重试失败项</button><button v-if="batch.items.some(i => i.status === 'pending')" :disabled="working" @click="run(() => batchAction(batch.id, 'cancel'))">取消排队任务</button></div><details><summary>查看 {{ batch.items.length }} 个任务</summary><div v-for="item in batch.items" :key="item.id" class="pv-task-item"><b>{{ timeline.panels.find(p => p.id === item.panelId)?.title || groups.find(g => g.id === item.groupId)?.title }} {{ item.frameType ? frameNames[item.frameType] : '' }}</b><span>{{ statusNames[item.status] || item.status }}<small v-if="item.referenceInput"> · {{ item.referenceInput.effective === 'contact_sheet' ? '宫格参考' : '逐张参考' }}</small><small v-if="item.videoContinuity?.fallbackReason"> · {{ item.videoContinuity.fallbackReason }}</small><small v-if="item.actualStrategy"> · {{ constraintNames[item.actualStrategy] }}</small></span><p v-if="item.error" class="pv-frame-error">{{ item.error }}</p><button v-if="item.status === 'failed'" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry', [item.id]))">重试此项</button><a v-if="item.status === 'completed' && (item.localPath || item.resultUrl)" :href="mediaUrl(item.localPath || item.resultUrl)" target="_blank" rel="noopener">查看生成结果 ↗</a></div></details></article><div v-if="!batches.length" class="pv-small-empty"><Film :size="27" /><p>还没有生成任务</p><span>生成关键帧后，进度会显示在这里。</span></div>
+              <article v-for="batch in filteredBatches" :key="batch.id" class="pv-batch">
+                <header><b>{{ batch.type === 'image' ? '关键帧' : '视频' }} #{{ batch.id }}</b><span>{{ statusNames[batch.status] || batch.status }}</span></header>
+                <progress :value="batch.items.filter(i => i.status === 'completed').length" :max="batch.items.length" /><small>{{ batch.items.filter(i => i.status === 'completed').length }} / {{ batch.items.length }} 已完成</small>
+                <div class="pv-batch-actions"><button v-if="batch.items.some(i => i.status === 'failed' && !i.queueJobId)" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry'))">重试失败项</button><button v-if="batch.items.some(i => i.status === 'pending' && !i.queueJobId)" :disabled="working" @click="run(() => batchAction(batch.id, 'cancel'))">取消排队任务</button></div>
+                <details><summary>查看 {{ batch.items.length }} 个任务</summary><div v-for="item in batch.items" :key="item.id" class="pv-task-item"><b>{{ timeline.panels.find(p => p.id === item.panelId)?.title || groups.find(g => g.id === item.groupId)?.title }} {{ item.frameType ? frameNames[item.frameType] : '' }}</b><span>{{ queueStatusLabel(item) }}<small v-if="item.referenceInput"> · {{ item.referenceInput.effective === 'contact_sheet' ? '宫格参考' : '逐张参考' }}</small><small v-if="item.videoContinuity?.fallbackReason"> · {{ item.videoContinuity.fallbackReason }}</small><small v-if="item.actualStrategy"> · {{ constraintNames[item.actualStrategy] }}</small></span><p v-if="item.queueReason" class="pv-frame-note">{{ item.queueReason }}</p><p v-if="item.error" class="pv-frame-error">{{ item.error }}</p><QueueJobActions v-if="item.queueJobId" :job="item" @changed="run(refreshQueueTasks)" /><button v-else-if="item.status === 'failed'" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry', [item.id]))">重试此项</button><a v-if="item.status === 'completed' && (item.localPath || item.resultUrl)" :href="mediaUrl(item.localPath || item.resultUrl)" target="_blank" rel="noopener">查看生成结果 ↗</a></div></details>
+              </article>
+              <div v-if="!filteredBatches.length && !showPlanningTasks" class="pv-small-empty"><Film :size="27" /><p>{{ taskFilter === 'all' ? '还没有生成任务' : '没有符合条件的任务' }}</p><span>生成任务后，进度会显示在这里。</span></div>
             </template>
           </div>
         </aside>
       </section>
       <PrevisTimeline :timeline="timeline" :current-ms="currentMs" :group-id="group?.id || ''" :active-frame-id="activeFrameId" :video-preview="stageView === 'video'" :video-sources="videoSources" :editable="editable" @seek="player?.seek($event)" @select="select" @audio="showAudio" @duration="setDuration" @move-audio="moveAudio" />
     </template>
+    <TaskQueueSettings :open="taskQueueSettingsOpen" @close="taskQueueSettingsOpen = false" />
     <dialog ref="dialog" class="pv-dialog" @close="modal = ''" @click="($event.target === dialog) && (modal = '')">
       <form v-if="modal" @submit.prevent>
         <header><h2>{{ ({ strategy: '模型设置', video: '生成正式视频', audio: '编辑音轨', waiver: '确认连续性提示', lock: '锁定故事版', sync: '同步最新分镜', reload: '重新载入版本', split: '重新拆分分镜画面' } as Record<string, string>)[modal] }}</h2><button aria-label="关闭对话框" @click="modal = ''"><X :size="18" /></button></header>

@@ -13,7 +13,8 @@ function evaluate(source, deps = {}) {
     { module, exports: module.exports, require: n => { assert.ok(n in deps, n); return deps[n] }, setInterval: fn => { intervals.push(fn); return intervals.length }, clearInterval() {}, setTimeout, clearTimeout, Set, Number })
   return module.exports
 }
-const domain = evaluate(read('../app/composables/useContinuityReview.ts'))
+const queue = evaluate(read('../app/composables/useTaskQueue.ts'))
+const domain = evaluate(read('../app/composables/useContinuityReview.ts'), { './useTaskQueue': queue })
 const timeline = { groups: [{ id: 'a', title: 'A', panelIds: [1, 2] }, { id: 'b', title: 'B', panelIds: [3, 4] }, { id: 'c', title: 'C', panelIds: [5] }], transitions: [{ from: 'a', to: 'b' }, { from: 'b', to: 'c' }] }
 const result = (score = 90, confidence = 'high') => ({ overallScore: score, confidence, summary: '模拟', dimensions: {}, issues: [], suggestions: [] })
 const snapshot = (status = 'completed', score = 90, confidence = 'high') => ({ settings: { enabled: false, threshold: 70 }, items: [{ id: 1, fromGroupId: 'a', toGroupId: 'b', inputHash: 'new', status, result: status === 'completed' ? result(score, confidence) : null, error: status === 'failed' ? '模拟错误' : null, lowScore: score < 70 }] })
@@ -33,14 +34,17 @@ test('六类风险和阈值边界完整，低分和低置信合并一条', () =>
 const descriptor = parse(read('../app/components/previs/ContinuityReviewPanel.vue')).descriptor
 const script = compileScript(descriptor, { id: 'review' })
 const flush = async () => { for (let i = 0; i < 6; i++) await vue.nextTick() }
-function mount({ current = snapshot('idle'), saveOK = true, unavailable = false, historyResponse, detailResponse, postResult } = {}) {
+function mount({ current = snapshot('idle'), saveOK = true, unavailable = false, historyResponse, detailResponse, postResult, settingsResponse, settingsFailure } = {}) {
   const calls = [], unmounts = []
   let exposed
   const component = evaluate(script.content, {
     vue: { ...vue, onUnmounted: fn => unmounts.push(fn) },
     '~/composables/usePrevis': { previsRequest: async (path, method = 'GET', body) => {
       calls.push({ path, method, body })
-      if (path.endsWith('continuity-review-settings')) return body || { enabled: false, threshold: 70 }
+      if (path === '/settings/evaluation-tasks' || path.endsWith('continuity-review-settings')) {
+        if (method === 'PUT' && settingsFailure) throw settingsFailure
+        return body ? { ...body, globalTotal: 6, stats: {} } : (typeof settingsResponse === 'function' ? settingsResponse() : settingsResponse) || { revision: 1, concurrency: 1, paused: false, enabled: false, threshold: 70, globalTotal: 6, stats: {} }
+      }
       if (unavailable) throw Error('模拟离线')
       if (method === 'POST' && postResult) return postResult
       if (/continuity-review-tasks\/\d+$/.test(path)) return detailResponse || { id: 12, type: 'continuity', status: 'processing', current: false, images: { from: null, to: null } }
@@ -48,6 +52,7 @@ function mount({ current = snapshot('idle'), saveOK = true, unavailable = false,
       return current
     } },
     '~/composables/useContinuityReview': domain,
+    '../QueueSettingsButton.vue': { default: {} },
     './EvaluationTaskList.vue': { default: {} },
     './ContinuityReviewDetail.vue': { default: {} },
   }).default
@@ -186,7 +191,7 @@ test('发起评测成功回任务列表，仍由用户点击具体记录后展�
   const m = mount({ postResult: { id: 12 } }); await flush()
   m.s.view.value = 'create'; await m.s.score('b'); await flush()
   assert.equal(m.s.view.value, 'tasks'); assert.equal(m.s.selectedId.value, null)
-  assert.match(m.s.taskMessage.value, /完成/); m.unmount()
+  assert.match(m.s.taskMessage.value, /已加入队列/); m.unmount()
 })
 test('旧轮询等待详情后不得按旧总数回退用户已切换的新页码', async () => {
   let total = 20, release
@@ -294,4 +299,35 @@ test('三个视频入口均在生成前等待共享确认，两个页面模板�
     const d = parse(source).descriptor
     assert.deepEqual(compileTemplate({ source: d.template.content, filename: file, id: file }).errors, [])
   }
+})
+
+test('评测设置只保存评测字段，携带独立修订号与暂停范围', async () => {
+  const m = mount(); await flush(); m.s.concurrency.value = 3; m.s.paused.value = true; m.s.enabled.value = true
+  await m.s.saveSettings(); const put = m.calls.find(c => c.method === 'PUT')
+  assert.equal(put.path, '/settings/evaluation-tasks')
+  assert.deepEqual(Object.keys(put.body).sort(), ['concurrency', 'enabled', 'paused', 'revision', 'threshold'])
+  assert.equal(put.body.revision, 1); assert.equal(put.body.concurrency, 3); assert.equal(put.body.paused, true); m.unmount()
+})
+test('评测保存冲突保留草稿和修订号，状态刷新不覆盖设置', async () => {
+  const m = mount({ settingsFailure: Object.assign(new Error('设置已更新'), { status: 409 }) }); await flush()
+  m.s.threshold.value = 88; m.s.concurrency.value = 2; await m.s.saveSettings(); await m.s.refresh()
+  assert.equal(m.s.settingsConflict.value, true); assert.equal(m.s.threshold.value, 88); assert.equal(m.s.concurrency.value, 2)
+  assert.equal(m.s.settings.value.revision, 1); assert.equal(m.s.settingsDirty.value, true); m.unmount()
+})
+
+test('保存期间已发出的旧设置查询不能覆盖新修订或草稿', async () => {
+  let defer = false, release
+  const base = { revision: 1, concurrency: 1, paused: false, enabled: false, threshold: 70, globalTotal: 6, stats: {} }
+  const m = mount({ settingsResponse: () => defer ? new Promise(resolve => { release = resolve }) : base }); await flush()
+  defer = true; const stale = m.s.loadSettings(false); await flush()
+  m.s.concurrency.value = 3; await m.s.saveSettings(); release({ ...base, revision: 0 }); await stale
+  assert.equal(m.s.settings.value.revision, 1); assert.equal(m.s.concurrency.value, 3); m.unmount()
+})
+
+test('评测设置重载移除已聚焦按钮后，Escape仍关闭抽屉并恢复入口焦点', async () => {
+  const m = mount(); await flush(); m.s.expanded.value = true; await flush()
+  assert.equal(typeof m.s.handleDrawerKeys, 'function')
+  let prevented = false, stopped = false
+  m.s.handleDrawerKeys({key:'Escape',preventDefault(){prevented=true},stopPropagation(){stopped=true}})
+  assert.equal(m.s.expanded.value,false); assert.equal(prevented,true); assert.equal(stopped,true); m.unmount()
 })
