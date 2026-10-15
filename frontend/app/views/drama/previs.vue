@@ -75,7 +75,7 @@ watch(() => `${inspector.value}:${version.value?.id || ''}`, () => {
 const framePlanActive = computed(() => framePlansSummary.value.pending + framePlansSummary.value.processing)
 const videoPanelIds = ref<number[]>([])
 const textModel = ref(''), imageModel = ref(''), videoModel = ref('')
-const episodeResolution = ref('720p')
+const episodeResolution = ref('480p')
 const configs = ref<any[]>([]), capabilities = ref<Record<string, any>>({})
 const storyboards = ref<any[]>([])
 const SIDEBAR_COLLAPSED_KEY = 'huobao:sidebar-collapsed'
@@ -296,7 +296,7 @@ watch(textModel, value => persistModel(value, 'huobao:model:chat'))
 watch(imageModel, value => persistModel(value, 'huobao:model:image'))
 watch(videoModel, value => persistModel(value, 'huobao:model:video'))
 watch(episodeResolution, async (value, previous) => {
-  if (!episode.value?.id || value === previous || value === (episode.value.resolution || '720p')) return
+  if (!episode.value?.id || value === previous || value === (episode.value.resolution || '480p')) return
   try {
     await previsRequest(`/episodes/${episode.value.id}`, 'PUT', { resolution: value })
     episode.value.resolution = value
@@ -617,7 +617,7 @@ onMounted(async () => {
     textModel.value = chooseModel('text', storedModel('huobao:model:chat'))
     imageModel.value = chooseModel('image', storedModel('huobao:model:image'), episode.value.image_config_id || episode.value.imageConfigId)
     videoModel.value = chooseModel('video', storedModel('huobao:model:video'), episode.value.video_config_id || episode.value.videoConfigId)
-    episodeResolution.value = episode.value.resolution || '720p'
+    episodeResolution.value = episode.value.resolution || '480p'
   } catch (e: any) { error.value = e.message }
   finally { loading.value = false }
 })

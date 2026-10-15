@@ -2297,10 +2297,15 @@ const resolutionOptions = computed(() => RESOLUTION_TIERS[resolutionProvider.val
   key,
   model: `${RESOLUTION_DISPLAY[resolutionProvider.value][key]} · ${t(`episode.resolution.${key === '480p' ? 'smooth' : key === '720p' ? 'hd' : 'uhd'}`)}`,
 })))
+// 默认档：优先 480p（试片阶段省钱）；当前视频模型不提供 480p 时（如 MiniMax 只有 768P/2K）退回它的最低档
+const defaultResolution = computed(() => {
+  const options = resolutionOptions.value
+  return (options.find(o => o.key === '480p') || options[0])?.key || '480p'
+})
 const episodeResolution = computed({
   get: () => {
     const v = episode.value?.resolution
-    return resolutionOptions.value.some(o => o.key === v) ? v : '720p'
+    return resolutionOptions.value.some(o => o.key === v) ? v : defaultResolution.value
   },
   set: (val) => { void changeEpisodeResolution(val) },
 })

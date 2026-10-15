@@ -209,7 +209,7 @@ export async function createBatch(versionId: number, options: BatchOptions) {
         const request = { ...inputs, generationScope, storyboardId: generationScope === 'storyboard' ? unit[0].id : undefined,
           panelIds: unit.map(p => p.id), inputHash: videoFingerprint(generationTimeline, unit, generationMode, referenceInput, videoContinuity),
           referenceInput, videoContinuity, videoReferenceInputStrategy: referenceInput?.requested,
-          dramaId: ep.dramaId, prompt, model, configId, frozenConfigHash: hashContent(config), aspectRatio: drama?.aspectRatio || '16:9', resolution: ep.resolution || '720p' }
+          dramaId: ep.dramaId, prompt, model, configId, frozenConfigHash: hashContent(config), aspectRatio: drama?.aspectRatio || '16:9', resolution: ep.resolution || '480p' }
         // Validate the contract before persisting any jobs or making a paid call.
         // Static images are converted to data URLs by generation.ts; use web URLs for contract validation only.
         const validationUrl = (url?: string) => url && /^\/?static\//.test(url) ? `https://local.invalid/${url}` : url

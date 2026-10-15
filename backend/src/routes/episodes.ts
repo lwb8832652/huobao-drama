@@ -35,7 +35,8 @@ app.post('/', async (c) => {
     imageConfigId,
     videoConfigId,
     // 视频分辨率在创建集时固定（480p/720p/1080p），后续可通过 PUT 修改；各视频适配器再映射为厂商档位
-    resolution: ['480p', '720p', '1080p'].includes(body.resolution) ? body.resolution : '720p',
+    // 未指定时默认 480p（最低档，试片阶段省钱；成片可再切 720p/1080p）
+    resolution: ['480p', '720p', '1080p'].includes(body.resolution) ? body.resolution : '480p',
     createdAt: ts,
     updatedAt: ts,
   })
