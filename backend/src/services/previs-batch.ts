@@ -8,6 +8,7 @@ import { now } from '../utils/response.js'
 import { getQueueJob, retryQueueJob } from './task-queue.js'
 import { getDramaStylePrompt } from './style-preset.js'
 import { FRAME_COUNT_MAX } from './previs-frame-contract.js'
+import { productionBlockingMessage } from './shot-planning.js'
 import { scheduleContactSheets } from './previs-contact-sheets.js'
 import { scheduleContinuityReviews } from './continuity-review.js'
 import { buildVideoReferenceInput, videoReferenceMatchesSource } from './previs-video-reference.js'
@@ -55,6 +56,10 @@ export function videoInputs(
 ) {
   const cap = videoCapabilities[provider as keyof typeof videoCapabilities]
   if (!cap) throw new PrevisError('当前视频服务尚未声明预演生成能力')
+  for (const panel of panels) {
+    const message = productionBlockingMessage(panel)
+    if (message) throw new PrevisError(message)
+  }
   if (t.strategy.mode === 'group' && !cap.group) throw new PrevisError('当前服务不支持按组生成，请改用按分镜生成')
   const seconds = panels.reduce((s, p) => s + p.durationMs, 0) / 1000
   if (!Number.isInteger(seconds) || seconds < cap.minSeconds || seconds > cap.maxSeconds) {
@@ -90,9 +95,14 @@ export async function createBatch(versionId: number, options: BatchOptions) {
   const raw = JSON.parse(row.timelineJson)
   const t = normalizeTimeline(raw)
   if (row.revision !== options.revision) throw new PrevisError('版本已更新，请刷新后生成', 409)
+  if (options.type === 'video') for (const panel of t.panels.filter(p => !options.panelIds?.length || options.panelIds.includes(p.id))) {
+    const message = productionBlockingMessage(panel)
+    if (message) throw new PrevisError(message)
+  }
   if (row.status === 'locked' && row.contentHash !== hashContent(raw)) throw new PrevisError('锁定版本内容校验失败', 409)
   if (options.type === 'image') {
     requireEditable(versionId, options.revision)
+    if (t.panels.some(p => (!options.panelIds?.length || options.panelIds.includes(p.id)) && p.framePlanNeedsReview)) throw new PrevisError('时序已调整，请先重新规划并审阅画面后生成图片')
     if (hasGridTask(versionId, options.panelIds)) throw new PrevisError('所选分镜正在生成宫格，请等待或取消后再逐张生成', 409)
   }
   if (options.type === 'video' && options.generationMode === 'storyboard_frames') {

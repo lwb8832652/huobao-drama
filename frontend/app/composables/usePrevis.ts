@@ -3,7 +3,7 @@ import { toast } from 'vue-sonner'
 import type { QueueMetadata } from './useTaskQueue'
 import { withNetworkRetry } from '~/composables/useApi'
 import type { AnimaticVersion, Timeline, FrameType, Panel, Keyframe } from '../../../backend/src/services/previs-domain'
-import { frameKey, makeFrame, orderedFrames, retimeBoundAudio } from '../../../backend/src/services/previs-domain'
+import { frameKey, makeFrame, orderedFrames, retimeBoundAudio, parseShotDescription } from '../../../backend/src/services/previs-domain'
 import { FRAME_COUNT_MAX } from '../../../backend/src/services/previs-frame-contract'
 import type { ContactSheetView } from '../../../backend/src/services/previs-contact-sheet-domain'
 import { selectVideoReferenceStrategy, type VideoReferenceInputStrategy } from '../../../backend/src/services/previs-video-reference-domain'
@@ -36,6 +36,7 @@ export async function previsRequest<T = any>(path: string, method = 'GET', body?
 }
 export interface FramePlanDraft {
   id?: string
+  shotId?: string
   title: string
   prompt: string
   offsetMs: number
@@ -52,6 +53,7 @@ export interface PanelFramePlan {
   panelTitle: string
   count: number
   source: 'ai' | 'rule'
+  reviewAcknowledged?: boolean
   continuityConstraints?: string
   frames: FramePlanDraft[]
 }
@@ -133,9 +135,34 @@ export interface GridCandidate {
   continuityStaleReason?: string
 }
 
+/** UI review guard; server production checks remain authoritative when saving. */
+export function framePlanReviewError(panel: Panel, plan: PanelFramePlan): string | undefined {
+  if (!plan.frames.length || plan.frames.some(frame => {
+    const visual = (frame.prompt || '').replace(/「[^」]*」|“[^”]*”|"[^"]*"/g, '').replace(/【[^】]*】/g, '')
+      .replace(/^(?:开场|结束|关键状态|第\s*\d+\s*个瞬间)[：:]\s*/, '')
+      .replace(/^\s*[@\p{L}\p{N}_-]{1,24}\s*[：:]\s*$/u, '').split('；')[0]
+    return (visual.match(/[\p{L}\p{N}]/gu) || []).length < 2
+  })) return '存在缺少可视内容的画面，请补充当前姿态与场景后应用'
+  if (plan.frames.some((frame, i) => !Number.isInteger(frame.offsetMs) || frame.offsetMs < 0 || frame.offsetMs >= panel.durationMs
+    || (i > 0 && frame.offsetMs <= plan.frames[i - 1].offsetMs))) return '画面时间点必须递增并处于分镜时长内'
+  const timedShots = panel.productionPlan?.shots
+  const sourceShots = parseShotDescription(panel.description)
+  const shots = timedShots || (sourceShots.length ? sourceShots : parseShotDescription(panel.imagePrompt))
+  const hasMapping = !!timedShots || plan.frames.some(frame => !!frame.shotId)
+  if (plan.frames.length < shots.length || (hasMapping && (shots.some(shot => !plan.frames.some(frame => frame.shotId === shot.id))
+    || plan.frames.some((frame, index) => {
+      const shotIndex = shots.findIndex(shot => shot.id === frame.shotId)
+      return shotIndex < 0 || (index > 0 && shotIndex < shots.findIndex(shot => shot.id === plan.frames[index - 1].shotId))
+    })))) return '请按原文子镜头顺序完整覆盖全部子镜头后应用'
+  if (timedShots && plan.frames.some(frame => {
+    const shot = timedShots.find(shot => shot.id === frame.shotId)
+    return !shot || frame.offsetMs < shot.startMs || frame.offsetMs >= shot.endMs
+  })) return '请完整覆盖全部子镜头，并将时间点放在对应子镜头范围内'
+}
+
 /** Keep stable slots and their media when reviewing a revised frame plan. */
 export function applyFramePlanToPanel(panel: Panel, plan: PanelFramePlan) {
-  if (panel.frames.some(frame => frame.locked)) return false
+  if (panel.frames.some(frame => frame.locked) || (plan.source === 'rule' && !plan.reviewAcknowledged)) return false
   const previous = orderedFrames(panel), used = new Set<string>()
   const reserved = new Set(plan.frames.map(frame => frame.id).filter(id => previous.some(frame => frame.id === id)))
   panel.frames = plan.frames.map((draft, index): Keyframe => {
@@ -147,7 +174,7 @@ export function applyFramePlanToPanel(panel: Panel, plan: PanelFramePlan) {
       .filter((entry, index, all) => all.findIndex(item => item.url === entry.url) === index)
     return {
       ...(old || makeFrame(draft.id || createFrameId())),
-      title: draft.title, type: draft.type, prompt: draft.prompt, history,
+      title: draft.title, type: draft.type, prompt: draft.prompt, history, shotId: draft.shotId,
       offsetMs: Math.max(0, Math.min(draft.offsetMs, Math.max(0, panel.durationMs - 1))),
       ...(draft.shotType ? { shotType: draft.shotType } : {}),
       ...(draft.angle ? { angle: draft.angle } : {}),
@@ -155,6 +182,7 @@ export function applyFramePlanToPanel(panel: Panel, plan: PanelFramePlan) {
       ...(draft.continuity !== undefined ? { continuity: draft.continuity } : {}),
     }
   })
+  panel.framePlanNeedsReview = false
   if (plan.continuityConstraints !== undefined) panel.continuityConstraints = plan.continuityConstraints
   if (!panel.frames.some(frame => frame.id === panel.coverFrameId)) panel.coverFrameId = panel.frames[0]?.id
   return true
@@ -563,7 +591,7 @@ export function useFramePlanner(
   workspace: Pick<ReturnType<typeof usePrevis>, 'version' | 'editable' | 'save' | 'edit'>,
   modelChoice: () => { configId?: number; model?: string },
 ) {
-  const open = ref(false), busy = ref(false), count = ref(4)
+  const open = ref(false), busy = ref(false), count = ref(0)
   const plans = ref<PanelFramePlan[]>([])
   let requestToken = 0, targetPanelId = 0, targetVersionId = 0
   function close() {
@@ -579,7 +607,7 @@ export function useFramePlanner(
     targetPanelId = panelId; targetVersionId = workspace.version.value.id
     const token = ++requestToken, versionId = targetVersionId
     const active = () => token === requestToken && open.value && workspace.version.value?.id === versionId
-    count.value = options.count ?? count.value
+    count.value = options.count ?? 0
     plans.value = []; open.value = true; busy.value = true
     try {
       const saved = await workspace.save()
@@ -587,7 +615,7 @@ export function useFramePlanner(
       if (!saved) { close(); return }
       const { taskIds } = await submitFramePlan(versionId, {
         revision: workspace.version.value!.revision,
-        panelIds: [panelId], count: count.value, force: options.force,
+        panelIds: [panelId], ...(count.value ? { count: count.value } : {}), force: options.force,
         ...modelChoice(),
       })
       const taskId = taskIds[0]
@@ -600,7 +628,7 @@ export function useFramePlanner(
         if (item.status === 'failed') throw new Error(item.error || '画面拆分失败，请重试')
         const plan = result.plans.find(plan => plan.taskId === taskId)
         if (item.status === 'completed' && plan) {
-          plans.value = [plan]; count.value = plan.count
+          plans.value = [plan]
           return
         }
         await new Promise(resolve => setTimeout(resolve, 1500))
@@ -616,6 +644,9 @@ export function useFramePlanner(
     const plan = drafts.find(plan => plan.panelId === targetPanelId)
     const target = workspace.version.value.timeline.panels.find(panel => panel.id === targetPanelId)
     if (!plan?.frames.length || !target) return
+    if (plan.source === 'rule' && !plan.reviewAcknowledged) { toast.error('请先审阅规则草稿并确认画面覆盖与衔接'); return }
+    const reviewError = framePlanReviewError(target, plan)
+    if (reviewError) { toast.error(reviewError); return }
     if (target.frames.some(frame => frame.locked)) { toast.error('存在已锁定画面，不能应用新的拆分方案'); return }
     if (plan.frames.length > FRAME_COUNT_MAX) {
       toast.error(`每个镜头最多 ${FRAME_COUNT_MAX} 张画面，请先删减拆分方案`)

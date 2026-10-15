@@ -49,6 +49,11 @@ const videoContinuitySchema = z.object({
   first: videoEndpointSchema.optional(), last: videoEndpointSchema.optional(),
   frames: z.array(z.object({ panelId: id, frameId: z.string().max(100), sourceUrl: url, digest: z.string().length(64), offsetMs: ms })).max(9).optional(),
 })
+const dialogueUnitSchema = z.object({ id: z.string().min(1).max(100), speaker: z.string().max(100), text,
+  kind: z.enum(['dialogue', 'narration', 'inner']), emotion: z.string().max(200).optional(), startMs: ms, endMs: ms })
+const productionPlanSchema = z.object({ version: z.literal(1), description: text, durationMs: ms.min(100), atmosphere: text,
+  charsPerSecond: z.number().min(2).max(6), shots: z.array(z.object({ id: z.string().min(1).max(100), visual: text,
+    startMs: ms, endMs: ms, dialogue: z.array(dialogueUnitSchema).max(200) })).min(1).max(100) })
 export const timelineSchema = z.object({
   schemaVersion: z.union([z.literal(1), z.literal(2)]),
   groups: z.array(z.object({
@@ -62,8 +67,10 @@ export const timelineSchema = z.object({
     referenceLabels: z.array(text).max(30).optional(), sourceFingerprint: z.string().optional(),
     generation: z.object({ constraint, includeAssets: z.boolean() }).optional(),
     coverFrameId: z.string().max(100).optional(), continuityConstraints: text.optional(),
+    productionPlan: productionPlanSchema.optional(), framePlanNeedsReview: z.boolean().optional(),
     frames: z.array(z.object({
       id: z.string().min(1).max(100).optional(), title: z.string().max(200).optional(), offsetMs: ms.optional(),
+      shotId: z.string().max(100).optional(),
       useForVideo: z.boolean().optional(), history: z.array(z.object({ url, taskId: id.optional(), source: frameSource.optional() })).max(200).optional(),
       source: frameSource.optional(), continuity: text.optional(),
       referenceImages: z.array(url).max(30).optional(),
@@ -163,7 +170,7 @@ export function videoFingerprint(t: Timeline, panels: Panel[], generationMode: V
     })),
   })
 }
-function sourceMetadata(p: Panel) {
+export function sourceMetadata(p: Panel) {
   return {
     title: p.title, description: p.description, atmosphere: p.atmosphere,
     imagePrompt: p.imagePrompt, videoPrompt: p.videoPrompt,
@@ -218,7 +225,7 @@ export function listVersions(episodeId: number) {
   }).from(schema.animaticVersions).where(eq(schema.animaticVersions.episodeId, episodeId))
     .orderBy(desc(schema.animaticVersions.versionNo)).all()
 }
-function initialTimeline(episodeId: number): Timeline {
+export function initialTimeline(episodeId: number): Timeline {
   const rows = db.select().from(schema.storyboards).where(and(
     eq(schema.storyboards.episodeId, episodeId),
     isNull(schema.storyboards.deletedAt),

@@ -152,7 +152,7 @@ function plan() {
   const existing = frames.value
   const next = planned.map((frame, index) => {
     const old = existing[index]
-    return old ? { ...old, title: frame.title, offsetMs: frame.offsetMs, prompt: frame.prompt } : frame
+    return old ? { ...old, title: frame.title, offsetMs: frame.offsetMs, shotId: frame.shotId, prompt: frame.prompt } : frame
   })
   // Planning keeps existing extra images while updating matching planned slots.
   if (changed([...next, ...existing.slice(planned.length)])) toast.success(`已按描述规划 ${planned.length} 张画面`)

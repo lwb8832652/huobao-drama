@@ -11,6 +11,7 @@ import { db, schema } from '../../db/index.js'
 import { getDramaStylePrompt } from '../../services/style-preset.js'
 import { normalizeTimeline, orderedFrames, timelineSegments } from '../../services/previs-domain.js'
 import { resolvePanelGridReferences } from '../../services/previs-grid-references.js'
+import { parseShotDescription } from '../../services/shot-planning.js'
 import { getDramaId, getEpisodeId } from '../context.js'
 
 type ToolContext = ToolExecutionContext | undefined
@@ -59,7 +60,7 @@ export async function readFramePlanningContext(versionId: number, panelIds: numb
     const p = segment.panel, group = timeline.groups.find(g => g.id === segment.groupId)
     const ordered = orderedFrames(p)
     return { panelId: p.id, title: p.title, description: p.description, videoPrompt: p.videoPrompt,
-      imagePrompt: p.imagePrompt, atmosphere: p.atmosphere, scene: p.scene, sceneId: p.sceneId,
+      productionPlan: p.productionPlan, imagePrompt: p.imagePrompt, atmosphere: p.atmosphere, scene: p.scene, sceneId: p.sceneId,
       shotType: p.shotType, angle: p.angle, movement: p.movement, entry: group?.entry, exit: group?.exit,
       boundaryFrame: delta < 0 ? ordered.at(-1) : ordered[0],
       referenceManifest: resolvePanelGridReferences(p, dramaId),
@@ -73,12 +74,13 @@ export async function readFramePlanningContext(versionId: number, panelIds: numb
       ? db.select().from(schema.scenes).where(eq(schema.scenes.id, panel.sceneId)).get()
       : null
     const frames = orderedFrames(panel).map(frame => ({
-      id: frame.id, title: frame.title, offsetMs: frame.offsetMs, type: frame.type, url: frame.url, source: frame.source,
+      id: frame.id, shotId: frame.shotId, title: frame.title, offsetMs: frame.offsetMs, type: frame.type, url: frame.url, source: frame.source,
       prompt: frame.prompt, shotType: frame.shotType, angle: frame.angle,
       composition: frame.composition, continuity: frame.continuity, referenceImages: frame.referenceImages,
     }))
     panels.push({
       panelId: panel.id, title: panel.title, description: panel.description,
+      productionPlan: panel.productionPlan, visualShots: parseShotDescription(panel.description),
       videoPrompt: panel.videoPrompt, imagePrompt: panel.imagePrompt, atmosphere: panel.atmosphere,
       referenceImages: panel.referenceImages, referenceLabels: panel.referenceLabels,
       referenceManifest: resolvePanelGridReferences(panel, dramaId, { timeline, versionId }),

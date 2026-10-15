@@ -1,6 +1,9 @@
 import type { ContactSheetView } from './previs-contact-sheet-domain.js'
 import type { VideoContinuitySnapshot } from './previs-video-continuity.js'
 import type { VideoReferenceInput } from './previs-video-reference-domain.js'
+import type { ProductionPlan } from './shot-planning.js'
+import { analyzePanelProduction, invalidVisualPrompt, parseShotDescription } from './shot-planning.js'
+export { parseShotDescription } from './shot-planning.js'
 /** Version-owned production data. Times are integer milliseconds throughout. */
 export type FrameType = 'start' | 'middle' | 'end' | 'beat'
 export type VideoGenerationMode = 'direct' | 'storyboard_frames'
@@ -11,6 +14,7 @@ export interface PanelGeneration {
 }
 export type ContinuityState = Record<string, string>
 export interface Keyframe {
+  shotId?: string
   id?: string
   title?: string
   offsetMs?: number
@@ -36,6 +40,8 @@ export interface FrameSource {
   inputDigest?: string
 }
 export interface Panel {
+  productionPlan?: ProductionPlan
+  framePlanNeedsReview?: boolean
   continuityConstraints?: string
   id: number
   title: string
@@ -275,14 +281,12 @@ export function normalizeTimeline(value: Timeline): Timeline {
 }
 /** Plan one image per explicitly labelled subshot; plain descriptions need only one. */
 export function planFrames(panel: Panel, prefix: string): Keyframe[] {
-  const parts = panel.description.split(/(?=【(?:镜头|子镜头)\s*[\d一二三四五六七八九十]+】)/).filter(s => s.trim())
-  const labelled = parts.filter(s => /^【(?:镜头|子镜头)/.test(s))
-  const shots = labelled.length
-    ? labelled.map(prompt => [prompt, panel.atmosphere].filter(Boolean).join('\n'))
-    : [panelImageFallback(panel)]
-  return shots.map((prompt, i) => ({
-    ...makeFrame(`${prefix}-${i}`, Math.floor(i * panel.durationMs / shots.length), `画面 ${i + 1}`),
-    prompt: prompt.trim(),
+  const plan = panel.productionPlan
+  const shots = (plan?.shots || parseShotDescription(panel.description)).filter(shot => !invalidVisualPrompt(shot.visual))
+  return shots.map((shot, i) => ({
+    ...makeFrame(`${prefix}-${i}`, plan ? plan.shots.find(s => s.id === shot.id)!.startMs : Math.floor(i * panel.durationMs / shots.length), `画面 ${i + 1}`),
+    shotId: shot.id,
+    prompt: [shot.visual, panel.atmosphere].filter(Boolean).join('\n').trim(),
   }))
 }
 export function groupPanels(t: Timeline, group: StoryboardGroup): Panel[] {
@@ -339,6 +343,9 @@ export function checkContinuity(t: Timeline): ContinuityIssue[] {
     issue.id = `${issue.id}:${encodeURIComponent(issue.message)}`
     issues.push({ ...issue, reason: t.acknowledgements[issue.id] })
   }
+  for (const panel of t.panels) for (const [index, issue] of analyzePanelProduction(panel).issues.entries()) add({
+    ...issue, id: `production:${panel.id}:${issue.rule}:${index}`, groupId: t.groups.find(g => g.panelIds.includes(panel.id))?.id || '',
+  })
   for (const group of t.groups) {
     const panels = groupPanels(t, group)
     if (!panels.length) add({ id: `empty:${group.id}`, rule: 'empty_group', severity: 'fail', groupId: group.id, message: '镜头节点没有关联分镜，请同步视频制作数据。' })

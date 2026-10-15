@@ -95,6 +95,12 @@ const ruleNames: Record<string, string> = {
   missing_frame: '关键帧缺失', group_duration: '组时长建议',
   scene_bridge: '场景衔接', camera_jump: '机位跳变', audio_overflow: '音频超时',
   empty_group: '空镜头', empty_timeline: '没有分镜',
+  dialogue_total_overflow: '对白时长不足', dialogue_pacing_tight: '对白节奏偏紧',
+  dialogue_missing: '对白遗漏', dialogue_mismatch: '对白顺序', dialogue_added: '新增对白', dialogue_speaker_mismatch: '说话人不一致', dialogue_speaker_unknown: '说话人待核对',
+  dialogue_window_overflow: '局部对白超时', dialogue_window_tight: '局部节奏偏紧',
+  prompt_time_unstructured: '时间待核对', prompt_time_gap: '时间缺口', prompt_time_overlap: '时间重叠', prompt_time_overflow: '时间越界',
+  invalid_frame_prompt: '画面描述不完整', production_plan_stale: '制作计划已过期', production_plan_invalid: '制作计划时间无效',
+  frame_plan_review: '画面待重新审阅', frame_shot_coverage: '子镜头画面缺失', frame_shot_mapping: '画面顺序不一致',
 }
 const continuityPanel = ref<InstanceType<typeof ContinuityReviewPanel>>()
 const groups = computed(() => timeline.value?.groups || [])

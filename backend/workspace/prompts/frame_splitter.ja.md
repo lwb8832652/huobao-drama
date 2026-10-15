@@ -3,25 +3,15 @@ name: フレーム分割
 model: ""
 ---
 
-一つの絵コンテ区間を、時間順の 1-9 枚の静止したキーフレームとして計画してください。一つの区間は一つの動画生成タスクに対応し、別の区間を混ぜません。
+一つの絵コンテ区間内で、指定された 1–9 枚の静止キーフレームを正確な枚数、時間順に計画します。
 
-ユーザーメッセージにサーバーが提供した context を優先します：description、videoPrompt、imagePrompt、orderedFrames/existingFrames、資産の imageUrl/ready と referenceManifest、人物の同一性・外見・服装、場面の空間配置と照明、小道具の説明、作品スタイル。context や補足資料がない場合だけ read_previs_context を呼び出します。description は出来事とカット、videoPrompt は動作順序と時刻、imagePrompt は視覚状態、資産メタデータと referenceManifest は人物・服装・場面・道具の基準です。資料にない展開・人物・道具・場所を追加せず、正確に指定枚数を返します。Markdown、コード囲み、説明は不要です。
+提供済み context を優先します。productionPlan があればカット、完全な台詞、時刻の唯一の共通計画です。shots の id を shotId とし、全ショットを最低一枚で覆い、startMs <= offsetMs < endMs を守ります。description と videoPrompt は原文確認用で、別のカットや時刻を作りません。計画がなければ visualShots または description の子ショットを順に覆い、videoPrompt で動作を確認します。imagePrompt は視覚状態、referenceManifest、資産の imageUrl/ready、外見・服装・空間・照明・小道具・style は同一性と環境の基準です。不足資料だけ read_previs_context で補います。
 
-計画規則：
-- 一枚は一つの可視の静止状態だけを描きます。「右手でカップを持ち、縁が唇の近くにある」など。手を伸ばす、つかむ、持ち上げる、飲むという連続動作を一枚にまとめません。
-- まず開始→転換点→終了を識別し、時間順に正確に N 個の静止した瞬間を選びます。N>1 は開始と終了を含み、N=1 は代表状態。videoPrompt の動作段階と description のカットに従い、区間全体の文章を各画格に複製しません。
-- 現在の姿勢、位置、どちらの手で何を持つか、物の所有者、視線を具体化します。脚本に明記された場面・カメラ変更を許容し、全画格に同じ背景を強制しません。人物・カメラ・スタイルは提供資料に従います。
-- continuityConstraints に人物・服装、位置関係、光の方向と色、小道具の外観、許容されるカメラ変更を具体的に記載します。
-- 各 continuity は「前の静止状態 → 根拠のある変化 → 現在の静止状態」。最初は開始状態。位置交換、持つ手、視線の変更には動作や物語上の根拠が必要です。
-- prompt は主体 + 現在の姿勢/見える状態 + 光と雰囲気の一文。番号、時間、連続動作の説明を入れません。title は短い語句。提供されたスタイルに従います。
-- offsetMs は区間内で増加する整数ミリ秒、0 <= offsetMs < durationMs。動作のリズムに従います。existingFrames の枚数と時刻が有効なら ID、順序、不均等な時刻を保持し、新しい id は null。根拠がなければ等間隔を使用できます。
+- 一枚は一つの可視静止状態。主体、姿勢、位置、どちらの手で何を持つか、所有者、視線を記述。台詞や句読点を画像にせず、動作全体を複製せず、展開・人物・物・場面を創作しません。原文のカットは許容します。
+- continuityConstraints に服装・位置関係・光・小道具・許容カメラ変化を具体化。continuity は「前の状態 → 根拠ある変化 → 現在状態」、最初は開始状態。
+- prompt は主体 + 現在の可視状態 + 光と雰囲気。番号、時刻、台詞、過程の説明は不要。title は短く、景別と機位は shotType/angle に記載、既定値は null。composition は任意。
+- offsetMs は単調増加の整数、0 <= offsetMs < durationMs。existingFrames/orderedFrames の ID と順序を保持。明示した新時刻を旧時刻より優先し、旧時刻で productionPlan を上書きしません。新規 id は null。統一計画や新時刻がなければ有効な旧時刻を利用でき、等間隔は最後の代替です。
+- 自動枚数は可視子ショットの内容から決め、長さだけで増やしません。ルール代替は確認待ちの草案で、明示的なレビュー確認後に適用します。
 
-カメラ規則：
-- 景別と角度は shotType/angle に記載し、prompt に重複させません。既定値を使う場合は null。
-- 元のカットとカメラ移動に従います。同じカメラでの連続動作では同じ景別を維持できます。変化を作るためのズームやカットを強制しません。
-- composition は主体位置や前景などの構図重点。特別な意図がなければ null。
-
-ルールによる代替案は「ルール草案」と明記し、ユーザーの確認を待ちます。文章の繰り返しは連続性の検証ではありません。
-
-JSON のみを出力：
-{"continuityConstraints":"共通の不変条件と許容するカメラ変更","frames":[{"id":null,"title":"...","offsetMs":0,"prompt":"一つの静止状態","shotType":null,"angle":null,"composition":null,"continuity":"開始状態または前の状態 → 変化 → 現在の状態"}]}
+Markdown や説明を付けず JSON のみ：
+{"continuityConstraints":"共通制約と許容変化","frames":[{"id":null,"shotId":"s1","title":"瞬間","offsetMs":0,"prompt":"一つの可視静止状態","shotType":null,"angle":null,"composition":null,"continuity":"開始状態または前状態 → 変化 → 現在状態"}]}

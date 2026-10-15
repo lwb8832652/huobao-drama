@@ -13,9 +13,10 @@ import { mastra } from '../mastra/index.js'
 import { buildAgentRequestContext } from '../agents/context.js'
 import { db, schema } from '../db/index.js'
 import { getActiveConfigId, getConfigById } from './ai.js'
-import { normalizeTimeline, orderedFrames, panelImageFallback, type FrameType, type Panel } from './previs-domain.js'
+import { normalizeTimeline, orderedFrames, type FrameType, type Panel } from './previs-domain.js'
 import { hashContent, PrevisError, episodeForPrevis, requireEditable, versionRow } from './previs.js'
-import { FRAME_COUNT_MIN, FRAME_COUNT_MAX, gridLayoutForCount } from './previs-frame-contract.js'
+import { FRAME_COUNT_MIN, FRAME_COUNT_MAX } from './previs-frame-contract.js'
+import { parseShotDescription, suggestedVisualCount, invalidVisualPrompt, productionPlanMatchesPanel } from './shot-planning.js'
 import { readFramePlanningContext } from '../agents/tools/frame-splitter-tools.js'
 import { enqueueQueueJob, getQueueJob, getQueueJobById, registerQueueExecutor, updateQueueJob, resetQueueJob, tickTaskQueue, queueJobView, type QueueJob } from './task-queue.js'
 import { httpErrorStatus, retryRejectedRateLimit } from './task-queue-retry.js'
@@ -24,6 +25,7 @@ export { FRAME_COUNT_MIN, FRAME_COUNT_MAX, FRAME_COUNT_OPTIONS, FRAME_GRID_LAYOU
 
 export interface FramePlanDraft {
   id?: string
+  shotId?: string
   title: string
   prompt: string
   offsetMs: number
@@ -62,6 +64,7 @@ export interface FramePlanStatus {
 
 const planItemSchema = z.object({
   id: z.string().trim().min(1).max(200).nullish(),
+  shotId: z.string().trim().min(1).max(200).nullish(),
   title: z.string().trim().min(1).max(200),
   prompt: z.string().trim().min(1).max(4000),
   // 三个镜头参数用 nullish 而非 optional：提示词要求「未变化时填 null」，
@@ -77,13 +80,43 @@ const planResultSchema = z.object({
   frames: z.array(planItemSchema).min(1).max(FRAME_COUNT_MAX),
 })
 
-/** 按时长给出默认画面数：短镜头不必拆太碎，长镜头需要更多中间过程；结果必须是宫格数量（2/3/4/6/9）。 */
+/** Content determines coverage; duration alone must not manufacture additional pictures. */
 export function suggestedFrameCount(panel: Panel) {
-  const seconds = Math.max(1, Math.round((panel.durationMs || 0) / 1000))
-  if (seconds <= 3) return 2
-  if (seconds <= 6) return 4
-  if (seconds <= 10) return 6
-  return 9
+  return panel.productionPlan && productionPlanMatchesPanel(panel.productionPlan, panel)
+    ? Math.min(FRAME_COUNT_MAX, Math.max(1, panel.productionPlan.shots.length)) : suggestedVisualCount(panel)
+}
+function hasVisual(text: string) {
+  const source = text.replace(/^(?:开场|结束|关键状态|第\s*\d+\s*个瞬间)[：:]\s*/, '')
+  return !invalidVisualPrompt(source) && parseShotDescription(source).some(shot => !invalidVisualPrompt(shot.visual))
+}
+function planningShots(panel: Panel) {
+  if (panel.productionPlan && !productionPlanMatchesPanel(panel.productionPlan, panel)) throw new PrevisError('统一镜头计划已变化，请先更新计划后重新规划画面')
+  const source = panel.productionPlan?.shots || parseShotDescription(panel.description)
+  const fallback = parseShotDescription(panel.imagePrompt || '').find(shot => hasVisual(shot.visual))?.visual
+  const firstVisual = source.find(shot => hasVisual(shot.visual))?.visual || fallback
+  if (!firstVisual) throw new PrevisError('请先补充可视画面描述，再规划画面')
+  let previous = firstVisual
+  return (source.length ? source : [{ id: 's1', visual: firstVisual, dialogue: [] }]).map((shot, index, all) => {
+    const visual = hasVisual(shot.visual) ? shot.visual : previous
+    previous = visual
+    return { ...shot, visual,
+      startMs: 'startMs' in shot ? Number(shot.startMs) : Math.floor(index * panel.durationMs / all.length),
+      endMs: 'endMs' in shot ? Number(shot.endMs) : Math.floor((index + 1) * panel.durationMs / all.length) }
+  })
+}
+function requireCoverage(panel: Panel, count: number) {
+  const shots = planningShots(panel)
+  if (shots.length > FRAME_COUNT_MAX) throw new PrevisError('子镜头超过 9 个，请先拆分段落再规划画面')
+  if (count < shots.length) throw new PrevisError(`至少需要 ${shots.length} 张画面才能覆盖全部子镜头`)
+  return shots
+}
+function defaultFrameMapping(panel: Panel, count: number) {
+  const shots = requireCoverage(panel, count)
+  const allocations = shots.map((_, i) => Math.floor((i + 1) * count / shots.length) - Math.floor(i * count / shots.length))
+  return shots.flatMap((shot, i) => Array.from({ length: allocations[i] }, (_, index) => ({
+    shotId: shot.id, visual: shot.visual,
+    offsetMs: shot.startMs + offsetAt(index, allocations[i], shot.endMs - shot.startMs),
+  })))
 }
 export function clampCount(value: number | undefined, fallback: number) {
   const next = Math.round(value ?? fallback)
@@ -117,71 +150,66 @@ function validOffsets(offsets: unknown[], count: number, durationMs: number): of
   return offsets.length === count && offsets.every((offset, index) => typeof offset === 'number'
     && Number.isInteger(offset) && offset >= 0 && offset < durationMs && (index === 0 || offset > Number(offsets[index - 1])))
 }
-function draftFrames(panel: Panel, count: number, source: DraftSource[]): FramePlanDraft[] {
+function draftFrames(panel: Panel, count: number, source: DraftSource[]): FramePlanDraft[] | null {
   const items = source.slice(0, count)
+  if (items.some(item => !hasVisual(item.prompt))) return null
+  let mapping: ReturnType<typeof defaultFrameMapping>
+  let shots: ReturnType<typeof requireCoverage>
+  try { mapping = defaultFrameMapping(panel, count); shots = requireCoverage(panel, count) } catch { return null }
   const existingFrames = orderedFrames(panel)
   const existingOffsets = existingFrames.map(frame => frame.offsetMs)
   const proposedOffsets = items.map(item => item.offsetMs)
-  const offsets = validOffsets(existingOffsets, count, panel.durationMs) ? existingOffsets
-    : validOffsets(proposedOffsets, count, panel.durationMs) ? proposedOffsets
-    : items.map((_, index) => offsetAt(index, count, panel.durationMs))
+  const offsets = validOffsets(proposedOffsets, count, panel.durationMs) ? proposedOffsets
+    : validOffsets(existingOffsets, count, panel.durationMs) ? existingOffsets
+    : mapping.map(item => item.offsetMs)
+  const shotIds = items.map((item, index) => item.shotId || (panel.productionPlan
+    ? shots.find(shot => offsets[index] >= shot.startMs && offsets[index] < shot.endMs)?.id : mapping[index].shotId))
+  if (shots.some(shot => !shotIds.includes(shot.id)) || shotIds.some((id, index) => {
+    const shot = shots.find(shot => shot.id === id)
+    return !shot || (index > 0 && shots.findIndex(shot => shot.id === id) < shots.findIndex(shot => shot.id === shotIds[index - 1]))
+      || (panel.productionPlan && (offsets[index] < shot.startMs || offsets[index] >= shot.endMs))
+  })) return null
   return items.map((item, index) => ({
-    id: existingFrames[index]?.id || randomUUID(),
+    id: existingFrames[index]?.id || randomUUID(), shotId: shotIds[index],
     title: item.title.trim() || (index === 0 ? '开场画面' : index === count - 1 ? '结束画面' : `画面 ${index + 1}`),
-    prompt: item.prompt.trim(),
-    offsetMs: offsets[index],
-    type: frameTypeAt(index, count),
-    shotType: optionalText(item.shotType),
-    angle: optionalText(item.angle),
-    composition: optionalText(item.composition),
-    continuity: optionalText(item.continuity),
-  })).filter(frame => frame.prompt)
+    prompt: item.prompt.trim(), offsetMs: offsets[index], type: frameTypeAt(index, count),
+    shotType: optionalText(item.shotType), angle: optionalText(item.angle),
+    composition: optionalText(item.composition), continuity: optionalText(item.continuity),
+  }))
 }
 
 /** Old plan fields remain readable; AI generation separately requires the continuity contract. */
 export function normalizeFramePlan(panel: Panel, count: number, input: unknown): { frames: FramePlanDraft[]; continuityConstraints?: string } | null {
   const parsed = planResultSchema.safeParse(input)
   if (!parsed.success || parsed.data.frames.length !== count) return null
-  return { frames: draftFrames(panel, count, parsed.data.frames), continuityConstraints: optionalText(parsed.data.continuityConstraints) }
+  const frames = draftFrames(panel, count, parsed.data.frames)
+  return frames ? { frames, continuityConstraints: optionalText(parsed.data.continuityConstraints) } : null
 }
 
-/** 规则兜底：描述分句优先，句数不足时用时点提示补足。 */
+/** Rule drafts retain complete visual subshot coverage and never turn spoken clauses into pictures. */
 export function ruleFrames(panel: Panel, count: number): FramePlanDraft[] {
-  const source = panel.description?.trim() || panelImageFallback(panel)
-  const beats = source.split(/(?<=[。！？；!?;])|\n+/).map(part => part.trim()).filter(Boolean)
-  const atmosphere = panel.atmosphere?.trim()
-  const items = Array.from({ length: count }, (_, index) => {
-    const beat = count === 1 ? source : beats.length >= count
-      ? beats[Math.floor(index * beats.length / count)]
-      : beats[index] || (beats.length ? beats[beats.length - 1] : source)
-    const lead = count === 1 ? '关键状态：' : index === 0 ? '开场：' : index === count - 1 ? '结束：' : `第 ${index + 1} 个瞬间：`
-    // 景别不再拼进 prompt：它由 frame.shotType 承载，生图模板会单独成句，
-    // 两处都写会让提示词出现「景别 中景 … 景别：中景」这种重复矛盾描述。
-    const prompt = [beat, atmosphere].filter(Boolean).join('；')
-    return {
-      title: count === 1 ? '关键画面' : index === 0 ? '开场画面' : index === count - 1 ? '结束画面' : `画面 ${index + 1}`,
-      prompt: `${lead}${prompt}`,
-      // 规则兜底没有逐帧判断能力，直接继承面板级参数（生图模板本就会回退到面板值，
-      // 这里显式写出只是让确认弹窗能看到可编辑的取值）。
-      shotType: panel.shotType,
-      angle: panel.angle,
-    }
-  })
-  return draftFrames(panel, count, items.map((item, index) => ({
-    ...item,
-    continuity: index === 0 ? `规则草稿：起始静态状态「${item.prompt}」，请人工核对动作阶段。`
-      : `规则草稿：上一格「${items[index - 1].prompt}」→变化需人工核对→当前格「${item.prompt}」。`,
-  })))
+  const mapping = defaultFrameMapping(panel, count)
+  const items = mapping.map((shot, index) => ({
+    shotId: shot.shotId, offsetMs: shot.offsetMs,
+    title: count === 1 ? '关键画面' : `画面 ${index + 1}`,
+    prompt: [shot.visual, panel.atmosphere?.trim()].filter(Boolean).join('；'),
+    shotType: panel.shotType, angle: panel.angle,
+    continuity: index === 0 ? '规则草稿：请核对起始静态状态、身份与持物。'
+      : `规则草稿：从 ${mapping[index - 1].shotId} 到 ${shot.shotId}，请核对当前姿态和动作衔接。`,
+  }))
+  const frames = draftFrames(panel, count, items)
+  if (!frames) throw new PrevisError('规则画面草稿缺少有效可视描述或子镜头覆盖')
+  return frames
 }
 
 export function planInputHash(panel: Panel, context?: unknown) {
   return hashContent({
-    description: panel.description, videoPrompt: panel.videoPrompt, imagePrompt: panel.imagePrompt,
+    productionPlan: panel.productionPlan, description: panel.description, videoPrompt: panel.videoPrompt, imagePrompt: panel.imagePrompt,
     atmosphere: panel.atmosphere, durationMs: panel.durationMs,
     shotType: panel.shotType, angle: panel.angle, movement: panel.movement,
     scene: panel.scene, characterIds: panel.characterIds, propIds: panel.propIds,
     frames: orderedFrames(panel).map(frame => ({ id: frame.id, title: frame.title, prompt: frame.prompt, offsetMs: frame.offsetMs, url: frame.url, source: frame.source,
-      type: frame.type, shotType: frame.shotType, angle: frame.angle, composition: frame.composition, continuity: frame.continuity })),
+      type: frame.type, shotId: frame.shotId, shotType: frame.shotType, angle: frame.angle, composition: frame.composition, continuity: frame.continuity })),
     continuityConstraints: panel.continuityConstraints, context,
   })
 }
@@ -202,8 +230,8 @@ export function buildFramePlanningRequestContent(input: {
   return [
     `请规划同一分镜的静态关键画面，versionId=${input.versionId}，panelId=${input.panelId}。目标画面数：${input.count}。`,
     '以下是服务端已读取的完整资料，优先直接使用；仅在缺少补充资料时调用 read_previs_context。',
-    '来源优先级：description 决定事件与切镜；videoPrompt 决定动作顺序与时间；imagePrompt 锚定视觉状态；资产元数据与 referenceManifest 锚定身份、服装、场景、道具；style 决定风格。',
-    '先识别开始→转折点→结束，再按时间选取指定数量的静态瞬间。多张包含起止锚点，单张选代表状态；不新增情节。每格只呈现当前姿态、位置、手部与持物、视线，不复制整段动作。',
+    '存在 productionPlan 时，以它的 shots、shotId、startMs/endMs、完整对白时间为唯一时序依据，覆盖每个子镜头；description、videoPrompt 用于核对原文，不能另造一套切镜或时间。无统一计划时按 visualShots 覆盖可视子镜头。imagePrompt、资产与 referenceManifest 锚定视觉身份和环境；style 决定风格。',
+    '每格返回对应 shotId 和该子镜头时间范围内的 offsetMs；每个子镜头至少一格。每格只呈现当前姿态、位置、手部与持物、视线，不复制对白、标点或整段动作。保留现有 ID 与媒体；有明确时序依据时可以修正旧 offsetMs。',
     JSON.stringify(input),
   ].join('\n')
 }
@@ -275,6 +303,7 @@ export async function startFramePlan(versionId: number, options: PlanFramesOptio
     if ('error' in context) throw new PrevisError(context.error || '镜头资料不可用')
     const inputHash = planInputHash(panel, context)
     const count = clampCount(options.count, suggestedFrameCount(panel))
+    requireCoverage(panel, count)
     prepared.push({ panelId: panel.id, inputHash, count })
   }
   // Resolve every target first, then reuse/queue atomically after async context reads.

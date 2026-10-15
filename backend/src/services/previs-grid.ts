@@ -182,7 +182,7 @@ async function saveArtifact(buffer: Buffer, tag: string) {
   })
   return `/static/previs-grids/${name}`
 }
-function promptFor(
+export function promptFor(
   p: Panel,
   grid: GenerationGrid,
   mode: GridMode,
@@ -201,12 +201,15 @@ function promptFor(
     p.continuityConstraints ||
     '沿用参考素材中的人物身份与服装、道具外观；位置、光源与持物状态依据原描述和逐格规划延续。原剧本明确的场景或镜头变化可以发生，不强制不同场景使用相同背景。'
   const geometry = `整图严格分为 ${grid.rows} 行 ${grid.columns} 列，等大无间隙画格，按从左到右、从上到下阅读。多余 ${grid.columns * grid.rows - frames.length} 格为纯中性灰背景，无物体。不要绘制文字、序号角标、水印、分隔线或边框；角标只用于界面引用，不能进入成片。`
-  const source = `原分镜描述：${p.description}\n原视频动作与时间：${p.videoPrompt}\n视觉状态锚点：${p.imagePrompt}\n分镜场景：${p.scene}；氛围：${p.atmosphere}。只呈现原资料和规划已有的参与者与物体；不新增叙事、角色、场景、镜头或风格。每格一个静态状态，明确当前姿态、位置、手部持物和视线，不在一格画完整动作序列。`
+  const planSource = p.productionPlan
+    ? `统一镜头与对白时间计划（唯一时序依据）：${JSON.stringify(p.productionPlan)}\n画格的 shotId 和 offsetMs 必须对应计划中的同一子镜头；对白只用于理解表演，不绘制对白文字。`
+    : `原分镜描述：${p.description}\n原视频动作与时间：${p.videoPrompt}`
+  const source = `${planSource}\n视觉状态锚点：${p.imagePrompt}\n分镜场景：${p.scene}；氛围：${p.atmosphere}。只呈现原资料和规划已有的参与者与物体；不新增叙事、角色、场景、镜头或风格。每格一个静态状态，明确当前姿态、位置、手部持物和视线，不在一格画完整动作序列。`
   const states = frames
     .flatMap(
       (f, i) =>
         mode === 'frame_edit' && !targets.includes(f.id!) ? [] :
-          [`画格${i + 1}（第${Math.floor(i / grid.columns) + 1}行，第${(i % grid.columns) + 1}列，${(f.offsetMs || 0) / 1000}s）：${f.prompt || p.description}\n景别：${f.shotType || p.shotType}；机位：${f.angle || p.angle}；构图：${f.composition || ''}；衔接：${f.continuity || '按相邻状态自然推进，同一格只呈现一个静态关键状态。'}`],
+          [`画格${i + 1}（第${Math.floor(i / grid.columns) + 1}行，第${(i % grid.columns) + 1}列，子镜头 ${f.shotId || '按画格规划'}，${(f.offsetMs || 0) / 1000}s）：${f.prompt || p.description}\n景别：${f.shotType || p.shotType}；机位：${f.angle || p.angle}；构图：${f.composition || ''}；衔接：${f.continuity || '按相邻状态自然推进，同一格只呈现一个静态关键状态。'}`],
     )
     .join('\n')
   if (mode === 'frame_edit')
@@ -273,6 +276,7 @@ export async function startGridCandidates(versionId: number, request: GridReques
   const panels = request.panelIds.map((id) => {
     const p = t.panels.find((p) => p.id === id)
     if (!p) throw new PrevisError('所选分镜不属于当前版本')
+    if (p.framePlanNeedsReview) throw new PrevisError(`「${p.title}」时序已调整，请先重新规划并审阅画面后生成宫格`)
     return p
   })
   const configId = request.configId || (await getActiveConfigId('image')),

@@ -73,7 +73,7 @@ const supportedResolutions = computed(() => [...new Set((capabilities.value?.siz
 const selectedSize = computed(() => capabilities.value?.sizes?.find(size => size.aspectRatio === projectRatio.value && size.resolution === resolution.value))
 const gridLayout = computed(() => gridLayoutForCount(frames.value.length, projectRatio.value))
 const predictedCell = computed(() => selectedSize.value && ({ width: Math.floor(selectedSize.value.width / gridLayout.value.columns), height: Math.floor(selectedSize.value.height / gridLayout.value.rows) }))
-const canSubmit = computed(() => props.editable && validFrameCount.value && !!capabilities.value?.enabled && !!selectedSize.value && !paidBusy.value)
+const canSubmit = computed(() => props.editable && !props.panel.framePlanNeedsReview && validFrameCount.value && !!capabilities.value?.enabled && !!selectedSize.value && !paidBusy.value)
 const canGenerate = computed(() => !!referenceManifest.value?.ready && !referenceLoading.value && canSubmit.value && frames.value.every(frame => !frame.locked))
 const canGridEdit = computed(() => canSubmit.value && !!capabilities.value?.supportsEdit && frames.value.every(frame => frame.url) && frames.value.some(frame => !frame.locked))
 const canFrameEdit = computed(() => canSubmit.value && !!capabilities.value?.supportsEdit && frames.value.some(frame => frame.url && !frame.locked))

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, useId, watch } from 'vue'
 import { Loader2, Scissors, Sparkles, Trash2, X } from 'lucide-vue-next'
-import { gridLayoutsForRatio, type PanelFramePlan } from '~/composables/usePrevis'
+import { FRAME_COUNT_OPTIONS, gridLayoutForCount, type PanelFramePlan } from '~/composables/usePrevis'
 
 const props = defineProps<{
   plans: PanelFramePlan[]
@@ -30,10 +30,11 @@ const descriptionId = useId()
 const previousFocus = props.returnFocus
   || (typeof document === 'undefined' ? null : document.activeElement as HTMLElement | null)
 const totalFrames = computed(() => drafts.value.reduce((sum, plan) => sum + plan.frames.length, 0))
-const layoutOptions = computed(() => gridLayoutsForRatio(props.aspectRatio))
+const layoutOptions = computed(() => FRAME_COUNT_OPTIONS.map(count => ({ count, label: gridLayoutForCount(count, props.aspectRatio).label })))
 const aiCount = computed(() => drafts.value.filter(plan => plan.source === 'ai').length)
-const canApply = computed(() => !!props.editable && !props.busy && drafts.value.some(plan => plan.frames.length))
-const sourceLabel = (plan: PanelFramePlan) => plan.source === 'ai' ? 'AI 拆分' : '规则兜底'
+const canApply = computed(() => !!props.editable && !props.busy && drafts.value.some(plan => plan.frames.length)
+  && drafts.value.every(plan => plan.source !== 'rule' || plan.reviewAcknowledged))
+const sourceLabel = (plan: PanelFramePlan) => plan.source === 'ai' ? 'AI 拆分' : '规则草稿 · 待审阅'
 
 function remove(panelIndex: number, frameIndex: number) {
   if (!props.editable || props.busy) return
@@ -74,7 +75,7 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
         <span class="plan-icon"><Scissors :size="20" /></span>
         <div>
           <h2 :id="titleId">宫格画面规划</h2>
-          <p :id="descriptionId">{{ drafts.length }} 个镜头 · {{ totalFrames }} 张画面{{ aiCount ? ` · ${aiCount} 个镜头来自 AI` : ' · 规则兜底' }}</p>
+          <p :id="descriptionId">{{ drafts.length }} 个镜头 · {{ totalFrames }} 张画面{{ aiCount ? ` · ${aiCount} 个镜头来自 AI` : ' · 规则草稿待审阅' }}</p>
         </div>
         <button type="button" class="btn btn-icon" aria-label="关闭拆分方案" @click="emit('close')"><X :size="18" /></button>
       </header>
@@ -83,11 +84,12 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
         <label>
           <span>目标画面数</span>
           <select v-model.number="requestedCount" :disabled="busy || !editable">
+            <option :value="0">自动 · 按子镜头内容推荐</option>
             <option v-for="layout in layoutOptions" :key="layout.count" :value="layout.count">{{ layout.label }} · {{ layout.count }} 张</option>
           </select>
         </label>
         <button type="button" class="btn btn-sm" :disabled="busy || !editable" @click="replan"><Sparkles :size="12" />重新规划</button>
-        <span class="plan-hint">选择数量后点击重新规划。下方按时间排列，每格描述一个静态瞬间。</span>
+        <span class="plan-hint">自动数量按可视子镜头推荐，可手动指定 1–9 张；每个子镜头至少一张。</span>
       </div>
 
       <div class="plan-body">
@@ -103,6 +105,10 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
             <span class="plan-source" :class="plan.source"><Sparkles v-if="plan.source === 'ai'" :size="11" />{{ sourceLabel(plan) }}</span>
             <span class="plan-count">{{ plan.frames.length }} 张</span>
           </header>
+          <label v-if="plan.source === 'rule'" class="plan-review">
+            <input v-model="plan.reviewAcknowledged" type="checkbox" :disabled="!editable || busy">
+            <span>我已逐格审阅规则草稿，确认子镜头完整、画面可视、时间与衔接合理。</span>
+          </label>
           <details class="plan-shared-details"><summary>人物、场景与整组约束</summary><label class="plan-continuity">
             <span>整组连续性约束</span>
             <textarea v-model="plan.continuityConstraints" rows="2" maxlength="4000" aria-label="整组连续性约束" placeholder="人物、服装、背景、轴线和光线等需要保持一致的条件" :disabled="!editable || busy" />
@@ -111,7 +117,7 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
             <div class="plan-frame-head">
               <span class="plan-index">{{ String(frameIndex + 1).padStart(2, '0') }}</span>
               <input v-model="frame.title" type="text" maxlength="60" aria-label="画面标题" :disabled="!editable || busy">
-              <span class="plan-time">{{ seconds(frame.offsetMs) }}s</span>
+              <span class="plan-time">{{ frame.shotId ? `${frame.shotId} · ` : '' }}{{ seconds(frame.offsetMs) }}s</span>
               <button
                 type="button" class="btn btn-sm plan-remove" :disabled="!editable || busy || plan.frames.length <= 1"
                 :aria-label="`移除第 ${frameIndex + 1} 张画面`" :title="`移除第 ${frameIndex + 1} 张画面`"
@@ -198,6 +204,8 @@ onUnmounted(() => { if (previousFocus?.isConnected) previousFocus.focus({ preven
 .plan-panel strong { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; }
 .plan-source { display: flex; align-items: center; gap: 3px; padding: 1px 6px; border-radius: 4px; background: var(--bg-active); color: var(--text-2); font-size: 10px; }
 .plan-source.ai { color: var(--accent-text); }
+.plan-review { display: flex; align-items: flex-start; gap: 7px; padding: 10px; font-size: 12px; color: var(--text-1); background: var(--surface-soft); }
+.plan-review input { margin-top: 2px; }
 .plan-count { color: var(--text-2); font: 10px var(--font-mono); }
 .plan-frame { padding: 8px 10px; border-bottom: 1px solid var(--border); }
 .plan-frame-details, .plan-shared-details { font-size: 11px; color: var(--text-2); }

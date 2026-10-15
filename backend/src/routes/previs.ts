@@ -12,6 +12,7 @@ import { scheduleContactSheets, readContactSheets, tickContactSheets } from '../
 import { startFramePlan, listFramePlans, retryFramePlans } from '../services/previs-frames.js'
 import { FRAME_COUNT_MIN, FRAME_COUNT_MAX } from '../services/previs-frame-contract.js'
 import { readGridReferences } from '../services/previs-grid-references.js'
+import { previewProductionRepair, applyProductionRepair } from '../services/shot-planning-repair.js'
 
 import { gridCapabilities, listGridCandidates, startGridCandidates, adoptGridCandidate, discardGridCandidate, uploadGridCandidate, retryGridProcessing } from '../services/previs-grid.js'
 
@@ -60,6 +61,13 @@ app.post('/episodes/:id/animatic-versions', async c => {
 })
 app.get('/animatic-versions/:id/timeline', c => success(c, getVersion(Number(c.req.param('id')))))
 app.get('/animatic-versions/:id/state', c => success(c, getVersionState(Number(c.req.param('id')))))
+const productionRepairOptions = z.object({ revision, panelIds: z.array(positiveId).min(1).max(200), maxSeconds: z.number().int().min(5).max(15).default(15) })
+app.post('/animatic-versions/:id/production-plan/preview', async c => success(c, previewProductionRepair(
+  positiveId.parse(Number(c.req.param('id'))), productionRepairOptions.parse(await c.req.json()),
+)))
+app.post('/animatic-versions/:id/production-plan/apply', async c => success(c, applyProductionRepair(
+  positiveId.parse(Number(c.req.param('id'))), productionRepairOptions.extend({ inputHash: z.string().length(64) }).parse(await c.req.json()),
+)))
 app.get('/animatic-versions/:id/contact-sheets', c => success(c, { items: readContactSheets(Number(c.req.param('id'))) }))
 app.post('/animatic-versions/:id/contact-sheets', async c => {
   const body = z.object({ revision, panelIds: z.array(positiveId).max(200).optional(), force: z.boolean().optional() }).parse(await c.req.json())

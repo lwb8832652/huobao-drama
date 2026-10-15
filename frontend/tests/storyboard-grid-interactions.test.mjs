@@ -603,7 +603,8 @@ test('a ready candidate is adopted from the preview without extra confirmation',
 })
 
 test('closing, refreshing, changing context or unmounting review cannot release a workspace adoption commit', async () => {
-  const domain = evaluate(read('../../backend/src/services/previs-domain.ts'))
+  const shotPlanning = evaluate(read('../../backend/src/services/shot-planning.ts'))
+  const domain = evaluate(read('../../backend/src/services/previs-domain.ts'), { './shot-planning.js': shotPlanning })
   const contract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
   const reference = evaluate(read('../../backend/src/services/previs-video-reference-domain.ts'), { './previs-domain.js': domain })
   const payload = { id: 4, revision: 2, status: 'draft', busy: false,
@@ -642,7 +643,8 @@ test('closing, refreshing, changing context or unmounting review cannot release 
 })
 
 test('the workspace adoption lease releases on failure and shows a persistent error', async () => {
-  const domain = evaluate(read('../../backend/src/services/previs-domain.ts'))
+  const shotPlanning = evaluate(read('../../backend/src/services/shot-planning.ts'))
+  const domain = evaluate(read('../../backend/src/services/previs-domain.ts'), { './shot-planning.js': shotPlanning })
   const contract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
   const reference = evaluate(read('../../backend/src/services/previs-video-reference-domain.ts'), { './previs-domain.js': domain })
   const payload = { id: 4, revision: 2, status: 'draft', busy: false, timeline: { panels: [], groups: [], audio: [] } }

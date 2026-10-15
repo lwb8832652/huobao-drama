@@ -20,7 +20,8 @@ function evaluate(source, dependencies = {}, globals = {}) {
 }
 // usePrevis.ts 依赖 useApi.ts 的 withNetworkRetry；useApi 自身无 import，直接跑真模块。
 const useApi = evaluate(read('../app/composables/useApi.ts'))
-const domain = evaluate(read('../../backend/src/services/previs-domain.ts'))
+const shotPlanning = evaluate(read('../../backend/src/services/shot-planning.ts'))
+const domain = evaluate(read('../../backend/src/services/previs-domain.ts'), { './shot-planning.js': shotPlanning })
 const contract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
 const reference = evaluate(read('../../backend/src/services/previs-video-reference-domain.ts'), { './previs-domain.js': domain })
 const sheets = evaluate(read('../../backend/src/services/previs-contact-sheet-domain.ts'), { './previs-domain.js': domain, './previs-frame-contract.js': contract })

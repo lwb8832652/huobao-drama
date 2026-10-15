@@ -633,6 +633,13 @@
 
                 </div>
 
+                <ProductionPlanPanel
+                  :version="productionVersion" :panel-id="selectedSb?.id"
+                  :editable="productionEditable" :busy="productionWorking || productionFramePlanBusy || productionGridBusy"
+                  :before-action="beforeProductionGridAction"
+                  @applied="acceptProductionPlan" @select="selectProductionPanel"
+                />
+
                   <section
                     v-if="productionPanel"
                     class="video-inspector-section production-frames-section"
@@ -751,8 +758,8 @@
                 <div v-else class="video-player-empty">
                   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
                   <div class="video-player-empty-copy">
-                    <div class="video-player-empty-title">{{ videoTaskState(selectedSb) === 'pending' ? t('episode.vid.emptyGenerating') : videoTaskState(selectedSb) === 'blocked' ? '分镜画面尚未全部完成' : t('episode.vid.emptyNoVideo') }}</div>
-                    <div class="video-player-empty-desc">{{ videoTaskState(selectedSb) === 'pending' ? t('episode.vid.emptyGeneratingDesc') : videoTaskState(selectedSb) === 'blocked' ? '分镜画面模式会按时间顺序使用当前镜头的全部画面' : t('episode.vid.emptyNoVideoDesc') }}</div>
+                    <div class="video-player-empty-title">{{ videoTaskState(selectedSb) === 'pending' ? t('episode.vid.emptyGenerating') : videoTaskState(selectedSb) === 'blocked' ? videoTaskStatusLabel(selectedSb) : t('episode.vid.emptyNoVideo') }}</div>
+                    <div class="video-player-empty-desc">{{ videoTaskState(selectedSb) === 'pending' ? t('episode.vid.emptyGeneratingDesc') : videoTaskState(selectedSb) === 'blocked' ? productionReferenceState(selectedSb?.id).error || '请先完成并审阅当前镜头的参考画面。' : t('episode.vid.emptyNoVideoDesc') }}</div>
                   </div>
                   <button
                     v-if="videoTaskState(selectedSb) !== 'pending'"
@@ -760,7 +767,7 @@
                     :disabled="videoTaskState(selectedSb) === 'blocked'"
                     @click="genVid(selectedSb)"
                   >
-                    {{ videoTaskState(selectedSb) === 'blocked' ? '先完成全部分镜画面' : t('episode.vid.generateVideo') }}
+                    {{ videoTaskState(selectedSb) === 'blocked' ? videoTaskActionLabel(selectedSb) : t('episode.vid.generateVideo') }}
                   </button>
                 </div>
               </div>
@@ -1498,6 +1505,8 @@ import ContinuityReviewPanel from '~/components/previs/ContinuityReviewPanel.vue
 import VideoContinuityControl from '~/components/previs/VideoContinuityControl.vue'
 import StoryboardGridTools from '~/components/previs/StoryboardGridTools.vue'
 import StoryboardReferencePicker from '~/components/previs/StoryboardReferencePicker.vue'
+import ProductionPlanPanel from '~/components/previs/ProductionPlanPanel.vue'
+import { productionBlockingMessage } from '../../../../backend/src/services/shot-planning'
 import { buildReferencePatch } from '~/composables/useStoryboardReferences'
 import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
 import StoryboardContactSheet from '~/components/previs/StoryboardContactSheet.vue'
@@ -1515,7 +1524,7 @@ const drama = ref(null), episode = ref(null), chars = ref([]), scenes = ref([]),
 const {
   version: productionVersion, timeline: productionTimeline, editable: productionEditable, dirty: productionDirty,
   generatable: productionGeneratable, retryContactSheet: retryProductionContactSheet, working: productionWorking, initialize: initializeProduction, create: createProduction,
-  edit: editProduction, save: saveProduction, savePanelReferences: saveProductionReferences, saveError: productionSaveError, generate: generateProduction, adoptGridCandidate: adoptProductionGridCandidate,
+  edit: editProduction, save: saveProduction, open: openProduction, savePanelReferences: saveProductionReferences, saveError: productionSaveError, generate: generateProduction, adoptGridCandidate: adoptProductionGridCandidate,
 } = usePrevis()
 const {
   open: productionFramePlanOpen, busy: productionFramePlanBusy,
@@ -2170,12 +2179,12 @@ function videoTaskStatusLabel(sb) {
   if (state === 'done') return t('episode.status.done')
   if (state === 'pending') return t('episode.status.generating')
   if (state === 'failed') return t('episode.status.failed')
-  if (state === 'blocked') return '待完成分镜画面'
+  if (state === 'blocked') return productionPanelById(sb?.id) && productionBlockingMessage(productionPanelById(sb.id)) ? '待检查制作计划' : '待完成分镜画面'
   return t('episode.status.todo')
 }
 
 function videoTaskActionLabel(sb) {
-  if (!videoCanGenerate(sb?.id)) return '先完成全部分镜画面'
+  if (!videoCanGenerate(sb?.id)) return productionPanelById(sb?.id) && productionBlockingMessage(productionPanelById(sb.id)) ? '先检查制作计划' : '先完成全部分镜画面'
   const state = videoTaskState(sb)
   if (state === 'done') return t('episode.asset.regen')
   if (state === 'pending') return t('episode.asset.generating')
@@ -2817,8 +2826,10 @@ function videoFramesReady(id) {
 }
 function productionReferenceState(id) {
   const target = productionPanelById(id)
-  return videoContinuityReadiness(target ? [target] : [], videoContinuityMode.value, videoContinuityCapability.value, videoReferenceInputStrategy.value,
+  const state = videoContinuityReadiness(target ? [target] : [], videoContinuityMode.value, videoContinuityCapability.value, videoReferenceInputStrategy.value,
     videoCapabilities.value[selectedVideoConfig.value?.provider]?.maxImages || 9, productionVersion.value?.contactSheets || [])
+  const error = target ? productionBlockingMessage(target) : ''
+  return error ? { ...state, ready: false, error } : state
 }
 function videoCanGenerate(id) {
   return productionReferenceState(id).ready
@@ -2854,6 +2865,18 @@ const productionGridModel = computed(() => imageModelOptions.value.find(item => 
 async function beforeProductionGridAction() {
   if (!await saveProduction() || !productionVersion.value) return false
   return { versionId: productionVersion.value.id, revision: productionVersion.value.revision }
+}
+async function acceptProductionPlan(version) {
+  try {
+    await openProduction(version.id)
+    if (productionVersion.value?.id !== version.id) throw new Error('新工作版尚未加载，请先保存当前修改后重新切换。')
+    await refresh()
+    toast.success('已应用到新工作版，请核对画面后再生成视频')
+  } catch (error) { toastError(error) }
+}
+function selectProductionPanel(id) {
+  const sb = sbs.value.find(item => item.id === id)
+  if (sb) selectedSb.value = sb
 }
 async function generateProductionFrames(frameIds, force = false) {
   const target = productionPanel.value
@@ -3145,6 +3168,7 @@ function doBreakdown() {
     : '（当前集还没有道具）'
   runAgent('storyboard_breaker', `请基于当前集剧本拆分分镜，并为每个分镜段落同时生成 video_prompt（视频生成提示词）。
 本次视频模型：${effectiveVideoModelLabel.value}，请按该模型的特性与时长限制生成 video_prompt。
+先完整保留剧本的台词、旁白、说话人和顺序；中文按每秒 4 个汉字估算，另留标点与句间停顿、换人接话及必要动作/表演时间。按自然语义边界、说话轮次、动作完成和场景变化分段，在模型时长范围内安排 duration；装不下时沿完整语义拆成相邻段落，不得删减或加速台词。video_prompt 用连续覆盖 duration 的可变时间行，不按固定秒数切块。一个分镜可承载多个子镜头和关键画面，仍属于同一个格组，不要求每句台词或每次切镜独立生成格组。
 
 当前集已有角色：${charList}
 当前集已有场景：${sceneList}
@@ -3172,6 +3196,8 @@ async function genVideoPrompt(sb) {
   const label = cfg ? `${cfg.name} (${cfg.provider})` : '默认'
   const charNames = getStoryboardCharacters(sb).map(c => c.name).join('、') || '无'
   const propNames = getStoryboardProps(sb).map(p => p.name).join('、') || '无'
+  const beforePrompt = sb.video_prompt || sb.videoPrompt || ''
+  const beforeUpdated = sb.updated_at || sb.updatedAt
   videoPromptGeneratingIds.value.push(sb.id)
   try {
     await api.post(`/agent/prompt_generator/chat`, {
@@ -3179,14 +3205,21 @@ async function genVideoPrompt(sb) {
 
 该分镜信息:时长 ${sb.duration || 10}s;场景:${getSceneName(sb) || '未绑定'};角色:${charNames};道具:${propNames}。
 
-请先调用 read_storyboard_context 获取该分镜的画面描述(含【镜头N】子镜头与台词/旁白)、氛围及时长,据此生成 video_prompt(按 3 秒分段换行、用 @角色名/@场景名/@道具名 引用参考素材；段落内允许多镜头切镜,但不跨场景,切镜点对齐 description 的【镜头N】结构),然后调用 update_storyboard 保存到分镜 ID:${sb.id}。只更新 video_prompt 字段,不要改动其他字段,不要重新拆分整集。`,
+请先调用 read_storyboard_context 获取该分镜的画面描述(含【镜头N】子镜头与台词/旁白)、氛围及时长。完整保留台词、旁白、说话人和顺序；中文按每秒 4 个汉字估算，另留标点与句间停顿、换人接话及必要动作/表演时间，其他语言按自然语速保守估时。video_prompt 第一行列出实际人物与场景，用 @角色名/@场景名/@道具名 引用；之后按自然语义、动作完成和切镜边界写可变时长时间行，从 0 连续覆盖到 duration，不重叠、不留空缺。保持 description 的【镜头N】顺序，段落内可以切镜但不跨场景；多个关键画面仍属于同一个格组，不要求每句台词或每次切镜新建格组。若完整对白预算超出现有 duration 或模型时长范围，不保存该条，报告分镜 ID、原时长、所需时长和完整语义拆分建议，不得删减台词解决。然后调用 update_storyboard 保存到分镜 ID:${sb.id}，只传 storyboard_id 和 video_prompt，不要改动其他字段，不要重新拆分整集。`,
       drama_id: dramaId,
       episode_id: epId.value,
       model: chatModelOverride() || undefined,
       config_id: chatConfigId() || undefined,
     })
-    toast.success(t('episode.sb.promptGenerated', { n: idx }))
     await refresh()
+    const fresh = sbs.value.find(item => item.id === sb.id)
+    const prompt = fresh?.video_prompt || fresh?.videoPrompt || ''
+    const error = fresh ? productionBlockingMessage({ id: fresh.id, title: fresh.title || `分镜 ${idx}`, description: fresh.description || '', videoPrompt: prompt, durationMs: (fresh.duration || 10) * 1000 }) : '分镜已变化，请刷新'
+    if (!prompt.trim() || (prompt === beforePrompt && (fresh?.updated_at || fresh?.updatedAt) === beforeUpdated) || error) {
+      toast.error(error || '未保存新的有效提示词，请先检查对白与时间规划')
+      return
+    }
+    toast.success(t('episode.sb.promptGenerated', { n: idx }))
   } catch (e) {
     toastError(e)
   } finally {

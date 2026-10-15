@@ -85,7 +85,8 @@ test('selection rejects assets that disappeared and multiple selected scenes', (
 })
 
 function workspace(request) {
-  const domain = evaluate(read('../../backend/src/services/previs-domain.ts'))
+  const shotPlanning = evaluate(read('../../backend/src/services/shot-planning.ts'))
+  const domain = evaluate(read('../../backend/src/services/previs-domain.ts'), { './shot-planning.js': shotPlanning })
   const contract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
   const reference = evaluate(read('../../backend/src/services/previs-video-reference-domain.ts'), { './previs-domain.js': domain })
   const disposers = [], calls = []

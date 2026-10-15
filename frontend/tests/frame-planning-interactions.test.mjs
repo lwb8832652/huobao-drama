@@ -24,12 +24,13 @@ function evaluate(source, dependencies = {}, globals = {}) {
 }
 // usePrevis.ts 依赖 useApi.ts 的 withNetworkRetry；useApi 自身无 import，直接跑真模块。
 const useApi = evaluate(read('../app/composables/useApi.ts'))
-const domain = evaluate(read('../../backend/src/services/previs-domain.ts'))
+const shotPlanning = evaluate(read('../../backend/src/services/shot-planning.ts'))
+const domain = evaluate(read('../../backend/src/services/previs-domain.ts'), { './shot-planning.js': shotPlanning })
 const reference = evaluate(read('../../backend/src/services/previs-video-reference-domain.ts'), { './previs-domain.js': domain })
 const contract = evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
 const panel = () => ({
   id: 7, title: '开门', description: '【镜头1】走到门前。【镜头2】推开门。',
-  atmosphere: '安静', imagePrompt: '', durationMs: 6000, frames: [], referenceImages: [],
+  atmosphere: '安静', imagePrompt: '', videoPrompt: '', durationMs: 6000, frames: [], referenceImages: [],
 })
 const draft = () => ({
   taskId: 13, panelId: 7, panelTitle: '开门', count: 2, source: 'ai', frames: [
@@ -553,11 +554,11 @@ test('history restore carries the selected image source and clears stale refinem
 test('split submission identifies both new tasks and cached tasks, and results keep that identity', async () => {
   const source = read('../../backend/src/services/previs-frames.ts')
   const ast = ts.createSourceFile('previs-frames.ts', source, ts.ScriptTarget.Latest, true)
-  const names = ['startFramePlan', 'listFramePlans', 'clampCount', 'suggestedFrameCount']
+  const names = ['startFramePlan', 'listFramePlans', 'clampCount']
   const functions = ast.statements.filter(statement => ts.isFunctionDeclaration(statement) && names.includes(statement.name?.text))
     .map(statement => statement.getText(ast)).join('\n')
   for (const status of [null, 'pending', 'completed', 'failed']) {
-    let row = status && { id: 13, panelId: 7, status, inputHash: 'current-description', count: 4, configId: 9, model: 'selected-text-model', resultJson: JSON.stringify({ source: 'ai', frames: draft().frames }) }
+    let row = status && { id: 13, panelId: 7, status, inputHash: 'current-description', count: 2, configId: 9, model: 'selected-text-model', resultJson: JSON.stringify({ source: 'ai', frames: draft().frames }) }
     const queueCalls = [], queueJobs = new Map()
     if (status) queueJobs.set(13, { id: 101, ownerType: 'frame_plan', ownerId: 13, status })
     const builder = {
@@ -571,7 +572,7 @@ test('split submission identifies both new tasks and cached tasks, and results k
     const target = { ...panel(), characterIds: [], propIds: [] }
     const timeline = { schemaVersion: 2, panels: [target], groups: [], transitions: [], audio: [], strategy: { ...domain.defaultStrategy } }
     const api = evaluate(functions, {}, {
-      db, schema: { framePlans: {} }, ...contract,
+      db, schema: { framePlans: {} }, ...contract, suggestedFrameCount: () => 2, requireCoverage() {},
       and(...args) { return args.includes('active') ? 'active' : undefined }, inArray() { return 'active' }, eq() {}, desc() {},
       requireEditable: () => ({ timelineJson: JSON.stringify(timeline) }),
       episodeForPrevis: () => ({ id: 1, dramaId: 1 }),
@@ -600,4 +601,91 @@ test('split submission identifies both new tasks and cached tasks, and results k
     const listed = api.listFramePlans(4)
     assert.equal(listed.plans[0].taskId, result.taskIds[0]); assert.equal(listed.items[0].queueJobId, queueJobs.get(result.taskIds[0]).id)
   }
+})
+
+test('automatic planning omits count on first submission and can be selected again', async () => {
+  const h = harness({ results: [complete(), complete()] })
+  await h.planner.split(7)
+  assert.equal('count' in h.requests[0].body, false)
+  await h.planner.recount(0)
+  assert.equal('count' in h.requests.filter(r => r.method === 'POST')[1].body, false)
+})
+
+test('rule drafts require explicit review acknowledgment before they can be applied', async () => {
+  const plan = { ...draft(), source: 'rule' }
+  const h = harness({ results: [{ items: [{ id: 13, panelId: 7, status: 'completed' }], plans: [plan] }] })
+  await h.planner.split(7)
+  await h.planner.apply([plan])
+  assert.equal(h.workspace.version.value.timeline.panels[0].frames.length, 0)
+  assert.match(h.notices.at(-1).message, /审阅|确认/)
+  await h.planner.apply([{ ...plan, reviewAcknowledged: true }])
+  assert.equal(h.workspace.version.value.timeline.panels[0].frames.length, 2)
+  assert.equal(h.workspace.version.value.timeline.panels[0].framePlanNeedsReview, false)
+})
+
+test('review dialog offers automatic and every 1–9 override and guards rule draft application', () => {
+  const descriptor = parse(read('../app/components/previs/FramePlanDialog.vue')).descriptor
+  const script = compileScript(descriptor, { id: 'rule-review' })
+  const component = evaluate(script.content, {
+    vue: { ...vue, useId: () => 'rule-review', onMounted() {}, onBeforeUnmount() {}, onUnmounted() {} },
+    'lucide-vue-next': {}, '~/composables/usePrevis': contract,
+  }).default
+  const changes = [], plan = { ...draft(), source: 'rule' }
+  const setup = component.setup({ plans: [plan], count: 0, editable: true }, { expose() {}, emit: (event, ...args) => changes.push({ event, args }) })
+  assert.deepEqual(Array.from(setup.layoutOptions.value, option => option.count), [1, 2, 3, 4, 5, 6, 7, 8, 9])
+  assert.match(descriptor.template.content, /option :value="0"/)
+  assert.match(setup.sourceLabel(plan), /规则草稿.*待审阅/)
+  setup.apply(); assert.equal(changes.length, 0)
+  setup.drafts.value[0].reviewAcknowledged = true
+  setup.apply(); assert.equal(changes[0].event, 'apply')
+})
+
+test('edited review plans cannot omit a timed shot or apply a quote-only visual', async () => {
+  for (const invalid of ['missing-shot', 'quote-only', 'speaker-quote', 'label-quote']) {
+    const h = harness()
+    await h.planner.split(7)
+    const target = h.workspace.version.value.timeline.panels[0]
+    target.productionPlan = { shots: [{ id: 's1', startMs: 0, endMs: 3000 }, { id: 's2', startMs: 3000, endMs: 6000 }] }
+    const plan = draft()
+    plan.frames[0].shotId = 's1'; plan.frames[1].shotId = 's2'
+    if (invalid === 'missing-shot') plan.frames.pop()
+    else plan.frames[0].prompt = invalid === 'speaker-quote' ? '小明：「我终于回来了！」' : invalid === 'label-quote' ? '开场：「我终于回来了！」' : '「我终于回来了！」'
+    await h.planner.apply([plan])
+    assert.equal(target.frames.length, 0)
+    assert.match(h.notices.at(-1).message, /子镜头|可视/)
+  }
+})
+
+test('deleting a legacy subshot in the compiled review dialog cannot mark incomplete coverage as reviewed', async () => {
+  const h = harness(), descriptor = parse(read('../app/components/previs/FramePlanDialog.vue')).descriptor
+  const script = compileScript(descriptor, { id: 'legacy-delete-review' })
+  const component = evaluate(script.content, {
+    vue: { ...vue, useId: () => 'legacy-delete-review', onMounted() {}, onBeforeUnmount() {}, onUnmounted() {} },
+    'lucide-vue-next': {}, '~/composables/usePrevis': contract,
+  }).default
+  await h.planner.split(7)
+  const target = h.workspace.version.value.timeline.panels[0]
+  target.framePlanNeedsReview = true
+  target.frames = [{ ...domain.makeFrame('retained'), url: '/static/retained.png' }]
+  const original = JSON.stringify(target), applications = []
+  const plan = { ...draft(), frames: draft().frames.map((frame, index) => ({ ...frame, shotId: `s${index + 1}` })) }
+  const setup = component.setup({ plans: [plan], count: 0, editable: true }, {
+    expose() {}, emit: (event, drafts) => { if (event === 'apply') applications.push(h.planner.apply(drafts)) },
+  })
+  setup.remove(0, 1); setup.apply(); await Promise.all(applications)
+  assert.equal(JSON.stringify(target), original)
+  assert.equal(target.framePlanNeedsReview, true)
+  assert.match(h.notices.at(-1).message, /子镜头|覆盖/)
+})
+
+test('legacy review coverage validates declared IDs and preserves compatible unmapped full plans', () => {
+  const h = harness(), target = panel(), plan = draft()
+  assert.equal(h.api.framePlanReviewError(target, plan), undefined)
+  const imageOnly = { ...target, description: '', imagePrompt: '人物站在门前。' }
+  assert.equal(h.api.framePlanReviewError(imageOnly, { ...plan, frames: [{ ...plan.frames[0], shotId: 's1' }] }), undefined)
+  assert.match(h.api.framePlanReviewError(target, { ...plan, frames: plan.frames.slice(0, 1) }), /子镜头|覆盖/)
+  const repeated = { ...plan, frames: plan.frames.map(frame => ({ ...frame, shotId: 's1' })) }
+  assert.match(h.api.framePlanReviewError(target, repeated), /子镜头|覆盖/)
+  const reversed = { ...plan, frames: plan.frames.map((frame, index) => ({ ...frame, shotId: `s${2 - index}` })) }
+  assert.match(h.api.framePlanReviewError(target, reversed), /子镜头|顺序/)
 })

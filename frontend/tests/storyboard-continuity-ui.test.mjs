@@ -12,7 +12,8 @@ function evaluate(source, deps = {}) {
     {module,exports:module.exports,require:n=>{assert.ok(n in deps,n);return deps[n]},setTimeout,clearTimeout,setInterval,clearInterval,URLSearchParams})
   return module.exports
 }
-const domain=evaluate(read('../../backend/src/services/previs-domain.ts'))
+const shotPlanning=evaluate(read('../../backend/src/services/shot-planning.ts'))
+const domain=evaluate(read('../../backend/src/services/previs-domain.ts'),{'./shot-planning.js':shotPlanning})
 const contract=evaluate(read('../../backend/src/services/previs-frame-contract.ts'))
 const reference=evaluate(read('../../backend/src/services/previs-video-reference-domain.ts'),{'./previs-domain.js':domain})
 const previs=evaluate(read('../app/composables/usePrevis.ts'),{vue,'vue-sonner':{toast:{}},'~/composables/useApi':{withNetworkRetry:fn=>fn()},'../../../backend/src/services/previs-domain':domain,'../../../backend/src/services/previs-frame-contract':contract,'../../../backend/src/services/previs-video-reference-domain':reference})
