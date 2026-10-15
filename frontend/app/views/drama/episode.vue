@@ -537,9 +537,9 @@
                   <div class="video-task-meta">{{ videoListFilter ? t('episode.vid.listMetaFiltered', { n: videoTaskRows.length, total: allVideoTaskRows.length }) : t('episode.vid.listMeta', { n: videoTaskRows.length }) }}</div>
                 </div>
                 <div class="video-task-metrics">
-                  <button type="button" class="video-task-metric is-pending" :class="{ on: videoListFilter === 'pending' }" @click="toggleVideoFilter('pending')">{{ t('episode.vid.metricPending', { n: pendingVideoIds.length }) }}</button>
-                  <button type="button" class="video-task-metric is-done" :class="{ on: videoListFilter === 'done' }" @click="toggleVideoFilter('done')">{{ t('episode.vid.metricDone', { n: videoTaskDoneCount }) }}</button>
-                  <button type="button" class="video-task-metric is-failed" :class="{ on: videoListFilter === 'failed' }" @click="toggleVideoFilter('failed')">{{ t('episode.vid.metricFailed', { n: videoTaskFailedCount }) }}</button>
+                  <button type="button" class="video-task-metric is-pending" :class="{ on: videoListFilter === 'pending' }" @click="toggleVideoFilter('pending')"><b>{{ pendingVideoIds.length }}</b>{{ t('episode.vid.metricPending') }}</button>
+                  <button type="button" class="video-task-metric is-done" :class="{ on: videoListFilter === 'done' }" @click="toggleVideoFilter('done')"><b>{{ videoTaskDoneCount }}</b>{{ t('episode.vid.metricDone') }}</button>
+                  <button type="button" class="video-task-metric is-failed" :class="{ on: videoListFilter === 'failed' }" @click="toggleVideoFilter('failed')"><b>{{ videoTaskFailedCount }}</b>{{ t('episode.vid.metricFailed') }}</button>
                 </div>
                 </div>
                 <div v-if="videoSelectMode" class="shot-quick-actions video-quick-actions">
@@ -1042,7 +1042,7 @@
             </div>
           </header>
           <div class="video-task-metrics task-drawer-metrics" role="group" aria-label="筛选制作任务状态">
-            <button v-for="option in [{ key: 'active', label: '进行中', count: genTaskActiveCount, tone: 'pending' }, { key: 'completed', label: '完成', count: genTaskDoneCount, tone: 'done' }, { key: 'failed', label: '失败', count: genTaskFailedCount, tone: 'failed' }]" :key="option.key" type="button" :class="['video-task-metric', 'is-' + option.tone, { on: genTaskFilter === option.key }]" :aria-pressed="genTaskFilter === option.key" title="再次点击取消筛选" @click="toggleGenTaskFilter(option.key)">{{ option.count }} {{ option.label }}</button>
+            <button v-for="option in [{ key: 'active', label: '进行中', count: genTaskActiveCount, tone: 'pending' }, { key: 'completed', label: '完成', count: genTaskDoneCount, tone: 'done' }, { key: 'failed', label: '失败', count: genTaskFailedCount, tone: 'failed' }]" :key="option.key" type="button" :class="['video-task-metric', 'is-' + option.tone, { on: genTaskFilter === option.key }]" :aria-pressed="genTaskFilter === option.key" title="再次点击取消筛选" @click="toggleGenTaskFilter(option.key)"><b>{{ option.count }}</b>{{ option.label }}</button>
             <span class="task-scope-breakdown">本集执行 {{ genTaskExecutingCount }} · 排队 {{ genTaskQueuedCount }}</span>
           </div>
           <div v-if="!filteredGenTaskRows.length" class="step-empty task-drawer-empty">
@@ -2212,14 +2212,26 @@ function videoTaskActionLabel(sb) {
   return t('episode.asset.generate')
 }
 
+/**
+ * 视频任务列表的标题取 storyboards.description（整段剧本的合并文本）。
+ * 11 条记录的 description 全部以「【镜头1】」开头，于是每行标题都显示「镜头1」。
+ * 这里只改写**行首**那一个镜头标记，换成该行自己的镜头序号（一行 = 一个视频任务 = 一个镜头）；
+ * 行内后续的【镜头2】【镜头3】属于该分镜内部的子镜头，原样保留，不参与改写。
+ */
+function shotNumberedTitle(description, shotNo) {
+  if (!description) return ''
+  return description.replace(/^(\s*)【镜头\d+】/, `$1【镜头${shotNo}】`)
+}
+
 const allVideoTaskRows = computed(() => sbs.value.map((sb, index) => {
   const duration = Number(sb.duration || 5)
   const sceneName = getSceneName(sb)
+  const shotNo = index + 1
   return {
     id: sb.id,
     index,
     storyboard: sb,
-    title: sb.description || t('episode.vid.shotN', { n: String(index + 1).padStart(2, '0') }),
+    title: shotNumberedTitle(sb.description, shotNo) || t('episode.vid.shotN', { n: String(shotNo).padStart(2, '0') }),
     meta: sceneName,
     duration: Number.isFinite(duration) ? duration : 5,
     state: videoTaskState(sb),
@@ -5304,6 +5316,10 @@ onMounted(() => setTimeout(() => autoTour('episode', EPISODE_TOUR, t), 900))
 button.video-task-metric { cursor: pointer; font-family: inherit; transition: box-shadow 0.15s; }
 button.video-task-metric:hover { box-shadow: 0 0 0 2px var(--sel-glow); }
 button.video-task-metric.on { box-shadow: 0 0 0 2px var(--accent); }
+/* 键盘焦点描边与评测筛选器（.metric）、预演筛选器同规格：2px + offset 2px */
+button.video-task-metric:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* 数字用等宽数字，与评测筛选器一致（位数不同也能对齐） */
+.video-task-metric b { font-variant-numeric: tabular-nums; }
 /* 批量视频：选择模式 */
 .btn.is-on { border-color: var(--accent); color: var(--accent-text); background: var(--accent-bg); }
 .video-retry-failed { color: var(--warning); border-color: var(--warning-bg); }

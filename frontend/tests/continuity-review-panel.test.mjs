@@ -25,6 +25,17 @@ test('目标边界仅包含实际首尾画面相关连接，不扩大到整组',
   assert.equal(domain.relevantContinuityEdges(timeline, [4]).length, 1)
   assert.equal(domain.relevantContinuityEdges(timeline, [2, 3, 4]).length, 2)
 })
+test('任务状态文案对用户可读：执行中的各阶段统一显示为进行中', () => {
+  // submitting=提交服务商、upstream=已提交、polling=轮询，均为内部术语；
+  // 评测与制作列表共用 queueStatusLabel，用户视角只应看到「进行中」。
+  for (const phase of ['submitting', 'upstream', 'polling']) {
+    assert.equal(queue.queueStatusLabel({ status: 'processing', phase }), '进行中', phase)
+  }
+  assert.equal(queue.queueStatusLabel({ status: 'processing' }), '进行中', '无 phase 的 processing')
+  assert.equal(queue.queueStatusLabel({ status: 'pending' }), '排队中')
+  assert.equal(queue.queueStatusLabel({ status: 'pending', phase: 'waiting_dependency' }), '等待前置任务')
+  assert.equal(queue.queueStatusLabel({ status: 'completed' }), '已完成')
+})
 test('六类风险和阈值边界完整，低分和低置信合并一条', () => {
   for (const state of ['idle', 'missing_images', 'pending', 'processing', 'failed']) assert.equal(domain.continuityRisks(timeline, snapshot(state), [2]).length, 1)
   assert.equal(domain.continuityRisks(timeline, snapshot('completed', 70), [2]).length, 0)

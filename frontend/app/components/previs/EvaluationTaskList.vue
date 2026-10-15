@@ -52,7 +52,7 @@ function taskAriaLabel(item: EvaluationListItem) {
       <button v-for="item in items" :key="item.key" class="evaluation-task-row" type="button" :class="`is-${item.status}`" :aria-label="taskAriaLabel(item)" @click="emit('select', item.key)">
         <span class="evaluation-preview"><img v-if="item.preview" :src="item.preview" alt="" loading="lazy" @error="($event.target as HTMLImageElement).style.visibility = 'hidden'"><Loader2 v-else-if="item.status === 'processing' || item.status === 'pending'" :size="21" :class="{ spin: item.status === 'processing' }" /><FileSearch v-else :size="23" /><span class="evaluation-type">{{ item.typeLabel }}</span></span>
         <span class="evaluation-task-copy"><strong :title="item.title">{{ item.title }}</strong><span class="evaluation-task-meta">{{ item.meta }}</span><span class="evaluation-task-summary" :class="{ 'is-error': item.status === 'failed' }" :title="item.summary">{{ item.summary }}</span><span class="evaluation-task-flags"><span v-if="!item.current" class="evaluation-label">历史结果</span><span v-if="item.attention" class="evaluation-label attention">需关注</span></span></span>
-        <span class="evaluation-task-outcome"><span class="evaluation-status" :class="`is-${item.status}`"><i />{{ queueStatusLabel(item) }}</span><span v-if="item.score !== undefined" class="evaluation-score" :class="{ attention: item.attention }">{{ item.score }}<small> / 100</small></span><ChevronRight :size="15" class="evaluation-row-arrow" /></span>
+        <span class="evaluation-task-outcome"><span class="evaluation-status" :class="`is-${item.status}`"><i :class="item.status === 'completed' ? 'ok' : item.status === 'processing' ? 'pending' : ''" />{{ queueStatusLabel(item) }}</span><span v-if="item.score !== undefined" class="evaluation-score" :class="{ attention: item.attention }">{{ item.score }}<small> / 100</small></span><ChevronRight :size="15" class="evaluation-row-arrow" /></span>
       </button>
     </div>
     <footer class="evaluation-pagination"><span>{{ keyword || filter !== 'all' ? '符合条件 ' : '共 ' }}{{ total }} 项{{ loading && items.length ? ' · 更新中' : '' }}</span><nav v-if="total > pageSize" aria-label="评测历史分页"><button type="button" aria-label="上一页" :disabled="page <= 1 || loading" @click="emit('page', page - 1)"><ChevronLeft :size="15" /></button><span>{{ page }} / {{ Math.max(1, Math.ceil(total / pageSize)) }}</span><button type="button" aria-label="下一页" :disabled="page * pageSize >= total || loading" @click="emit('page', page + 1)"><ChevronRight :size="15" /></button></nav><span v-else class="evaluation-live"><Clock3 :size="11" />状态自动更新</span></footer>
@@ -63,13 +63,17 @@ function taskAriaLabel(item: EvaluationListItem) {
 .evaluation-list-view{display:flex;flex-direction:column;min-height:0;flex:1}
 .evaluation-metrics{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:10px 16px;border-bottom:1px solid var(--surface-outline,#e7ebf1)}
 .metric{display:inline-flex;align-items:center;gap:5px;min-height:22px;padding:0 8px;border:1px solid var(--surface-outline,#e7ebf1);border-radius:999px;background:var(--overlay-track,#f1f3f6);color:var(--text-2,#7a8796);font:inherit;font-size:11px;font-weight:750;white-space:nowrap;cursor:pointer;transition:box-shadow .15s}
-.metric b{font-variant-numeric:tabular-nums;font-weight:inherit}
+/* 数字：等宽数字 + 走 UA 的 bolder（与制作/预演筛选按钮一致）。不要在这里写
+   font-weight:inherit——那会把 <b> 压回按钮的 750，与另两处的 900 差一档。 */
+.metric b{font-variant-numeric:tabular-nums}
 .metric-active{color:var(--accent-text,#d77b2f);border-color:var(--accent-glow,#ffd9ba);background:var(--accent-bg,#fff0e4)}
 .metric-completed{color:var(--success,#35896b);border-color:var(--success-bg,#edf7f1);background:var(--success-bg,#edf7f1)}
 .metric-failed{color:var(--warning,#bb7c37);border-color:var(--warning-bg,#fff3e5);background:var(--warning-bg,#fff3e5)}
 .metric:hover{box-shadow:0 0 0 2px var(--sel-glow,var(--bg-hover,#f1f3f6))}
 .metric.on{box-shadow:0 0 0 2px var(--accent,#f58b36)}
-.evaluation-status i{width:5px;height:5px;border-radius:50%;background:currentColor}
+.evaluation-status i{width:7px;height:7px;border-radius:50%;background:var(--bg-3);flex-shrink:0}
+.evaluation-status i.ok{background:var(--success)}
+.evaluation-status i.pending{background:var(--accent);box-shadow:0 0 0 3px var(--accent-glow)}
 .evaluation-scope{margin:12px 24px 0;font-size:11px;color:var(--text-3,#94a0af)}
 .evaluation-tools{padding:15px 24px}
 .evaluation-search{display:flex;align-items:center;gap:9px;padding:9px 12px;background:var(--surface-input,#fafbfc);border:1px solid var(--border,#e5e9ef);border-radius:9px;color:var(--text-3,#939daa)}
@@ -93,10 +97,13 @@ function taskAriaLabel(item: EvaluationListItem) {
 .attention{color:var(--warning,#bb7c37)}
 .evaluation-label.attention{background:var(--warning-bg,#fff3e5)}
 .evaluation-task-outcome{display:flex;align-items:flex-end;flex-direction:column;gap:8px;flex-shrink:0;min-width:62px;position:relative;padding-right:14px}
-.evaluation-status{display:flex;gap:5px;align-items:center;font-size:10px;color:var(--text-2,#7b8899);white-space:nowrap}
-.evaluation-status.is-pending,.evaluation-status.is-processing{color:var(--info,#6c80bc)}
-.evaluation-status.is-completed{color:var(--success,#368969)}
-.evaluation-status.is-failed{color:var(--error,#c56868)}
+/* 行内任务状态：与制作任务列表（episode.vue 的 .video-task-status）同一规格的胶囊——
+   同样的边框/底色/圆角/字号与 7px 圆点，进行中用橙色系、失败用橙黄（可重试语气），
+   不再是「纯文字 + 蓝进行中 + 红失败」，避免同一状态在不同列表含义不同。 */
+.evaluation-status{display:inline-flex;align-items:center;gap:5px;min-height:22px;padding:0 8px;border:1px solid var(--surface-outline);border-radius:999px;background:var(--overlay-track);color:var(--text-2);font-size:11px;font-weight:750;white-space:nowrap}
+.evaluation-status.is-pending,.evaluation-status.is-processing{color:var(--accent-text);border-color:var(--accent-glow);background:var(--accent-bg)}
+.evaluation-status.is-completed{color:var(--success);border-color:var(--success-bg);background:var(--success-bg)}
+.evaluation-status.is-failed{color:var(--warning);border-color:var(--warning-bg);background:var(--warning-bg)}
 .evaluation-score{font-size:17px;color:var(--text-1,#536170);font-weight:600;font-variant-numeric:tabular-nums}
 .evaluation-score.attention{color:var(--warning,#bf7d38)}
 .evaluation-score small{font-size:9px;font-weight:400;color:var(--text-3,#98a2af)}

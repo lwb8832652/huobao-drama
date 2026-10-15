@@ -131,6 +131,13 @@ const taskExecuting = computed(() => taskItems.value.filter(item => item.status 
 const taskQueued = computed(() => taskItems.value.filter(item => item.status === 'pending').length + framePlansSummary.value.pending)
 const filteredBatches = computed(() => batches.value.map(batch => ({ ...batch, items: filterQueueRows(batch.items, taskFilter.value) })).filter(batch => batch.items.length))
 const filteredFramePlanTasks = computed(() => filterQueueRows(framePlanTaskRows.value, taskFilter.value))
+/** 行内状态胶囊的 class 映射，与 episode.vue 的 genTaskStateClass 同规则（cancelled 无配色，保持灰底）。 */
+function pvTaskStateClass(status: string) {
+  if (status === 'cancelled') return 'cancelled'
+  if (status === 'completed') return 'done'
+  if (status === 'failed') return 'failed'
+  return 'pending'
+}
 const showPlanningTasks = computed(() => taskFilter.value === 'all' ? framePlanTaskRows.value.length > 0 || framePlanActive.value + framePlansSummary.value.completed + framePlansSummary.value.failed > 0 : taskFilter.value === 'active' ? framePlanActive.value > 0 : taskFilter.value === 'failed' ? framePlansSummary.value.failed > 0 : framePlansSummary.value.completed > 0)
 async function refreshQueueTasks() {
   if (!version.value) return
@@ -340,7 +347,6 @@ function setStageView(view: PrevisStageView) {
 }
 function select(id: string, shotId?: number) {
   player.value?.stop()
-  continuityReviewError.value = ''
   groupId.value = id
   panelId.value = shotId || groups.value.find(g => g.id === id)?.panelIds[0] || 0
   currentMs.value = segments.value.find(s => s.panel.id === panelId.value)?.startMs || 0
@@ -921,18 +927,18 @@ onUnmounted(() => { ++framePlanTaskToken; clearInterval(framePlanTaskTimer); win
             </template>
             <template v-else-if="inspector === 'tasks'">
               <div class="pv-task-intro"><div class="pv-task-heading"><p class="pv-eyebrow">V{{ String(version.versionNo).padStart(2, '0') }} / 生成记录</p><QueueSettingsButton label="任务设置" @click="taskQueueSettingsOpen = true" /></div><p>本版本执行 {{ taskExecuting }} · 排队 {{ taskQueued }}</p></div>
-              <div class="pv-task-filters" role="group" aria-label="筛选制作任务状态"><button v-for="option in taskFilters" :key="option.key" type="button" :class="{ on: taskFilter === option.key }" :aria-pressed="taskFilter === option.key" title="再次点击取消筛选" @click="taskFilter = taskFilter === option.key ? 'all' : option.key">{{ option.count }} {{ option.label }}</button></div>
+              <div class="pv-task-filters" role="group" aria-label="筛选制作任务状态"><button v-for="option in taskFilters" :key="option.key" type="button" :class="['is-' + option.key, { on: taskFilter === option.key }]" :aria-pressed="taskFilter === option.key" title="再次点击取消筛选" @click="taskFilter = taskFilter === option.key ? 'all' : option.key"><b>{{ option.count }}</b>{{ option.label }}</button></div>
               <p v-if="framePlanTaskError" class="pv-frame-error" role="alert">{{ framePlanTaskError }}<button type="button" @click="loadFramePlanTasks">重新加载</button></p>
               <article v-if="showPlanningTasks" class="pv-batch">
                 <header><b>分镜画面拆分</b><span>执行 {{ framePlansSummary.processing }} · 排队 {{ framePlansSummary.pending }}</span></header>
                 <div class="pv-batch-actions"><button v-if="framePlansSummary.completed" :disabled="working" @click="run(openFramePlans)">查看拆分方案</button><button v-if="framePlansSummary.failed" :disabled="working" @click="run(retryFailedFramePlans)">重试失败项</button></div>
-                <details v-if="filteredFramePlanTasks.length"><summary>查看 {{ filteredFramePlanTasks.length }} 个任务</summary><div v-for="item in filteredFramePlanTasks" :key="item.id" class="pv-task-item"><b>{{ timeline.panels.find(panel => panel.id === item.panelId)?.title || `镜头 #${item.panelId}` }}</b><span>{{ queueStatusLabel(item) }}</span><p v-if="item.queueReason" class="pv-frame-note">{{ item.queueReason }}</p><p v-if="item.error" class="pv-frame-error">{{ item.error }}</p><QueueJobActions :job="item" @changed="loadFramePlanTasks" /></div></details>
+                <details v-if="filteredFramePlanTasks.length"><summary>查看 {{ filteredFramePlanTasks.length }} 个任务</summary><div v-for="item in filteredFramePlanTasks" :key="item.id" class="pv-task-item"><b>{{ timeline.panels.find(panel => panel.id === item.panelId)?.title || `镜头 #${item.panelId}` }}</b><span class="pv-task-status" :class="'is-' + pvTaskStateClass(item.status)"><i :class="pvTaskStateClass(item.status) === 'done' ? 'ok' : pvTaskStateClass(item.status) === 'pending' ? 'pending' : ''" />{{ queueStatusLabel(item) }}</span><p v-if="item.queueReason" class="pv-frame-note">{{ item.queueReason }}</p><p v-if="item.error" class="pv-frame-error">{{ item.error }}</p><QueueJobActions :job="item" @changed="loadFramePlanTasks" /></div></details>
               </article>
               <article v-for="batch in filteredBatches" :key="batch.id" class="pv-batch">
                 <header><b>{{ batch.type === 'image' ? '关键帧' : '视频' }} #{{ batch.id }}</b><span>{{ statusNames[batch.status] || batch.status }}</span></header>
                 <progress :value="batch.items.filter(i => i.status === 'completed').length" :max="batch.items.length" /><small>{{ batch.items.filter(i => i.status === 'completed').length }} / {{ batch.items.length }} 已完成</small>
                 <div class="pv-batch-actions"><button v-if="batch.items.some(i => i.status === 'failed' && !i.queueJobId)" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry'))">重试失败项</button><button v-if="batch.items.some(i => i.status === 'pending' && !i.queueJobId)" :disabled="working" @click="run(() => batchAction(batch.id, 'cancel'))">取消排队任务</button></div>
-                <details><summary>查看 {{ batch.items.length }} 个任务</summary><div v-for="item in batch.items" :key="item.id" class="pv-task-item"><b>{{ timeline.panels.find(p => p.id === item.panelId)?.title || groups.find(g => g.id === item.groupId)?.title }} {{ item.frameType ? frameNames[item.frameType] : '' }}</b><span>{{ queueStatusLabel(item) }}<small v-if="item.referenceInput"> · {{ item.referenceInput.effective === 'contact_sheet' ? '宫格参考' : '逐张参考' }}</small><small v-if="item.videoContinuity?.fallbackReason"> · {{ item.videoContinuity.fallbackReason }}</small><small v-if="item.actualStrategy"> · {{ constraintNames[item.actualStrategy] }}</small></span><p v-if="item.queueReason" class="pv-frame-note">{{ item.queueReason }}</p><p v-if="item.error" class="pv-frame-error">{{ item.error }}</p><QueueJobActions v-if="item.queueJobId" :job="item" @changed="run(refreshQueueTasks)" /><button v-else-if="item.status === 'failed'" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry', [item.id]))">重试此项</button><a v-if="item.status === 'completed' && (item.localPath || item.resultUrl)" :href="mediaUrl(item.localPath || item.resultUrl)" target="_blank" rel="noopener">查看生成结果 ↗</a></div></details>
+                <details><summary>查看 {{ batch.items.length }} 个任务</summary><div v-for="item in batch.items" :key="item.id" class="pv-task-item"><b>{{ timeline.panels.find(p => p.id === item.panelId)?.title || groups.find(g => g.id === item.groupId)?.title }} {{ item.frameType ? frameNames[item.frameType] : '' }}</b><span><span class="pv-task-status" :class="'is-' + pvTaskStateClass(item.status)"><i :class="pvTaskStateClass(item.status) === 'done' ? 'ok' : pvTaskStateClass(item.status) === 'pending' ? 'pending' : ''" />{{ queueStatusLabel(item) }}</span><small v-if="item.referenceInput"> · {{ item.referenceInput.effective === 'contact_sheet' ? '宫格参考' : '逐张参考' }}</small><small v-if="item.videoContinuity?.fallbackReason"> · {{ item.videoContinuity.fallbackReason }}</small><small v-if="item.actualStrategy"> · {{ constraintNames[item.actualStrategy] }}</small></span><p v-if="item.queueReason" class="pv-frame-note">{{ item.queueReason }}</p><p v-if="item.error" class="pv-frame-error">{{ item.error }}</p><QueueJobActions v-if="item.queueJobId" :job="item" @changed="run(refreshQueueTasks)" /><button v-else-if="item.status === 'failed'" :disabled="working || (batch.type === 'image' && !editable)" @click="run(() => batchAction(batch.id, 'retry', [item.id]))">重试此项</button><a v-if="item.status === 'completed' && (item.localPath || item.resultUrl)" :href="mediaUrl(item.localPath || item.resultUrl)" target="_blank" rel="noopener">查看生成结果 ↗</a></div></details>
               </article>
               <div v-if="!filteredBatches.length && !showPlanningTasks" class="pv-small-empty"><Film :size="27" /><p>{{ taskFilter === 'all' ? '还没有生成任务' : '没有符合条件的任务' }}</p><span>生成任务后，进度会显示在这里。</span></div>
             </template>
