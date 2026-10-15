@@ -265,6 +265,65 @@ test('reference strategy lives inside the generation settings dialog', async () 
   }
 })
 
+test('refreshing generation history stays in settings and does not reset resolution or submit generation', async () => {
+  let finishRefresh, candidateReads = 0
+  const h = harness({ request: path => {
+    if (path.includes('/grid-candidates?') && ++candidateReads > 1)
+      return new Promise(resolve => { finishRefresh = () => resolve({ items: [candidate({ status: 'adopted' })] }) })
+  } })
+  await h.start(); h.setup.openModal('settings')
+  assert.equal(typeof h.setup.refreshSettingsHistory, 'function')
+  h.setup.settingsTab.value = 'history'; h.setup.resolution.value = '2K'
+  const first = h.setup.refreshSettingsHistory()
+  await h.setup.refreshSettingsHistory()
+  assert.equal(candidateReads, 2)
+  finishRefresh(); await first
+  assert.equal(h.setup.modal.value, 'settings')
+  assert.equal(h.setup.settingsTab.value, 'history')
+  assert.equal(h.setup.resolution.value, '2K')
+  assert.equal(h.setup.visibleCandidates.value.length, 1)
+  assert.equal(h.requests.some(request => request.method === 'POST'), false)
+  h.dispose()
+})
+
+test('a delayed history refresh cannot erase a newly submitted generation or allow duplicate submission', async () => {
+  let finishRefresh, candidateReads = 0
+  const h = harness({ request: path => {
+    if (path.includes('/grid-candidates?') && ++candidateReads > 1)
+      return new Promise(resolve => { finishRefresh = () => resolve({ items: [] }) })
+  } })
+  await h.start(); h.setup.openModal('settings')
+  const refreshing = h.setup.refreshSettingsHistory()
+  h.setup.closeModal(); await h.setup.generateGrid()
+  assert.equal(h.setup.pending.value, true)
+  finishRefresh(); await refreshing
+  assert.equal(h.setup.pending.value, true)
+  assert.equal(h.setup.canGenerate.value, false)
+  assert.equal(h.timers.size, 1)
+  await h.setup.generateGrid()
+  assert.equal(h.requests.filter(request => request.method === 'POST').length, 1)
+  h.dispose()
+})
+
+test('an old panel history refresh cannot stop the current panel polling', async () => {
+  let finishRefresh, firstPanelReads = 0
+  const h = harness({ request: path => {
+    if (path.includes('/grid-candidates?panel_id=7') && ++firstPanelReads > 1)
+      return new Promise(resolve => { finishRefresh = () => resolve({ items: [] }) })
+    if (path.includes('/grid-candidates?panel_id=8')) return { items: [candidate({ panelId: 8, status: 'pending' })] }
+  } })
+  await h.start(); h.setup.openModal('settings')
+  const refreshing = h.setup.refreshSettingsHistory()
+  h.props.panel = { ...h.props.panel, id: 8 }; await flush()
+  assert.equal(h.setup.pending.value, true)
+  assert.equal(h.timers.size, 1)
+  finishRefresh(); await refreshing
+  assert.equal(h.setup.pending.value, true)
+  assert.equal(h.timers.size, 1)
+  assert.equal(h.setup.historyRefreshing.value, false)
+  h.dispose()
+})
+
 test('both workspaces wire the resplit event on the grid toolbar', () => {
   for (const path of ['../app/views/drama/episode.vue', '../app/views/drama/previs.vue']) {
     const block = read(path).match(/<StoryboardGridTools\b[\s\S]*?<\/StoryboardGridTools>/)

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
 import { toast } from 'vue-sonner'
-import { Check, Eye, Grid2X2, History, Images, Loader2, RefreshCw, Scissors, Settings2, SlidersHorizontal, Sparkles, Trash2, Upload, X } from 'lucide-vue-next'
+import { Check, Grid2X2, Loader2, RefreshCw, Scissors, Settings2, SlidersHorizontal, Sparkles, Trash2, Upload, X } from 'lucide-vue-next'
 import { isStaleChunkError, reloadStaleBundle, uploadAPI } from '~/composables/useApi'
 import GridReferenceAssets from './GridReferenceAssets.vue'
 import { mapError } from '~/composables/useToast'
@@ -54,6 +54,7 @@ const DEFAULT_RESOLUTION = '1K'
 const RESOLUTION_STORAGE_KEY = 'previs.grid-resolution.v2'
 const resolution = ref(DEFAULT_RESOLUTION)
 const modal = ref<'review' | 'edit' | 'settings' | ''>('')
+const settingsTab = ref<'settings' | 'history'>('settings'), historyRefreshing = ref(false)
 const review = ref<GridCandidate>()
 /** 分镜画面预览：当前放大查看的画面格（frameId）；undefined 时取第一格 */
 const previewFrameId = ref<string>()
@@ -141,7 +142,7 @@ function previewCellStyle(candidate: GridCandidate, frameId: string) {
 }
 /** 放大格对应的画面标题（若该格映射到当前画面） */
 const activePreviewFrame = computed(() => activePreviewThumb.value && frames.value.find(frame => frameKey(frame) === activePreviewThumb.value!.frameId))
-let token = 0, mounted = false, disposed = false
+let token = 0, candidateReadEpoch = 0, mounted = false, disposed = false
 let polling: ReturnType<typeof setTimeout> | undefined
 let previousFocus: HTMLElement | null = null
 const discardedIds = new Set<number>()
@@ -179,14 +180,16 @@ function failure(cause: unknown, fallback: string, endpoint = '') {
 }
 function stopPolling() { clearTimeout(polling); polling = undefined }
 function schedulePolling(requestToken: number, versionId: number, panelId: number) {
+  if (!active(requestToken, versionId, panelId)) return
   stopPolling()
-  if (!active(requestToken, versionId, panelId) || !pending.value) return
+  if (!pending.value) return
   polling = setTimeout(() => { void refreshCandidates(requestToken, versionId, panelId) }, 1200)
 }
 async function refreshCandidates(requestToken = token, versionId = props.versionId, panelId = props.panel.id) {
+  const readEpoch = candidateReadEpoch
   try {
     const result = await previsRequest<{ items: GridCandidate[] }>(`/animatic-versions/${versionId}/grid-candidates?panel_id=${panelId}`)
-    if (!active(requestToken, versionId, panelId)) return
+    if (!active(requestToken, versionId, panelId) || readEpoch !== candidateReadEpoch) return
     candidates.value = result.items.filter(candidate => !discardedIds.has(candidate.id))
     for (const candidate of candidates.value) {
       const previous = candidateStatuses.get(candidate.id)
@@ -197,8 +200,15 @@ async function refreshCandidates(requestToken = token, versionId = props.version
     }
     if (review.value) review.value = result.items.find(candidate => candidate.id === review.value!.id) || review.value
   } catch (cause) {
-    if (active(requestToken, versionId, panelId)) failure(cause, '候选图进度读取失败，可点击刷新重试')
+    if (active(requestToken, versionId, panelId) && readEpoch === candidateReadEpoch) failure(cause, '候选图进度读取失败，可点击刷新重试')
   } finally { schedulePolling(requestToken, versionId, panelId) }
+}
+async function refreshSettingsHistory() {
+  if (historyRefreshing.value || loading.value || submitting.value) return
+  const requestToken = token, versionId = props.versionId, panelId = props.panel.id
+  historyRefreshing.value = true; error.value = ''
+  try { await refreshCandidates(requestToken, versionId, panelId) }
+  finally { if (active(requestToken, versionId, panelId)) historyRefreshing.value = false }
 }
 async function loadContext() {
   const nextContextKey = currentContextKey()
@@ -210,7 +220,7 @@ async function loadContext() {
   const referenceRequest = refreshReferences()
   discardedIds.clear()
   candidates.value = []; capabilities.value = undefined; error.value = ''; loading.value = true
-  submitting.value = false; closeModal()
+  submitting.value = false; historyRefreshing.value = false; closeModal()
   const query = new URLSearchParams()
   if (props.configId) query.set('config_id', String(props.configId))
   if (props.model) query.set('model', props.model)
@@ -301,7 +311,14 @@ function refineFrame(edit: { frameId: string; mode: 'grid_edit' | 'frame_edit'; 
 }
 function openModal(kind: 'review' | 'edit' | 'settings') {
   if (!modal.value && typeof document !== 'undefined') previousFocus = document.activeElement as HTMLElement
+  if (kind === 'settings') settingsTab.value = 'settings'
   modal.value = kind
+}
+function navigateSettingsTabs(event: KeyboardEvent) {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+  event.preventDefault()
+  settingsTab.value = event.key === 'Home' ? 'settings' : event.key === 'End' ? 'history' : settingsTab.value === 'settings' ? 'history' : 'settings'
+  nextTick(() => dialog.value?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')?.focus())
 }
 function reviewCandidate(candidate: GridCandidate) { previewFrameId.value = undefined; review.value = candidate; openModal('review') }
 function closeModal() {
@@ -409,6 +426,8 @@ async function uploadGrid(event: Event) {
   finally { if (active(requestToken, versionId, panelId)) submitting.value = false }
 }
 watch(modal, async value => { if (value) { await nextTick(); if (modal.value && !dialog.value?.open) dialog.value?.showModal() } })
+// A read started before or during a mutation must never replace its newer result.
+watch(submitting, () => { candidateReadEpoch++ }, { flush: 'sync' })
 watch(paidBusy, value => emit('busy', value), { flush: 'sync' })
 watch(resolution, value => { try { localStorage.setItem(RESOLUTION_STORAGE_KEY, value) } catch {} })
 watch(() => props.revision, () => { if (mounted) void refreshReferences() })
@@ -459,45 +478,61 @@ onBeforeUnmount(() => { disposed = true; token++; referenceToken++; stopPolling(
 
   <Teleport to="body">
     <dialog v-if="modal" ref="dialog" class="grid-dialog" :class="{ 'grid-dialog-settings': modal === 'settings', 'grid-dialog-review': modal === 'review' }" :aria-labelledby="titleId" @cancel.prevent="closeModal" @click.self="closeModal" @keydown.stop>
-      <header><div><h2 :id="titleId">{{ modal === 'settings' ? '生成设置' : modal === 'edit' ? '微调画面' : '分镜画面预览' }}</h2><p>{{ modal === 'settings' ? '画面参考、分辨率与生成记录，设置即刻生效并沿用' : modal === 'edit' ? '选择要修改的画面，每次提交生成一个候选' : '逐格预览候选画面；采用后更新对应分镜画面' }}</p></div><button type="button" class="btn btn-icon" aria-label="关闭宫格窗口" @click="closeModal"><X :size="18" /></button></header>
+      <header><div><h2 :id="titleId">{{ modal === 'settings' ? '生成设置' : modal === 'edit' ? '微调画面' : '分镜画面预览' }}</h2><p v-if="modal !== 'settings'">{{ modal === 'edit' ? '选择要修改的画面，每次提交生成一个候选' : '逐格预览候选画面；采用后更新对应分镜画面' }}</p></div><button type="button" class="btn btn-icon" aria-label="关闭宫格窗口" @click="closeModal"><X :size="18" /></button></header>
       <div class="grid-dialog-body">
         <template v-if="modal === 'settings'">
-          <section class="grid-settings-section">
-            <h3><Eye :size="13" />画面预览</h3>
-            <div class="grid-settings-preview-wrap">
-              <div class="grid-settings-preview" :style="{ ...currentGridStyle, height: 'min(300px, 58vw)' }" data-testid="grid-settings-preview">
-                <div v-for="slot in currentGridSlots" :key="slot.index" class="grid-settings-preview-cell">
-                  <img v-if="slot.frame?.url" :src="mediaUrl(slot.frame.url)" :alt="`画面 ${slot.index + 1}`">
-                  <span v-else class="grid-settings-preview-empty">{{ slot.index + 1 }}</span>
-                </div>
+          <div class="grid-settings-summary">
+            <div class="grid-settings-preview" :style="currentGridStyle" data-testid="grid-settings-preview" aria-label="当前分镜画面缩略图">
+              <div v-for="slot in currentGridSlots" :key="slot.index" class="grid-settings-preview-cell">
+                <img v-if="slot.frame?.url" :src="mediaUrl(slot.frame.url)" :alt="`画面 ${slot.index + 1}`">
+                <span v-else class="grid-settings-preview-empty">{{ slot.index + 1 }}</span>
               </div>
             </div>
-            <p class="grid-hint">当前分镜 {{ frames.filter(frame => frame.url).length }} / {{ frames.length }} 张画面已就绪<template v-if="gridLayout.count > frames.length"> · {{ gridLayout.count - frames.length }} 个留白格</template>。</p>
-          </section>
-          <section v-if="connection !== undefined" class="grid-settings-section">
-            <h3>与上一分镜衔接</h3>
-            <label class="grid-resolution"><span>衔接方式</span><select :value="connection" aria-label="分镜衔接方式" :disabled="!editable || paidBusy" @change="emit('update:connection', ($event.target as HTMLSelectElement).value as 'normal' | 'strong' | 'scene_change')"><option value="normal">自动衔接</option><option value="strong">连续动作</option><option value="scene_change">场景切换</option></select></label>
-            <p class="grid-hint">连续动作仅在同场景、机位和状态兼容时共用视频边界；普通切镜保留当前构图。</p>
-          </section>
-          <section v-if="referenceStrategy !== undefined" class="grid-settings-section">
-            <h3><Images :size="13" />画面参考</h3>
-            <label class="grid-reference-select">参考方式<select :value="referenceStrategy || 'auto'" aria-label="画面参考方式" :disabled="!editable" @change="emit('update:referenceStrategy', ($event.target as HTMLSelectElement).value)"><option value="auto">自动选择</option><option value="individual">逐张画面</option><option value="contact_sheet">宫格画面</option></select></label>
-            <p class="grid-hint">决定生成视频时按逐张画面还是整组宫格提供参考；设置即刻生效并沿用。</p>
-          </section>
-          <section class="grid-settings-section">
-            <h3><SlidersHorizontal :size="13" />输出设置</h3>
-            <label class="grid-resolution"><span>分辨率</span><select v-model="resolution" aria-label="宫格生成分辨率" :disabled="paidBusy || !editable || !supportedResolutions.length"><option v-for="option in supportedResolutions" :key="option" :value="option">{{ option }}</option></select></label>
-            <p v-if="validFrameCount && selectedSize && predictedCell" class="grid-hint">{{ gridLayout.label }} 宫格 · {{ projectRatio }} · 原生输出 {{ selectedSize.width }} × {{ selectedSize.height }}px · 每格约 {{ predictedCell.width }} × {{ predictedCell.height }}px<template v-if="gridLayout.count > frames.length"> · {{ gridLayout.count - frames.length }} 个留白格</template></p>
-            <p v-else-if="capabilities && !supportedResolutions.length" class="grid-hint">当前模型未提供 {{ projectRatio }} 的原生输出尺寸，请切换图片模型。</p>
-          </section>
-          <section class="grid-settings-section">
-            <h3><History :size="13" />生成记录<em class="grid-settings-count">{{ visibleCandidates.length }}</em></h3>
-            <div class="grid-settings-actions">
-              <button type="button" class="btn btn-sm" :disabled="!editable || paidBusy || !validFrameCount || frames.some(frame => frame.locked)" @click="fileInput?.click()"><Upload :size="12" />上传替换宫格</button>
-              <button type="button" class="btn btn-sm" aria-label="刷新宫格候选" :disabled="loading || submitting" @click="loadContext"><RefreshCw :size="13" />刷新候选</button>
+            <div class="grid-settings-summary-text">
+              <strong>{{ panel.title || '当前分镜' }}</strong>
+              <span>{{ gridLayout.label }} 宫格 · {{ projectRatio }}<template v-if="gridLayout.count > frames.length"> · {{ gridLayout.count - frames.length }} 个留白格</template></span>
+              <small :class="{ ready: validFrameCount && frames.every(frame => frame.url) }"><Check v-if="validFrameCount && frames.every(frame => frame.url)" :size="12" />{{ frames.filter(frame => frame.url).length }} / {{ frames.length }} 张画面已就绪</small>
+            </div>
+          </div>
+          <div class="grid-settings-tabs" role="tablist" aria-label="生成设置与记录" @keydown="navigateSettingsTabs">
+            <button :id="`${titleId}-settings-tab`" type="button" role="tab" :aria-selected="settingsTab === 'settings'" :aria-controls="`${titleId}-settings-panel`" :tabindex="settingsTab === 'settings' ? 0 : -1" @click="settingsTab = 'settings'">生成设置</button>
+            <button :id="`${titleId}-history-tab`" type="button" role="tab" :aria-selected="settingsTab === 'history'" :aria-controls="`${titleId}-history-panel`" :tabindex="settingsTab === 'history' ? 0 : -1" @click="settingsTab = 'history'">生成记录<span>{{ visibleCandidates.length }}</span></button>
+          </div>
+          <div v-if="settingsTab === 'settings'" :id="`${titleId}-settings-panel`" class="grid-settings-fields" role="tabpanel" :aria-labelledby="`${titleId}-settings-tab`">
+            <section class="grid-setting-field">
+              <h3>宫格分辨率</h3>
+              <div class="grid-setting-options" role="group" aria-label="宫格生成分辨率">
+                <button v-for="option in supportedResolutions" :key="option" type="button" :aria-pressed="resolution === option" :disabled="paidBusy || !editable" @click="resolution = option">{{ option }}<Check v-if="resolution === option" :size="12" /></button>
+              </div>
+              <p v-if="validFrameCount && selectedSize && predictedCell" class="grid-hint">整图 {{ selectedSize.width }} × {{ selectedSize.height }}px · 每格约 {{ predictedCell.width }} × {{ predictedCell.height }}px</p>
+              <p v-else-if="capabilities && !supportedResolutions.length" class="grid-hint">当前模型不支持 {{ projectRatio }} 宫格，请切换图片模型。</p>
+              <p v-else class="grid-hint">先规划 1–9 张画面，再生成宫格。</p>
+            </section>
+            <section v-if="referenceStrategy !== undefined" class="grid-setting-field">
+              <h3>视频参考方式</h3>
+              <div class="grid-setting-options" role="group" aria-label="画面参考方式">
+                <button v-for="option in [{ value: 'auto', label: '自动选择' }, { value: 'individual', label: '逐张画面' }, { value: 'contact_sheet', label: '宫格画面' }]" :key="option.value" type="button" :aria-pressed="(referenceStrategy || 'auto') === option.value" :disabled="!editable" @click="emit('update:referenceStrategy', option.value)">{{ option.label }}<Check v-if="(referenceStrategy || 'auto') === option.value" :size="12" /></button>
+              </div>
+              <p class="grid-hint">{{ referenceStrategy === 'individual' ? '将各张画面分别提供给视频模型。' : referenceStrategy === 'contact_sheet' ? '将整张宫格图提供给视频模型。' : '根据视频模型能力，自动选择合适的画面参考。' }}</p>
+            </section>
+            <section v-if="connection !== undefined" class="grid-setting-field">
+              <h3>与上镜衔接</h3>
+              <div class="grid-setting-options" role="group" aria-label="分镜衔接方式">
+                <button v-for="option in [{ value: 'normal', label: '自动衔接' }, { value: 'strong', label: '连续动作' }, { value: 'scene_change', label: '场景切换' }] as const" :key="option.value" type="button" :aria-pressed="connection === option.value" :disabled="!editable || paidBusy" @click="emit('update:connection', option.value)">{{ option.label }}<Check v-if="connection === option.value" :size="12" /></button>
+              </div>
+              <p class="grid-hint">{{ connection === 'strong' ? '同场景且画面兼容时，复用上一镜头的结束画面。' : connection === 'scene_change' ? '切换到新场景，使用当前分镜的构图。' : '沿用前镜的视觉风格，保留当前分镜构图。' }}</p>
+            </section>
+          </div>
+          <section v-else :id="`${titleId}-history-panel`" class="grid-settings-history" role="tabpanel" :aria-labelledby="`${titleId}-history-tab`">
+            <div class="grid-settings-history-toolbar">
+              <span>点击记录查看画面</span>
+              <div class="grid-settings-actions">
+                <button type="button" class="btn btn-sm" :disabled="!editable || paidBusy || !validFrameCount || frames.some(frame => frame.locked)" @click="fileInput?.click()"><Upload :size="12" />上传宫格</button>
+                <button type="button" class="btn btn-icon btn-sm" aria-label="刷新宫格候选" :disabled="loading || submitting || historyRefreshing" @click="refreshSettingsHistory"><RefreshCw :size="13" :class="{ 'grid-spin': historyRefreshing }" /></button>
+              </div>
             </div>
             <div class="grid-candidates" data-testid="grid-candidate-records">
-              <p v-if="!visibleCandidates.length" class="grid-hint">暂无生成记录。</p>
+              <div v-if="!visibleCandidates.length" class="grid-settings-empty"><Grid2X2 :size="26" /><strong>还没有生成记录</strong><span>生成或上传宫格后，可在这里查看。</span></div>
               <template v-for="batch in candidateBatches" :key="batch.batchNo">
                 <p class="grid-batch-head">{{ versionLabel(batch.batchNo) }} · {{ batch.items.length }} 个候选<em v-if="batch.items.some(c => c.status === 'adopted')" class="grid-batch-current">当前采用中</em></p>
                 <button v-for="candidate in batch.items" :key="candidate.id" type="button" class="grid-candidate" :class="{ current: candidate.status === 'adopted' }" :data-candidate-id="candidate.id" @click="reviewCandidate(candidate)">
@@ -577,7 +612,7 @@ onBeforeUnmount(() => { disposed = true; token++; referenceToken++; stopPolling(
         </template>
         <p v-if="error" role="alert" class="grid-error">{{ error }}</p>
       </div>
-      <footer><span class="grid-footer-spacer" /><button type="button" class="btn btn-sm" @click="closeModal">关闭</button><button v-if="modal === 'edit'" type="button" class="btn btn-primary btn-sm" data-testid="grid-submit-edit" :disabled="!canSubmit || !editValid" @click="submitEdit"><Loader2 v-if="submitting" :size="13" class="grid-spin" /><Sparkles v-else :size="13" />提交微调</button></footer>
+      <footer><span v-if="modal === 'settings'" class="grid-settings-footnote">修改后用于下次生成</span><span class="grid-footer-spacer" /><button type="button" class="btn btn-sm" :class="{ 'btn-primary': modal === 'settings' }" @click="closeModal">{{ modal === 'settings' ? '完成' : '关闭' }}</button><button v-if="modal === 'edit'" type="button" class="btn btn-primary btn-sm" data-testid="grid-submit-edit" :disabled="!canSubmit || !editValid" @click="submitEdit"><Loader2 v-if="submitting" :size="13" class="grid-spin" /><Sparkles v-else :size="13" />提交微调</button></footer>
     </dialog>
   </Teleport>
 </template>
@@ -592,25 +627,11 @@ onBeforeUnmount(() => { disposed = true; token++; referenceToken++; stopPolling(
 .grid-hint { margin: 7px 0 0; line-height: 1.6; }
 /* 上游画布比例不符、已中心裁切适配：用告警色提示，与普通说明区分 */
 .grid-crop-note { color: var(--warning, #ad7839); }
-.grid-dialog-settings { width: min(660px, calc(100vw - 32px)); }
-.grid-resolution { display: flex; align-items: center; gap: 5px; color: var(--text-2); font-size: 11px; }
-.grid-settings-section { display: flex; flex-direction: column; align-items: stretch; gap: 11px; padding: 14px 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
-.grid-settings-section h3 { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 12px; font-weight: 600; color: var(--text-1); }
-.grid-settings-section h3 > svg { color: var(--accent-text); }
-.grid-settings-count { margin-left: auto; padding: 1px 8px; border-radius: 999px; background: var(--surface-muted); color: var(--text-2); font-size: 10px; font-style: normal; font-weight: 500; }
-.grid-settings-section .grid-resolution { justify-content: space-between; width: 100%; font-size: 12px; font-weight: 600; color: var(--text-1); }
-.grid-settings-section .grid-resolution select { min-width: 150px; min-height: 34px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: var(--radius); background: var(--surface-input); color: var(--text-0); font: 12px var(--font-body); }
-.grid-settings-section .grid-hint { margin: 0; }
-.grid-settings-section > .btn { align-self: flex-start; }
 .grid-settings-actions { display: flex; flex-wrap: wrap; gap: 7px; }
-.grid-settings-preview-wrap { display: flex; justify-content: center; }
-.grid-settings-preview { display: grid; gap: 3px; padding: 3px; max-width: 100%; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-2); }
+.grid-settings-preview { display: grid; flex-shrink: 0; width: 112px; gap: 2px; padding: 2px; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-2); }
 .grid-settings-preview-cell { position: relative; min-width: 0; min-height: 0; overflow: hidden; border-radius: 2px; background: var(--surface-soft); }
 .grid-settings-preview-cell img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .grid-settings-preview-empty { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; color: var(--text-3); font: 11px var(--font-mono); }
-.grid-settings-section :deep(.grid-reference-select) { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; color: var(--text-1); font-size: 12px; font-weight: 600; }
-.grid-settings-section :deep(.grid-reference-select select) { min-width: 150px; min-height: 34px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: var(--radius); background: var(--surface-input); color: var(--text-0); font: 12px var(--font-body); }
-.grid-resolution select { min-height: 28px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0 5px; background: var(--surface); color: var(--text-0); }
 .grid-file-input { display: none; }
 .grid-error { padding: 8px; margin: 8px 0 0; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--error) 9%, transparent); color: var(--error); font-size: 12px; line-height: 1.6; }
 .grid-candidates { display: flex; flex-direction: column; gap: 6px; overflow: auto; margin-top: 2px; }
@@ -636,6 +657,45 @@ onBeforeUnmount(() => { disposed = true; token++; referenceToken++; stopPolling(
 .grid-dialog-body { min-height: 0; overflow: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
 .grid-dialog > footer { border-top: 1px solid var(--border); flex-wrap: wrap; }
 .grid-footer-spacer { flex: 1; }
+/* 常用设置保持一屏可见，生成记录按需查看。 */
+.grid-dialog.grid-dialog-settings { width: min(560px, calc(100vw - 32px)); max-height: min(760px, 90dvh); border-radius: 18px; box-shadow: 0 24px 80px rgb(15 23 42 / 20%); }
+.grid-dialog-settings::backdrop { background: rgb(15 23 42 / 38%); backdrop-filter: blur(3px); }
+.grid-dialog-settings > header { padding: 17px 22px 12px; border: 0; }
+.grid-dialog-settings > header .btn-icon { width: 30px; height: 30px; background: transparent; color: var(--text-2); }
+.grid-dialog-settings > header .btn-icon:hover { background: var(--bg-hover); }
+.grid-dialog-settings > .grid-dialog-body { gap: 0; padding: 0 22px 20px; }
+.grid-dialog-settings > footer { padding: 13px 22px; background: var(--surface-muted); }
+.grid-dialog-settings > footer .btn { min-width: 70px; }
+.grid-settings-summary { display: flex; align-items: center; gap: 16px; padding: 4px 0 20px; }
+.grid-settings-summary-text { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.grid-settings-summary-text > strong { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 1.5; font-weight: 600; }
+.grid-settings-summary-text > span { font-size: 11px; color: var(--text-2); }
+.grid-settings-summary-text > small { display: inline-flex; align-items: center; gap: 4px; color: var(--text-2); font-size: 11px; }
+.grid-settings-summary-text > small.ready { color: var(--success); }
+.grid-settings-tabs { display: flex; gap: 24px; flex-shrink: 0; border-bottom: 1px solid var(--border); }
+.grid-settings-tabs > button { position: relative; display: inline-flex; align-items: center; gap: 6px; min-height: 39px; padding: 0 0 11px; border: 0; background: transparent; color: var(--text-2); font: 500 12px var(--font-body); cursor: pointer; }
+.grid-settings-tabs > button[aria-selected="true"] { color: var(--accent-text); font-weight: 600; }
+.grid-settings-tabs > button[aria-selected="true"]::after { content: ''; position: absolute; bottom: -1px; left: 0; right: 0; height: 2px; border-radius: 2px; background: var(--accent); }
+.grid-settings-tabs > button > span { padding: 1px 6px; border-radius: 5px; background: var(--surface-muted); color: var(--text-2); font-size: 10px; font-weight: 500; }
+.grid-settings-fields { display: flex; flex-direction: column; gap: 22px; padding-top: 22px; }
+.grid-setting-field { display: flex; flex-direction: column; gap: 9px; }
+.grid-setting-field h3 { margin: 0; color: var(--text-1); font-size: 12px; font-weight: 600; }
+.grid-setting-options { display: flex; gap: 7px; }
+.grid-setting-options > button { min-width: 0; flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 36px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-raised); color: var(--text-1); font: 500 12px var(--font-body); line-height: 1.4; cursor: pointer; transition: border-color .15s, background .15s; }
+.grid-setting-options > button:hover:not(:disabled) { border-color: var(--accent); }
+.grid-setting-options > button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-bg); color: var(--accent-text); }
+.grid-setting-options > button svg { flex-shrink: 0; }
+.grid-setting-field .grid-hint { margin: 0; font-size: 11px; line-height: 1.65; }
+.grid-settings-history { min-height: 245px; padding-top: 16px; }
+.grid-settings-history-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-bottom: 12px; }
+.grid-settings-history-toolbar > span { color: var(--text-2); font-size: 11px; }
+.grid-settings-history .grid-candidates { overflow: visible; }
+.grid-settings-history .grid-candidate > span:not(.grid-candidate-placeholder) { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.grid-settings-history .grid-candidate strong { font-size: 12px; }
+.grid-settings-history .grid-candidate small { font-size: 10px; color: var(--text-2); }
+.grid-settings-empty { display: flex; flex-direction: column; align-items: center; gap: 9px; padding: 40px 12px; text-align: center; color: var(--text-3); }
+.grid-settings-empty strong { margin-top: 3px; font-size: 12px; font-weight: 500; color: var(--text-2); }
+.grid-settings-empty span, .grid-settings-footnote { font-size: 11px; color: var(--text-2); }
 /* ===== 分镜画面预览（与资产卡片详情同款布局） ===== */
 .grid-dialog-review { width: min(960px, calc(100vw - 32px)); }
 .grid-preview-shell { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(240px, 300px); gap: 14px; align-items: start; }
@@ -695,6 +755,16 @@ onBeforeUnmount(() => { disposed = true; token++; referenceToken++; stopPolling(
 .grid-spin { animation: grid-spin 1s linear infinite; }
 @keyframes grid-spin { to { transform: rotate(360deg); } }
 @media (max-width: 600px) { .grid-dialog { width: calc(100vw - 16px); max-height: 94vh; } .grid-dialog-body { padding: 12px; } .grid-frame-choices { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 420px) {
+  .grid-dialog.grid-dialog-settings { width: calc(100vw - 24px); max-height: 92dvh; border-radius: 14px; }
+  .grid-dialog-settings > header { padding: 15px 16px 10px; }
+  .grid-dialog-settings > .grid-dialog-body { padding: 0 16px 18px; }
+  .grid-dialog-settings > footer { padding: 12px 16px; }
+  .grid-settings-summary { gap: 12px; }
+  .grid-settings-preview { width: 88px; }
+  .grid-setting-options { gap: 6px; }
+  .grid-setting-options > button { padding: 7px 5px; font-size: 11px; }
+}
 @media (prefers-reduced-motion: reduce) { .grid-spin { animation: none; } }
 .grid-tools > header > .grid-heading { flex: 1; flex-wrap: nowrap; white-space: nowrap; }
 .grid-heading > svg { flex-shrink: 0; }
