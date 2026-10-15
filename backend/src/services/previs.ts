@@ -575,10 +575,16 @@ export function saveTimeline(versionId: number, revision: number, input: unknown
           .filter((h, i, all) => all.findIndex(v => v.url === h.url) === i).slice(-200)
       }
     }
+    mirrorCurrent(versionId, timeline)
+    if (isCurrentVersion(versionId)) {
+      // Track the metadata actually mirrored to legacy storyboards. Timeline-only
+      // custom references must not look like an outside edit on the next poll.
+      const baselines = new Map(initialTimeline(row.episodeId).panels.map(panel => [panel.id, panel.sourceFingerprint]))
+      for (const panel of timeline.panels) panel.sourceFingerprint = baselines.get(panel.id) || panel.sourceFingerprint
+    }
     tx.update(schema.animaticVersions).set({
       timelineJson: JSON.stringify(timeline), revision: revision + 1, status: 'draft', contentHash: null, updatedAt: now(),
     }).where(and(eq(schema.animaticVersions.id, versionId), eq(schema.animaticVersions.revision, revision))).run()
-    mirrorCurrent(versionId, timeline)
   })
   scheduleContactSheets(versionId)
   if (changedImages.length) scheduleContinuityReviews(versionId, changedImages)

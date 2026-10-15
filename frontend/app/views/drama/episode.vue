@@ -631,45 +631,6 @@
                     </label>
                   </section>
 
-                  <section class="video-inspector-section">
-                    <div class="video-inspector-prompt-head">
-                      <span class="video-inspector-label">1 · {{ t('episode.ref.title') }}</span>
-                      <span class="tag mono">{{ t('episode.ref.boundCount', { bound: refBindableAssets.filter(a => a.bound).length, total: refBindableAssets.length }) }}</span>
-                    </div>
-                    <div class="storyboard-ref-list is-embedded">
-                      <template v-for="g in REF_KINDS" :key="g.kind">
-                        <div v-if="refBindableAssets.filter(a => a.kind === g.kind).length" class="storyboard-ref-group">
-                          <div class="storyboard-ref-group-label">{{ g.label }}</div>
-                          <div
-                            v-for="asset in refBindableAssets.filter(a => a.kind === g.kind)"
-                            :key="asset.key"
-                            :class="['storyboard-ref-item', { bound: asset.bound }]"
-                            :title="asset.bound ? t('episode.ref.clickRemove') : t('episode.ref.clickAdd')"
-                            @click="toggleShotBind(selectedSb, asset)"
-                          >
-                            <button
-                              type="button"
-                              class="storyboard-ref-thumb"
-                              :disabled="!asset.ready"
-                              @click.stop="asset.ready && openImageViewer(assetImageSrc({ imageUrl: asset.imageUrl }), `${asset.name} ${asset.typeLabel}`)"
-                            >
-                              <img v-if="asset.ready" :src="thumbOf(assetImageSrc({ imageUrl: asset.imageUrl }))" class="previewable-image" loading="lazy" @error="thumbFallback($event, assetImageSrc({ imageUrl: asset.imageUrl }))" />
-                              <span v-else>{{ asset.kind === 'scene' ? t('episode.ref.shortScene') : asset.kind === 'prop' ? t('episode.ref.shortProp') : t('episode.ref.shortChar') }}</span>
-                            </button>
-                            <div class="storyboard-ref-main">
-                              <span class="storyboard-ref-name">{{ asset.name }}</span>
-                              <span class="storyboard-ref-meta">{{ asset.typeLabel }} · {{ asset.meta }}</span>
-                              <span :class="['storyboard-ref-state', asset.bound && asset.ready ? 'is-ready' : '']">
-                                {{ asset.bound ? (asset.ready ? t('episode.ref.usable') : t('episode.ref.notReady')) : t('episode.ref.unbound') }}
-                              </span>
-                              <button v-if="asset.bound && !asset.ready" type="button" class="storyboard-ref-goto" @click.stop="prodTab = 'assets'">{{ t('episode.ref.gotoGenerate') }}</button>
-                            </div>
-                          </div>
-                        </div>
-                      </template>
-                      <div v-if="!refBindableAssets.length" class="storyboard-ref-empty">{{ t('episode.ref.empty') }}</div>
-                    </div>
-                  </section>
                 </div>
 
                   <section
@@ -692,6 +653,14 @@
                       :reference-strategy="productionReferenceState(productionPanel.id).actual === 'reference' ? videoReferenceInputStrategy : undefined"
                       @update:reference-strategy="videoReferenceInputStrategy = $event"
                     >
+                      <template #reference-actions>
+                        <StoryboardReferencePicker
+                          :key="`references-${productionVersion.id}-${productionPanel.id}`"
+                          :assets="refBindableAssets" :title="selectedSb.title || `分镜 ${selectedVideoTaskNumber}`"
+                          :editable="productionEditable && !productionFramePlanBusy && !productionGridBusy"
+                          :save="saveShotReferences" @generate-asset="prodTab = 'assets'"
+                        />
+                      </template>
                       <template #default="{ refineFrame, canRefineGrid, canRefineFrame }">
                         <StoryboardFramesEditor
                           integrated :can-refine-grid="canRefineGrid" :can-refine-frame="canRefineFrame"
@@ -705,7 +674,7 @@
                           :editable="productionEditable && !productionFramePlanBusy && !productionGridBusy"
                           :tasks="productionImageTasks"
                           :video-generation-mode="videoGenerationMode"
-                          title="2 · 分镜画面"
+                          title="分镜画面"
                           @change="updateProductionFrames"
                           @generate="generateProductionFrames"
                           @split="splitProductionFrames"
@@ -715,7 +684,7 @@
                   </section>
                   <section class="video-inspector-section">
                     <div class="video-inspector-prompt-head">
-                      <span class="video-inspector-label video-inspector-label-hero">3 · {{ t('episode.sb.videoPromptSection') }}</span>
+                      <span class="video-inspector-label video-inspector-label-hero">{{ t('episode.sb.videoPromptSection') }}</span>
                       <button
                         type="button"
                         class="btn btn-sm"
@@ -1528,6 +1497,8 @@ import StoryboardFramesEditor from '~/components/previs/StoryboardFramesEditor.v
 import ContinuityReviewPanel from '~/components/previs/ContinuityReviewPanel.vue'
 import VideoContinuityControl from '~/components/previs/VideoContinuityControl.vue'
 import StoryboardGridTools from '~/components/previs/StoryboardGridTools.vue'
+import StoryboardReferencePicker from '~/components/previs/StoryboardReferencePicker.vue'
+import { buildReferencePatch } from '~/composables/useStoryboardReferences'
 import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
 import StoryboardContactSheet from '~/components/previs/StoryboardContactSheet.vue'
 import { contactSheetForPanel, videoContinuityReadiness, panelIncomingTransition, useVideoContinuityMode, useVideoContinuityCapabilities, videoGenerationScopeError, previsRequest, mediaUrl, useFramePlanner, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy } from '~/composables/usePrevis'
@@ -1544,7 +1515,7 @@ const drama = ref(null), episode = ref(null), chars = ref([]), scenes = ref([]),
 const {
   version: productionVersion, timeline: productionTimeline, editable: productionEditable, dirty: productionDirty,
   generatable: productionGeneratable, retryContactSheet: retryProductionContactSheet, working: productionWorking, initialize: initializeProduction, create: createProduction,
-  edit: editProduction, save: saveProduction, generate: generateProduction, adoptGridCandidate: adoptProductionGridCandidate,
+  edit: editProduction, save: saveProduction, savePanelReferences: saveProductionReferences, saveError: productionSaveError, generate: generateProduction, adoptGridCandidate: adoptProductionGridCandidate,
 } = usePrevis()
 const {
   open: productionFramePlanOpen, busy: productionFramePlanBusy,
@@ -2956,18 +2927,6 @@ function getStoryboardScene(sb) {
   return scenes.value.find(s => s.id === sceneId) || null
 }
 
-function isStoryboardCharacterSelected(sb, charId) {
-  return getStoryboardCharacterIds(sb).includes(charId)
-}
-
-function toggleStoryboardCharacter(sb, charId) {
-  const currentIds = getStoryboardCharacterIds(sb)
-  const nextIds = currentIds.includes(charId)
-    ? currentIds.filter(id => id !== charId)
-    : [...currentIds, charId]
-  updateField(sb, 'character_ids', nextIds)
-}
-
 function getStoryboardPropIds(sb) {
   return sb?.prop_ids || sb?.propIds || []
 }
@@ -2975,18 +2934,6 @@ function getStoryboardPropIds(sb) {
 function getStoryboardProps(sb) {
   const ids = getStoryboardPropIds(sb)
   return propItems.value.filter(p => ids.includes(p.id))
-}
-
-function isStoryboardPropSelected(sb, propId) {
-  return getStoryboardPropIds(sb).includes(propId)
-}
-
-function toggleStoryboardProp(sb, propId) {
-  const currentIds = getStoryboardPropIds(sb)
-  const nextIds = currentIds.includes(propId)
-    ? currentIds.filter(id => id !== propId)
-    : [...currentIds, propId]
-  updateField(sb, 'prop_ids', nextIds)
 }
 
 function getSceneName(sb) {
@@ -3504,7 +3451,7 @@ function formatHistoryTime(iso) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
-// 右侧参考素材面板：本集全部可绑定素材（场景单选、角色/道具多选），bound 标记是否已绑定
+// 当前分镜的素材选择：场景单选、角色/道具多选；仅在保存成功后更新绑定
 // kind 为英文 code（逻辑值）；typeLabel 为显示名（渲染时求值）
 function shotBindableAssets(sb) {
   const out = []
@@ -3525,6 +3472,8 @@ function shotBindableAssets(sb) {
   for (const scene of scenes.value) {
     const imageUrl = scene.image_url || scene.imageUrl || ''
     out.push({
+      sceneDescription: `${scene.location} / ${scene.time || ''}`,
+      referenceLabel: scene.location || '场景',
       key: `scene-${scene.id}`,
       id: scene.id,
       kind: 'scene',
@@ -3554,37 +3503,34 @@ function shotBindableAssets(sb) {
   return out
 }
 
-// 右侧参考素材面板渲染用：当前分镜可绑定的全部素材
-const refBindableAssets = computed(() => {
-  const sb = selectedSb.value
-  return sb ? shotBindableAssets(sb) : []
+// 以工作版为准，撤销或刷新后预览、勾选和 @ 引用保持一致。
+const referenceStoryboard = computed(() => {
+  const sb = selectedSb.value, panel = productionPanel.value
+  return sb && panel ? { ...sb, scene_id: panel.sceneId, sceneId: panel.sceneId,
+    character_ids: panel.characterIds, prop_ids: panel.propIds } : sb
 })
+const refBindableAssets = computed(() => referenceStoryboard.value ? shotBindableAssets(referenceStoryboard.value) : [])
 
-// 参考面板分组顺序（kind code 驱动，label 渲染时求值）
-const REF_KINDS = computed(() => ([
-  { kind: 'character', label: t('common.role') },
-  { kind: 'scene', label: t('common.scene') },
-  { kind: 'prop', label: t('common.prop') },
-]))
-
-// 右侧面板切换绑定：场景单选（切换/解绑），角色/道具多选（kind code 判断，不依赖显示文案）
-function toggleShotBind(sb, asset) {
-  if (asset.kind === 'scene') {
-    const current = sb?.scene_id || sb?.sceneId
-    updateField(sb, 'scene_id', current === asset.id ? null : asset.id)
-    return
+async function saveShotReferences(keys) {
+  const panel = productionPanel.value, versionId = productionVersion.value?.id
+  if (!panel || !productionEditable.value || productionGridBusy.value || productionFramePlanBusy.value) return false
+  const patch = buildReferencePatch(panel, refBindableAssets.value, keys)
+  if (!await saveProductionReferences(panel.id, patch)) throw new Error(productionSaveError.value || '参考素材保存失败，请重试')
+  if (productionVersion.value?.id !== versionId) return false
+  const sb = sbs.value.find(item => item.id === panel.id)
+  if (sb) {
+    sb.scene_id = sb.sceneId = patch.sceneId
+    sb.character_ids = sb.characterIds = [...patch.characterIds]
+    sb.prop_ids = sb.propIds = [...patch.propIds]
   }
-  if (asset.kind === 'character') {
-    toggleStoryboardCharacter(sb, asset.id)
-    return
-  }
-  toggleStoryboardProp(sb, asset.id)
+  toast.success('参考素材已更新，下次生成生效')
+  return true
 }
 
 // 视频提示词 @ 引用候选：仅当前分镜已绑定的角色与道具（按名字引用）、场景（按地点引用），展示顺序：角色 → 场景 → 道具
 // kind 为逻辑值（MentionTextarea 按 kind 着色/选图标），group 为显示文案
 const mentionOptions = computed(() => {
-  const sb = selectedSb.value
+  const sb = referenceStoryboard.value
   if (!sb) return []
   const scene = getStoryboardScene(sb)
   return [
@@ -4367,126 +4313,8 @@ onMounted(() => setTimeout(() => autoTour('episode', EPISODE_TOUR, t), 900))
 }
 .loading-text { font-size: 13px; color: var(--text-2); }
 
-.storyboard-ref-list {
-  min-height: 0;
-  overflow-y: auto;
-  padding: 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-/* 嵌入中栏时：不自带内边距；高度封顶内部滚动，避免把下方提示词顶出首屏 */
-.storyboard-ref-list.is-embedded { overflow: visible; padding: 0; }
-.video-main-grid .storyboard-ref-list.is-embedded { max-height: 300px; overflow-y: auto; }
-/* 视频列表选择模式快捷操作：复用分段芯片样式，去掉顶部虚线分隔 */
+/* 视频列表选择模式快捷操作 */
 .video-quick-actions { margin: 0 12px 10px; padding-top: 0; border-top: none; }
-.storyboard-ref-group {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 5px;
-}
-.storyboard-ref-group + .storyboard-ref-group {
-  margin-top: 4px;
-}
-.storyboard-ref-group-label {
-  grid-column: 1 / -1;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-3);
-  letter-spacing: 0.02em;
-  padding: 0 2px;
-}
-.storyboard-ref-goto {
-  flex-shrink: 0;
-  align-self: center;
-  border: none;
-  background: transparent;
-  padding: 0 2px;
-  border-radius: var(--radius-sm, 6px);
-  font-size: 10.5px;
-  font-weight: 600;
-  color: var(--accent);
-  cursor: pointer;
-}
-.storyboard-ref-goto:hover {
-  background: var(--accent-bg);
-}
-.storyboard-ref-item {
-  display: grid;
-  grid-template-columns: 30px minmax(0, 1fr);
-  gap: 8px;
-  align-items: center;
-  padding: 5px 7px;
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
-  background: var(--surface-raised);
-  cursor: pointer;
-  transition: border-color 0.15s var(--ease-out), opacity 0.15s var(--ease-out);
-}
-.storyboard-ref-item:hover { border-color: var(--accent); }
-.storyboard-ref-item:not(.bound) {
-  background: transparent;
-  border-color: var(--border);
-  opacity: 0.72;
-}
-.storyboard-ref-item:not(.bound):hover { opacity: 1; border-color: var(--accent); }
-.storyboard-ref-item:not(.bound) .storyboard-ref-main .storyboard-ref-name { color: var(--text-2); }
-.storyboard-ref-item.bound {
-  border-color: var(--accent);
-  background: var(--accent-bg);
-}
-.storyboard-ref-item.bound:hover { border-color: var(--accent); }
-.storyboard-ref-thumb {
-  width: 30px;
-  aspect-ratio: 1;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--surface-outline);
-  overflow: hidden;
-  background: var(--bg-2);
-  color: var(--text-3);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 10px;
-  font-weight: 800;
-}
-.storyboard-ref-thumb:disabled { cursor: default; }
-.storyboard-ref-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.storyboard-ref-main { min-width: 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 6px; }
-.storyboard-ref-name {
-  flex: none;
-  max-width: 42%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--text-0);
-}
-.storyboard-ref-state {
-  flex-shrink: 0;
-  margin-left: auto;
-  font-size: 10px;
-  color: var(--text-3);
-}
-.storyboard-ref-state.is-ready { color: var(--success); }
-.storyboard-ref-meta {
-  flex: 1;
-  min-width: 0;
-  font-size: 10.5px;
-  color: var(--text-3);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.storyboard-ref-empty {
-  padding: 14px 10px;
-  color: var(--text-3);
-  font-size: 12px;
-  line-height: 1.5;
-  border: 1px dashed var(--surface-outline);
-  border-radius: var(--radius);
-}
 .detail-panel { flex: 1; display: flex; flex-direction: column; overflow-y: auto; min-width: 0; }
 .detail-head { display: flex; align-items: center; gap: 8px; padding: 9px 14px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
 .detail-head-copy { display: flex; flex-direction: column; gap: 2px; }
@@ -5076,7 +4904,7 @@ onMounted(() => setTimeout(() => autoTour('episode', EPISODE_TOUR, t), 900))
   border-radius: var(--radius);
   background: var(--surface-raised);
 }
-/* 生成前检查动线集中一屏：上双栏（画面描述/氛围 ｜ 参考绑定），下整宽（视频提示词） */
+/* 参考素材统一放入分镜画面卡片，描述区保留单栏。 */
 .video-main-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr);

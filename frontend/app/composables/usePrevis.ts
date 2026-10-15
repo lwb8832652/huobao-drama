@@ -468,6 +468,31 @@ export function usePrevis() {
     })()
     return saving
   }
+  /** Save picker choices as one transaction without exposing an autosave draft. */
+  async function savePanelReferences(panelId: number, patch: Partial<Pick<Panel, 'sceneId' | 'scene' | 'characterIds' | 'propIds' | 'referenceImages' | 'referenceLabels'>>): Promise<boolean> {
+    if (!editable.value || !timeline.value?.panels.some(panel => panel.id === panelId)) return false
+    const versionId = version.value!.id, frozenPatch = copy(patch)
+    if (!await save() || disposed || version.value?.id !== versionId || !editable.value) return false
+    const current = version.value!, before = copy(current.timeline), next = copy(before)
+    const panel = next.panels.find(panel => panel.id === panelId)
+    if (!panel) return false
+    Object.assign(panel, frozenPatch)
+    if (JSON.stringify(before) === JSON.stringify(next)) return true
+    working.value = true
+    saveError.value = ''
+    try {
+      const result = await previsRequest<AnimaticVersion>(`/animatic-versions/${current.id}/timeline`, 'PUT', { revision: current.revision, timeline: next })
+      if (disposed || version.value?.id !== versionId) return false
+      undoStack.value.push(before)
+      if (undoStack.value.length > 60) undoStack.value.shift()
+      redoStack.value = []
+      accept(result)
+      return true
+    } catch (cause: any) {
+      saveError.value = cause.message || '参考素材保存失败，请重试'
+      return false
+    } finally { working.value = false }
+  }
   async function check(lock = false) {
     if (!await save() || !version.value) return
     working.value = true
@@ -529,7 +554,7 @@ export function usePrevis() {
   onUnmounted(() => { disposed = true; clearInterval(polling); clearTimeout(autosave) })
   return {
     version, versions, timeline, editable, generatable, dirty, working, saveError, pollError, undoStack, redoStack,
-    framePlans, initialize, open, create, edit, history, save, check, generate, batchAction, composeContactSheets, retryContactSheet, acceptGridVersion, adoptGridCandidate,
+    framePlans, initialize, open, create, edit, history, save, savePanelReferences, check, generate, batchAction, composeContactSheets, retryContactSheet, acceptGridVersion, adoptGridCandidate,
   }
 }
 

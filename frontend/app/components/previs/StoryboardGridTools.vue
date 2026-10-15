@@ -436,7 +436,9 @@ onBeforeUnmount(() => { disposed = true; token++; referenceToken++; stopPolling(
         <button type="button" class="btn btn-sm" data-testid="grid-settings" :disabled="loading && !capabilities" @click="openModal('settings')"><Settings2 :size="12" />生成设置</button>
       </div>
     </header>
-    <GridReferenceAssets :manifest="referenceManifest" :loading="referenceLoading" :error="referenceError" />
+    <GridReferenceAssets :manifest="referenceManifest" :loading="referenceLoading" :error="referenceError">
+      <template #actions><slot name="reference-actions" /></template>
+    </GridReferenceAssets>
     <slot :refine-frame="refineFrame" :can-refine-grid="canGridEdit" :can-refine-frame="canFrameEdit" />
     <input ref="fileInput" class="grid-file-input" type="file" accept="image/*" aria-label="上传整组宫格" @change="uploadGrid">
     <p v-if="!validFrameCount" class="grid-hint">先规划 1–9 张画面，再生成宫格。</p>
