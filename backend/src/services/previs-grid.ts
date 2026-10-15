@@ -128,6 +128,9 @@ function view(row: Row) {
     referenceAssets: s.referenceAssets,
     width: row.width,
     height: row.height,
+    /** 上游原图尺寸；非空表示这张宫格的画布比例与冻结布局不符、已中心裁切适配 */
+    sourceWidth: row.sourceWidth,
+    sourceHeight: row.sourceHeight,
     error: row.error,
     batchNo: row.batchNo,
     grid: s.grid,
@@ -504,16 +507,18 @@ async function processResult(row: Row, url: string) {
     .set({ rawUrl: raw.url, width: rawMetadata.width, height: rawMetadata.height })
     .where(eq(table.id, row.id))
     .run()
-  let preview: Buffer, width: number, height: number
+  let preview: Buffer, width: number, height: number, cropped: { width: number; height: number } | undefined
   if (row.mode === 'frame_edit') {
     const single = await splitGrid(buffer, generationGrid([s.targets[0]]), s.aspectRatio)
     preview = single.tiles[0]
     width = single.width
     height = single.height
+    if (single.sourceWidth) cropped = { width: single.sourceWidth, height: single.sourceHeight! }
   } else {
     const result = await splitGrid(buffer, s.grid, s.aspectRatio)
     width = result.width
     height = result.height
+    if (result.sourceWidth) cropped = { width: result.sourceWidth, height: result.sourceHeight! }
     preview =
       row.mode === 'grid_edit'
         ? await mergeGridSelection(
@@ -530,7 +535,11 @@ async function processResult(row: Row, url: string) {
   height = metadata.height!
   const previewUrl = await saveArtifact(preview, `candidate-${row.id}`)
   db.update(table)
-    .set({ status: 'ready', rawUrl: raw.url, previewUrl, width, height, error: null, updatedAt: now() })
+    .set({
+      status: 'ready', rawUrl: raw.url, previewUrl, width, height,
+      sourceWidth: cropped?.width ?? null, sourceHeight: cropped?.height ?? null,
+      error: null, updatedAt: now(),
+    })
     .where(and(eq(table.id, row.id), inArray(table.status, ['processing', 'failed'])))
     .run()
   // 整组生成免审核：就绪即自动切分写入画面，行为与资产制作一致
@@ -694,6 +703,8 @@ export async function uploadGridCandidate(versionId: number, revision: number, p
       previewUrl: base.url,
       width: decoded.width,
       height: decoded.height,
+      sourceWidth: decoded.sourceWidth ?? null,
+      sourceHeight: decoded.sourceHeight ?? null,
       createdAt: now(),
       updatedAt: now(),
     })

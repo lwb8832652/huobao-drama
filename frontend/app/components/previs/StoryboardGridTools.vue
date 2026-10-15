@@ -110,6 +110,15 @@ const candidateBatches = computed(() => {
 })
 /** 版本号标签（batch_no 的展示）：V1/V2/… = 第几次整组生成；0 = 版本概念上线前的历史候选 */
 const versionLabel = (batchNo: number) => batchNo > 0 ? `V${batchNo}` : '历史生成'
+/**
+ * 上游偶发忽略请求尺寸、把画布改成别的比例（实测 gpt-image-2 中转把 16:9 返成 3:2）。
+ * 这种输出服务端已中心裁切适配到冻结布局的比例再切格；这里把上游原尺寸标出来便于事后核对。
+ */
+function cropNote(candidate: GridCandidate) {
+  return candidate.sourceWidth && candidate.sourceHeight
+    ? `已裁切适配（上游 ${candidate.sourceWidth}×${candidate.sourceHeight} ≠ ${projectRatio.value}）`
+    : ''
+}
 /** 分镜画面预览的格列表：frame_edit 为单格（整图即该画面），其余按宫格 index 排序 */
 const reviewThumbs = computed(() => {
   if (!review.value) return []
@@ -492,7 +501,7 @@ onBeforeUnmount(() => { disposed = true; token++; referenceToken++; stopPolling(
                 <button v-for="candidate in batch.items" :key="candidate.id" type="button" class="grid-candidate" :class="{ current: candidate.status === 'adopted' }" :data-candidate-id="candidate.id" @click="reviewCandidate(candidate)">
                   <img v-if="candidate.previewUrl && candidate.status !== 'failed'" :src="mediaUrl(candidate.previewUrl)" alt="宫格候选缩略图">
                   <span v-else class="grid-candidate-placeholder"><Grid2X2 :size="18" /></span>
-                  <span><strong>{{ modeLabel(candidate) }} · {{ statusLabel(candidate) }}</strong><small>{{ candidate.error || `${candidate.resolution || ''}${perCellPixels(candidate) ? ` · 每格 ${perCellPixels(candidate)!.width} × ${perCellPixels(candidate)!.height}px` : ''}` }}</small></span>
+                  <span><strong>{{ modeLabel(candidate) }} · {{ statusLabel(candidate) }}</strong><small>{{ cropNote(candidate) ? `${cropNote(candidate)} · ` : '' }}{{ candidate.error || `${candidate.resolution || ''}${perCellPixels(candidate) ? ` · 每格 ${perCellPixels(candidate)!.width} × ${perCellPixels(candidate)!.height}px` : ''}` }}</small></span>
                   <em v-if="candidate.status === 'adopted'" class="grid-candidate-current">当前</em>
                 </button>
               </template>
@@ -545,6 +554,7 @@ onBeforeUnmount(() => { disposed = true; token++; referenceToken++; stopPolling(
             </aside>
             <section class="grid-preview-side">
               <div class="grid-preview-section-title"><span>候选信息</span><span v-if="review.width && review.height" class="dim">{{ review.width }} × {{ review.height }}px · {{ review.adoptFrameIds.length }} 张画面 · {{ versionLabel(review.batchNo) }}</span></div>
+              <p v-if="cropNote(review)" class="grid-hint grid-crop-note">{{ cropNote(review) }}</p>
               <GridReferenceAssets v-if="frozenManifest" :manifest="frozenManifest" frozen />
               <p v-if="review.error" role="alert" class="grid-error">{{ review.error }}</p>
               <p v-if="review.status === 'ready'" class="grid-hint">采用后该候选会切分并更新对应画面，原画面保留在画面历史中。</p>
@@ -578,6 +588,8 @@ onBeforeUnmount(() => { disposed = true; token++; referenceToken++; stopPolling(
 .grid-tools strong { font-size: 12px; }
 .grid-tools small, .grid-hint { color: var(--text-2); font-size: 11px; }
 .grid-hint { margin: 7px 0 0; line-height: 1.6; }
+/* 上游画布比例不符、已中心裁切适配：用告警色提示，与普通说明区分 */
+.grid-crop-note { color: var(--warning, #ad7839); }
 .grid-dialog-settings { width: min(660px, calc(100vw - 32px)); }
 .grid-resolution { display: flex; align-items: center; gap: 5px; color: var(--text-2); font-size: 11px; }
 .grid-settings-section { display: flex; flex-direction: column; align-items: stretch; gap: 11px; padding: 14px 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }

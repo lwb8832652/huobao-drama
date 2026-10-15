@@ -113,6 +113,9 @@ export interface GridCandidate {
   baseUrl?: string | null
   width?: number | null
   height?: number | null
+  /** 上游返回的原始画布尺寸；仅当它与冻结布局比例不符、服务端已中心裁切适配时才有值 */
+  sourceWidth?: number | null
+  sourceHeight?: number | null
   error?: string | null
   grid: { columns: number; rows: number; cells: { frameId: string; index: number }[] }
   targetFrameIds: string[]

@@ -13,6 +13,8 @@ export const gridCandidates = sqliteTable('previs_grid_candidates', {
   previewUrl: text('preview_url'),
   width: integer('width'),
   height: integer('height'),
+  sourceWidth: integer('source_width'),
+  sourceHeight: integer('source_height'),
   error: text('error'),
   batchNo: integer('batch_no').notNull().default(0),
   createdAt: text('created_at').notNull(),
@@ -22,7 +24,8 @@ export function initGridSchema(sqlite: Database.Database) {
   sqlite.exec(`CREATE TABLE IF NOT EXISTS previs_grid_candidates (
     id INTEGER PRIMARY KEY AUTOINCREMENT, version_id INTEGER NOT NULL, panel_id INTEGER NOT NULL,
     mode TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', input_hash TEXT NOT NULL, snapshot_json TEXT NOT NULL,
-    task_id INTEGER, raw_url TEXT, preview_url TEXT, width INTEGER, height INTEGER, error TEXT,
+    task_id INTEGER, raw_url TEXT, preview_url TEXT, width INTEGER, height INTEGER,
+    source_width INTEGER, source_height INTEGER, error TEXT,
     batch_no INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   ); CREATE INDEX IF NOT EXISTS idx_grid_version_panel ON previs_grid_candidates(version_id,panel_id);
@@ -33,4 +36,9 @@ export function initGridSchema(sqlite: Database.Database) {
   const columns = sqlite.prepare('PRAGMA table_info(previs_grid_candidates)').all() as { name: string }[]
   if (!columns.some(c => c.name === 'batch_no'))
     sqlite.exec('ALTER TABLE previs_grid_candidates ADD COLUMN batch_no INTEGER NOT NULL DEFAULT 0')
+  // 上游画布比例与冻结布局不符时，服务端会中心裁切适配并把上游原尺寸记在这里（NULL = 未裁切）
+  if (!columns.some(c => c.name === 'source_width'))
+    sqlite.exec('ALTER TABLE previs_grid_candidates ADD COLUMN source_width INTEGER')
+  if (!columns.some(c => c.name === 'source_height'))
+    sqlite.exec('ALTER TABLE previs_grid_candidates ADD COLUMN source_height INTEGER')
 }

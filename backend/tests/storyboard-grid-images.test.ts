@@ -99,3 +99,36 @@ test('even if model redraws every tile, only selected second and fourth cells ch
   assert.deepEqual(await pixel(split.tiles[3]), [0, 0, 0])
   await assert.rejects(mergeGridSelection(original, model, grid, ['placeholder'], 320 / 180), /目标/)
 })
+test('画布比例与冻结布局不符时中心裁切适配，偏差过大仍拒绝', async () => {
+  const grid = generationGrid(['a', 'b', 'c', 'd']) // 4 帧 → 2×2
+  // 上游把 16:9 的请求返成 3:2（1536×1024，偏差 15.6%）：格数与布局都对，只是画布比例错，
+  // 裁切后每格应恢复成 16:9，且记录上游原尺寸供界面标注。
+  const offRatio = await composeGrid(
+    await Promise.all(['red', 'green', 'blue', 'white'].map((c) => tile(c, 768, 512))),
+    grid,
+    1536,
+    1024,
+  )
+  const split = await splitGrid(offRatio, grid, 16 / 9)
+  assert.equal(split.sourceWidth, 1536)
+  assert.equal(split.sourceHeight, 1024)
+  assert.equal(split.width, 1536)
+  assert.equal(split.height, 864)
+  assert.equal((await sharp(split.tiles[0]).metadata()).height, 432)
+  assert.deepEqual(await pixel(split.tiles[0]), [255, 0, 0])
+  assert.deepEqual(await pixel(split.tiles[3]), [255, 255, 255])
+  // 4:3 对 16:9 偏 25%，超出裁切上限：仍按原样拒绝，避免裁掉过多内容
+  const fourThree = await sharp({ create: { width: 800, height: 600, channels: 3, background: 'gray' } })
+    .png()
+    .toBuffer()
+  await assert.rejects(splitGrid(fourThree, grid, 16 / 9), /比例/)
+  // 完全合规时不裁切、也不上报原尺寸
+  const exact = await sharp({ create: { width: 1280, height: 720, channels: 3, background: 'gray' } })
+    .png()
+    .toBuffer()
+  const clean = await splitGrid(exact, grid, 16 / 9)
+  assert.equal(clean.width, 1280)
+  assert.equal(clean.height, 720)
+  assert.equal(clean.sourceWidth, undefined)
+  assert.equal(clean.sourceHeight, undefined)
+})
