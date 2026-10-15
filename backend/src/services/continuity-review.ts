@@ -32,7 +32,13 @@ const dimensionSchema = z.object({
   score: looseNum(z.number().min(0).max(25)),
   comment: looseComment,
 })
-export const continuityReviewResultSchema = z.object({
+const dimensionsSchema = z.object({
+  subject: dimensionSchema,
+  scene: dimensionSchema,
+  action: dimensionSchema,
+  camera: dimensionSchema,
+})
+const continuityReviewResultShape = z.object({
   overallScore: looseNum(z.number().min(0).max(100)),
   confidence: z.preprocess(
     (v) => (['high', 'medium', 'low'].includes(v as string) ? v : 'low'),
@@ -42,12 +48,7 @@ export const continuityReviewResultSchema = z.object({
     (v) => (typeof v === 'string' && v.trim() ? v : '未提供摘要'),
     z.string().trim().min(1).max(2000),
   ),
-  dimensions: z.object({
-    subject: dimensionSchema,
-    scene: dimensionSchema,
-    action: dimensionSchema,
-    camera: dimensionSchema,
-  }),
+  dimensions: dimensionsSchema,
   issues: z.preprocess(
     (v) => (Array.isArray(v) ? v.filter(item => typeof item === 'string' && item.trim()) : []),
     z.array(z.string().trim().min(1).max(1000)).max(8),
@@ -57,6 +58,8 @@ export const continuityReviewResultSchema = z.object({
     z.array(z.string().trim().min(1).max(1000)).max(8),
   ),
 })
+/** 模型输出（或 DB 行）→ 评分结果。对象级预处理：平铺四项先收进 dimensions。 */
+export const continuityReviewResultSchema = z.preprocess(withDimensions, continuityReviewResultShape)
 
 interface ReviewPanelContext {
   group: { id: string; title: string; note: string }
@@ -190,6 +193,20 @@ function reviewInput(timeline: Timeline, toGroupId: string): ContinuityReviewInp
   }
 }
 
+/**
+ * 模型常把四项平铺在顶层而不是包进 dimensions（instructions 早先只说明四项含义、未给
+ * 包裹层，实测 qwen3.8-flash 即平铺输出）。分数本身已算对，不该因包装失败——平铺时按
+ * 四个键收进 dimensions，与 looseBool/looseNum 同一容错约定。DB 里已是规范结构，恒等。
+ */
+function withDimensions(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || 'dimensions' in value) return value
+  const flat: Record<string, unknown> = {}
+  for (const key of ['subject', 'scene', 'action', 'camera']) {
+    if (key in (value as Record<string, unknown>)) flat[key] = (value as Record<string, unknown>)[key]
+  }
+  return Object.keys(flat).length ? { ...(value as Record<string, unknown>), dimensions: flat } : value
+}
+
 function normalizeReview(value: unknown): ContinuityReviewResult {
   const parsed = continuityReviewResultSchema.safeParse(value)
   if (!parsed.success) throw new PrevisError(`AI 连续性评分格式无效：${parsed.error.issues[0]?.message}`)
@@ -204,8 +221,13 @@ function normalizeReview(value: unknown): ContinuityReviewResult {
 }
 
 function parseReview(text: string): ContinuityReviewResult {
+  // 空响应 = 模型一步都没产出文本（典型：见工具就调、被 maxSteps 截断）。
+  // 与「返回了文本但不含 JSON」分开报错，排障时能直接区分是没输出还是格式错。
+  if (!text || !text.trim()) throw new PrevisError('模型未返回评分内容（响应为空，可能中途调用了工具），请重试')
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]
-  const source = fenced || text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)
+  const start = text.indexOf('{')
+  if (!fenced && start < 0) throw new PrevisError('模型未返回 JSON 评分（响应中不含 JSON 对象），请重试')
+  const source = fenced || text.slice(start, text.lastIndexOf('}') + 1)
   try {
     return normalizeReview(JSON.parse(source))
   } catch (error) {

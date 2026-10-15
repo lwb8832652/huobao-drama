@@ -156,8 +156,9 @@ video_prompt 规则（硬约束）：
 只依据给定图片和文字资料判断，不得臆造画外信息。场景切换、建立镜头、声音桥及明确允许的变化不应被误判为穿帮。
 四项各 0-25 分：subject=人物与关键道具，scene=场景、时间与光线，action=动作、姿态、视线与方向，camera=构图、景别与机位衔接。
 overallScore 必须等于四项之和。图片缺失时仍可依据文字评分，但 confidence 必须为 low，并在 summary 中说明依据有限。
-issues 只列明确问题，没有则返回空数组；suggestions 给出可直接修改分镜或提示词的建议。
-只输出一个 JSON 对象，不要 Markdown，不要代码围栏，不要补充解释。`,
+issues 只列明确问题，没有则返回空数组；suggestions 给出可直接修改分镜或提示词的建议。summary 用一两句话概括整体连续性结论。
+只输出一个 JSON 对象，不要 Markdown，不要代码围栏，不要补充解释，不要调用任何工具。JSON 结构：
+{"dimensions":{"subject":{"score":0,"comment":"..."},"scene":{"score":0,"comment":"..."},"action":{"score":0,"comment":"..."},"camera":{"score":0,"comment":"..."}},"overallScore":0,"confidence":"high|medium|low","summary":"...","issues":[],"suggestions":[]}`,
   },
   frame_splitter: {
     name: '分镜画面拆分',
@@ -471,6 +472,13 @@ function buildModel(type: string) {
 }
 
 /** 启动时注册的静态 Agent 表（供 Mastra 实例挂载） */
+// continuity-reviewer 是纯输出型 agent：输入（结构化资料 + 两张边界画面）全部随消息下发，
+// 不读文件、不调工具，且 generate 用 maxSteps=1 只走一步。给它挂 workspace 会被 Mastra
+// 自动注入 mastra_workspace_* 系列工具，qwen 系模型见工具就调（实测第一步调
+// mastra_workspace_list_files），一步耗尽后 generate 在工具步返回、response.text 为空，
+// 评分解析必然失败（「AI 未返回可解析的连续性评分」）。它没有 SKILL.md / prompt 文件，
+// skillWorkspaces 对它无内容可注入，摘除不影响 instructions 路径（loadAgentSkills 仍返回空）。
+const TOOL_FREE_AGENTS = new Set(['continuity-reviewer'])
 export const agentRegistry: Record<string, Agent> = Object.fromEntries(
   validAgentTypes.map(type => [
     type,
@@ -480,8 +488,7 @@ export const agentRegistry: Record<string, Agent> = Object.fromEntries(
       instructions: buildInstructions(type),
       model: buildModel(type),
       tools: AGENT_TOOLS[type],
-      workspace: skillWorkspaces[type],
-      skillsFormat: 'markdown',
+      ...(TOOL_FREE_AGENTS.has(type) ? {} : { workspace: skillWorkspaces[type], skillsFormat: 'markdown' as const }),
       ...(['frame_splitter', 'continuity-reviewer'].includes(type) ? { maxRetries: 0 } : {}),
     }),
   ]),
