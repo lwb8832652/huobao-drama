@@ -249,8 +249,12 @@ export async function startTaskQueueWorker(prepare?: () => Promise<void>) {
   const token = randomUUID(), leaseMs = 30_000
   const hold = client.transaction(() => {
     const previous = leaseRecord()
+    // 持锁进程已死 → 锁失效，必须允许接管：否则僵尸 PID 会让后端永远无法启动
+    // （2026-10-14 实证：旧后端被回收后锁里留死 PID，新后端一律 QueueError 拒起）。
     if (previous.pid) {
-      try { process.kill(previous.pid, 0); return false } catch {}
+      let alive = false
+      try { process.kill(previous.pid, 0); alive = true } catch {}
+      if (alive) return false
     } else if (previous.expires && previous.expires > Date.now()) return false
     setCursor('worker', JSON.stringify({ token, pid: process.pid, expires: Date.now() + leaseMs })); return true
   }).immediate()

@@ -172,6 +172,22 @@ test('known external task IDs resume polling after restart even if earlier polli
   assert.equal(queue.getQueueJobById(id)?.status, 'processing')
 })
 
+test('持锁进程已死时新后端能接管，僵尸 PID 不会永久挡住启动', async () => {
+  assert.ok(queue)
+  // 复现线上故障：旧后端被回收后锁里留下不存在的 PID，新后端一律 QueueError 拒起
+  db.$client.prepare("INSERT INTO task_queue_cursors (key, value) VALUES ('worker', ?)")
+    .run(JSON.stringify({ token: 'dead', pid: 2147483646, expires: Date.now() + 600_000 }))
+  const stop = await queue.startTaskQueueWorker()
+  try {
+    assert.equal(queue.getQueueWorkerReady?.() ?? true, true)
+    const row = db.$client.prepare("SELECT value FROM task_queue_cursors WHERE key='worker'").get() as any
+    assert.equal(JSON.parse(row.value).pid, process.pid)   // 锁已转交给本进程
+  } finally { stop() }
+  // 持锁进程仍活着时，第二个 worker 拿不到锁（复用同进程在途 worker，不抛错）
+  const first = await queue.startTaskQueueWorker()
+  try { assert.equal(await queue.startTaskQueueWorker(), first) } finally { first() }
+})
+
 test('worker admission stays closed until all startup migrations have finished', async () => {
   assert.ok(queue)
   let id = 0
