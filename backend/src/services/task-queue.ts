@@ -3,7 +3,7 @@ import { db } from '../db/index.js'
 import { readProductionSettings, readEvaluationSettings, onQueueSettingsChange } from './task-queue-settings.js'
 
 export type QueueKind = 'image' | 'video' | 'evaluation' | 'planning' | 'local'
-export type QueueOwner = 'sys_task' | 'continuity_review' | 'frame_plan' | 'contact_sheet' | 'video_merge'
+export type QueueOwner = 'sys_task' | 'continuity_review' | 'production_quality' | 'frame_plan' | 'contact_sheet' | 'video_merge'
 export type QueueStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled'
 export interface QueueJob {
   id: number; ownerType: QueueOwner; ownerId: number; kind: QueueKind; projectId: number; configId: number

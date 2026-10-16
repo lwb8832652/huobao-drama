@@ -1,10 +1,11 @@
 import { queueStatusLabel, type QueueMetadata, type QueueStats } from './useTaskQueue'
 import type { Timeline, ContinuityReviewResult } from './usePrevis'
+import type { QualityTask, QualityResult } from './useProductionQuality'
 
-export type EvaluationType = 'continuity'
+export type EvaluationType = 'continuity' | 'planning'
 export interface EvaluationTask extends QueueMetadata {
   id: number
-  type: EvaluationType
+  type: 'continuity'
   versionId: number
   status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled'
   current: boolean
@@ -22,14 +23,15 @@ export interface EvaluationTask extends QueueMetadata {
   toGroupTitle: string | null
   images: { from: string | null; to: string | null }
 }
+export type AnyEvaluationTask = EvaluationTask | QualityTask
 export interface EvaluationTaskPage {
-  type: EvaluationType
+  type: EvaluationType | 'all'
   page: number
   pageSize: number
   total: number
   activeCount: number
   lowScore: number
-  items: EvaluationTask[]
+  items: AnyEvaluationTask[]
   summary?: { total: number; active: number; completed: number; failed: number; pending?: number; processing?: number }
 }
 /** 不依赖连续性输入/评分结构的列表展示契约，可供其他评测类型复用。 */
@@ -46,17 +48,21 @@ export interface EvaluationListItem extends QueueMetadata {
   attention: boolean
 }
 export type EvaluationTaskFilter = 'all' | 'active' | 'completed' | 'failed'
-export function evaluationTaskRow(item: EvaluationTask, threshold: number): EvaluationListItem {
+export type EvaluationTypeFilter = 'all' | EvaluationType
+export function evaluationTaskRow(item: AnyEvaluationTask, threshold: number): EvaluationListItem {
   const time = item.createdAt ? new Date(item.createdAt) : null
   const formattedTime = time && !Number.isNaN(time.getTime()) ? time.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : ''
+  const planning = item.type === 'planning'
+  const result = item.result
+  const score = result && 'overallScore' in result ? result.overallScore ?? undefined : undefined
   return {
-    key: String(item.id), typeLabel: '连续性',
-    title: `${item.fromGroupTitle || item.fromGroupId || '前镜头'} → ${item.toGroupTitle || item.toGroupId || '后镜头'}`,
+    key: `${item.type}:${item.id}`, typeLabel: planning ? '分镜规划质量' : '连续性',
+    title: planning ? item.kind === 'optimization' ? `AI 优化候选 · 第 ${item.round} 轮` : item.kind === 'rules' ? '分镜规划质量 · 规则检查' : '分镜规划质量 · AI 评测' : `${item.fromGroupTitle || item.fromGroupId || '前镜头'} → ${item.toGroupTitle || item.toGroupId || '后镜头'}`,
     queueJobId: item.queueJobId, phase: item.phase, queueReason: item.queueReason, canCancel: item.canCancel, canRetry: item.canRetry,
     status: item.status, summary: item.queueReason || item.error || item.result?.summary || (item.status === 'completed' ? '未提供摘要' : queueStatusLabel(item)),
-    meta: [item.model || '等待分配模型', formattedTime, `#${item.id}`].filter(Boolean).join(' · '),
-    preview: item.images.from || item.images.to, score: item.result?.overallScore,
-    current: item.current, attention: !!item.result && (item.result.overallScore < threshold || item.result.confidence === 'low'),
+    meta: [planning && item.kind === 'rules' ? '免费规则检查' : item.model || '等待分配模型', formattedTime, `#${item.id}`].filter(Boolean).join(' · '),
+    preview: planning ? null : item.images.from || item.images.to, score,
+    current: item.current, attention: !!result && ((score !== undefined && score < threshold) || ('confidence' in result && result.confidence === 'low') || (planning && 'issues' in result && (result as QualityResult).issues.length > 0)),
   }
 }
 export interface ContinuityReviewSettings { enabled: boolean; threshold: number }

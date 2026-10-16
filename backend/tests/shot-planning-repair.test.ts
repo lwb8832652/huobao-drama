@@ -5,6 +5,7 @@ process.env.SQLITE_PATH = ':memory:'
 const { db, schema } = await import('../src/db/index.js')
 const previs = await import('../src/services/previs.js')
 const repair = await import('../src/services/shot-planning-repair.js')
+const requirePlanning = await import('../src/services/shot-planning.js')
 const ts = new Date().toISOString()
 const dramaId = Number(db.insert(schema.dramas).values({ title: '修复测试', createdAt: ts, updatedAt: ts }).run().lastInsertRowid)
 const line = '要不是族长是他爹，这种废物早被赶出家族了，哪还能在这儿白吃白喝。'
@@ -22,6 +23,17 @@ test('preview is read-only and shows long dialogue splitting, output retention a
   assert.ok(preview.proposals[0].segments.every(s => s.durationMs <= 15000))
   assert.equal(preview.proposals[0].beforeVideoUrl, 'static/test/video.mp4')
   assert.equal(db.select().from(schema.sysTask).all().length, 0)
+})
+test('reviewed server-side description overrides are previewed and atomically adopted', () => {
+  const { version, id } = seed()
+  const options = { revision: version.revision, panelIds: [id], maxSeconds: 15 }
+  const overrides = { [id]: { description: '【镜头1】族女丙转身抱臂。族女丙：「你好。」', atmosphere: '夕照' } }
+  const preview = repair.previewProductionRepair(version.id, options, overrides)
+  assert.match(preview.proposals[0].segments[0].description, /转身抱臂/)
+  const result = repair.applyProductionRepair(version.id, { ...options, inputHash: preview.inputHash }, overrides)
+  assert.equal(result.timeline.panels[0].atmosphere, '夕照')
+  assert.equal(result.timeline.panels[0].productionPlan?.atmosphere, '夕照')
+  assert.match(result.timeline.panels[0].videoPrompt, /夕照/)
 })
 test('apply creates a fresh version, preserves historical video and grid, mirrors ordered splits without generating media', () => {
   const { version, id, episodeId } = seed()
@@ -129,4 +141,15 @@ test('pending and processing video jobs block repair without changing versions o
     assert.equal(db.select().from(schema.animaticVersions).all().length, count)
     assert.equal(previs.getVersion(version.id).revision, version.revision)
   }
+})
+test('trusted quality candidates do not undergo a second implicit speech restoration',()=>{
+  const {episodeId,id}=seed()
+  const short=line.replace('早被赶出家族了，','')
+  const description=`【镜头1】族女丙抱臂转身。族女丙：「${short}」`
+  db.update(schema.storyboards).set({description,duration:15}).where(eq(schema.storyboards.id,id)).run()
+  const version=previs.getWorkspace(episodeId)
+  const preview=repair.previewProductionRepair(version.id,{revision:version.revision,panelIds:[id],maxSeconds:15},{[id]:{description}})
+  assert.equal(preview.proposals[0].restorations.length,0)
+  const {extractDialogue,spokenText}=requirePlanning
+  assert.equal(spokenText(preview.proposals[0].segments.flatMap(s=>extractDialogue(s.description)).map(u=>u.text).join('')),spokenText(short))
 })

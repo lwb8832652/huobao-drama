@@ -13,6 +13,8 @@ import { startFramePlan, listFramePlans, retryFramePlans } from '../services/pre
 import { FRAME_COUNT_MIN, FRAME_COUNT_MAX } from '../services/previs-frame-contract.js'
 import { readGridReferences } from '../services/previs-grid-references.js'
 import { previewProductionRepair, applyProductionRepair } from '../services/shot-planning-repair.js'
+import { checkProductionQuality, enqueueQualityReview, enqueueQualityOptimization, getProductionQualityTask, productionQualityStatus, applyQualityOptimization } from '../services/production-quality.js'
+import { listEvaluationTasks } from '../services/evaluation-tasks.js'
 
 import { gridCapabilities, listGridCandidates, startGridCandidates, adoptGridCandidate, discardGridCandidate, uploadGridCandidate, retryGridProcessing } from '../services/previs-grid.js'
 
@@ -60,6 +62,27 @@ app.post('/episodes/:id/animatic-versions', async c => {
   return created(c, createVersion(Number(c.req.param('id')), body.sourceId))
 })
 app.get('/animatic-versions/:id/timeline', c => success(c, getVersion(Number(c.req.param('id')))))
+app.get('/animatic-versions/:id/production-quality', c => success(c, productionQualityStatus(positiveId.parse(Number(c.req.param('id'))))))
+app.post('/animatic-versions/:id/production-quality/check', async c => {
+  const body=z.object({revision,ai:z.boolean().default(false),configId:positiveId.optional(),model:z.string().max(200).optional()}).parse(await c.req.json())
+  const id=positiveId.parse(Number(c.req.param('id')))
+  if(getVersion(id).revision!==body.revision)throw new PrevisError('版本已更新，请重新检查',409)
+  return success(c,await checkProductionQuality(id,body))
+})
+app.post('/animatic-versions/:id/production-quality/reviews', async c => success(c, await enqueueQualityReview(
+  positiveId.parse(Number(c.req.param('id'))),z.object({revision,configId:positiveId.optional(),model:z.string().max(200).optional()}).parse(await c.req.json()),
+)))
+app.get('/animatic-versions/:id/production-quality/tasks/:taskId', c => success(c,getProductionQualityTask(positiveId.parse(Number(c.req.param('taskId'))),positiveId.parse(Number(c.req.param('id'))))))
+app.post('/animatic-versions/:id/production-quality/tasks/:taskId/optimize', async c => success(c, await enqueueQualityOptimization(
+  positiveId.parse(Number(c.req.param('id'))),positiveId.parse(Number(c.req.param('taskId'))),
+  z.object({inputHash:z.string().length(64),issueIds:z.array(z.string().min(1).max(200)).min(1).max(300),configId:positiveId.optional(),model:z.string().max(200).optional()}).parse(await c.req.json()),
+)))
+app.post('/animatic-versions/:id/production-quality/tasks/:taskId/apply', async c => success(c, await applyQualityOptimization(
+  positiveId.parse(Number(c.req.param('id'))),positiveId.parse(Number(c.req.param('taskId'))),z.object({inputHash:z.string().length(64)}).parse(await c.req.json()),
+)))
+app.get('/animatic-versions/:id/evaluation-tasks',c=>success(c,listEvaluationTasks(positiveId.parse(Number(c.req.param('id'))),{
+  page:c.req.query('page'),pageSize:c.req.query('pageSize'),status:c.req.query('status'),keyword:c.req.query('keyword'),type:c.req.query('type'),
+})))
 app.get('/animatic-versions/:id/state', c => success(c, getVersionState(Number(c.req.param('id')))))
 const productionRepairOptions = z.object({ revision, panelIds: z.array(positiveId).min(1).max(200), maxSeconds: z.number().int().min(5).max(15).default(15) })
 app.post('/animatic-versions/:id/production-plan/preview', async c => success(c, previewProductionRepair(

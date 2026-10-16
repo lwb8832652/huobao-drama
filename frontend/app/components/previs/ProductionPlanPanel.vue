@@ -30,6 +30,8 @@ const props = defineProps<{
   panelId?: number
   editable?: boolean
   busy?: boolean
+  secondary?: boolean
+  headless?: boolean
   beforeAction?: () => Promise<{ versionId: number; revision: number } | false>
 }>()
 const emit = defineEmits<{
@@ -194,10 +196,12 @@ onBeforeUnmount(() => {
   phase.value = 'idle'
   finishClose()
 })
+defineExpose({ openDialog })
 </script>
 
 <template>
-  <section class="production-panel" aria-label="对白与时间规划检查">
+  <button v-if="!headless && secondary" type="button" class="btn btn-sm" :disabled="!version || !panels.length || busy" @click="openDialog">规则修复预览 · 免费</button>
+  <section v-else-if="!headless" class="production-panel" aria-label="对白与时间规划检查">
     <div class="production-heading">
       <div>
         <strong>对白与时间检查</strong>

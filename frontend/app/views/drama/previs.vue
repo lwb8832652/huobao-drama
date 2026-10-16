@@ -27,7 +27,7 @@ import {
   FRAME_COUNT_MAX, frameCountChangeAllowed, checkContinuity, createFrameId, durationMs, formatTime, frameKey, groupPanels, makeFrame, mediaUrl, orderedFrames,
   applyFramePlanToPanel, contactSheetForPanel, videoContinuityReadiness, panelIncomingTransition, useVideoContinuityMode, useVideoContinuityCapabilities, videoGenerationScopeError, planFrames, previsRequest, submitFramePlan, fetchFramePlans, timelineSegments, usePrevis, useVideoGenerationMode, useVideoReferenceInputStrategy,
   type AudioClip, type ContinuityIssue, type FrameType, type Keyframe,
-  type Panel, type PanelFramePlan, type FramePlansResult, type Timeline, type VideoGenerationScope,
+  type Panel, type PanelFramePlan, type FramePlansResult, type Timeline, type VideoGenerationScope, type AnimaticVersion,
 } from '~/composables/usePrevis'
 import '~/assets/css/previs.css'
 
@@ -356,6 +356,16 @@ function select(id: string, shotId?: number) {
   groupId.value = id
   panelId.value = shotId || groups.value.find(g => g.id === id)?.panelIds[0] || 0
   currentMs.value = segments.value.find(s => s.panel.id === panelId.value)?.startMs || 0
+}
+async function acceptQualityVersion(adopted: AnimaticVersion) {
+  await open(adopted.id)
+  if (version.value?.id !== adopted.id) return false
+  toast.success('已应用到新工作版，请重新检查并审阅画面')
+  return true
+}
+function selectQualityPanel(id: number) {
+  const group = groups.value.find(group => group.panelIds.includes(id))
+  if (group) select(group.id, id)
 }
 function seek(ms: number) {
   currentMs.value = Math.max(0, Math.min(total.value, ms))
@@ -694,7 +704,7 @@ onUnmounted(() => { ++framePlanTaskToken; clearInterval(framePlanTaskTimer); win
             {{ t('episode.topbar.tasks') }}
             <span v-if="activeTasks" class="task-drawer-badge">{{ activeTasks }}</span>
           </button>
-          <ContinuityReviewPanel ref="continuityPanel" :version="version" :timeline="timeline" :panel-ids="allIssues ? undefined : panels.map(p => p.id)" :text-model="modelChoice('text')" :save="save" :dirty="dirty" />
+          <ContinuityReviewPanel ref="continuityPanel" :version="version" :timeline="timeline" :panel-ids="allIssues ? undefined : panels.map(p => p.id)" :text-model="modelChoice('text')" :save="save" :dirty="dirty" :busy="working || framePlanSubmitting" :editable="editable" :panel-id="panelId" :apply-quality="acceptQualityVersion" @select="selectQualityPanel" />
         </div>
       </div>
     </header>

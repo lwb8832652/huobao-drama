@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ChevronLeft, ChevronRight, Clock3, FileSearch, Loader2, Search, X } from 'lucide-vue-next'
 import { queueStatusLabel } from '~/composables/useTaskQueue'
-import type { EvaluationListItem, EvaluationTaskFilter } from '~/composables/useContinuityReview'
+import type { EvaluationListItem, EvaluationTaskFilter, EvaluationTypeFilter } from '~/composables/useContinuityReview'
 const props = defineProps<{
   items: EvaluationListItem[]
   total: number
@@ -10,6 +10,7 @@ const props = defineProps<{
   page: number
   pageSize: number
   filter: EvaluationTaskFilter
+  typeFilter?: EvaluationTypeFilter
   keyword: string
   loading: boolean
   error: string
@@ -18,6 +19,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   select: [key: string]
   filter: [filter: EvaluationTaskFilter]
+  type: [filter: EvaluationTypeFilter]
   search: [keyword: string]
   page: [page: number]
   refresh: []
@@ -38,6 +40,7 @@ function taskAriaLabel(item: EvaluationListItem) {
 
 <template>
   <div class="evaluation-list-view">
+    <div class="evaluation-types" role="group" aria-label="筛选评测类型"><button v-for="option in ([{ key: 'all', label: '全部类型' }, { key: 'planning', label: '分镜规划质量' }, { key: 'continuity', label: '连续性' }] as const)" :key="option.key" type="button" :aria-pressed="(typeFilter || 'all') === option.key" :class="{ on: (typeFilter || 'all') === option.key }" @click="emit('type', option.key)">{{ option.label }}</button></div>
     <div class="evaluation-metrics" role="group" aria-label="筛选评测任务状态">
       <button v-for="option in filters" :key="option.key" type="button" :class="['metric', `metric-${option.key}`, { on: filter === option.key }]" :aria-pressed="filter === option.key" :title="filter === option.key ? '再次点击取消筛选' : `查看${option.label}任务`" @click="toggleFilter(option.key)"><b v-if="filterCount(option.key) !== undefined">{{ filterCount(option.key) }}</b>{{ option.label }}</button>
     </div>
@@ -48,7 +51,7 @@ function taskAriaLabel(item: EvaluationListItem) {
     <p v-if="error" class="evaluation-notice" role="alert">{{ error }}<span v-if="items.length"> · 暂时显示上次查询结果</span><button type="button" @click="emit('refresh')">重新加载</button></p>
     <div class="evaluation-records" :aria-busy="loading" data-testid="evaluation-task-list">
       <div v-if="loading && !items.length" class="evaluation-empty" role="status"><Loader2 :size="28" class="spin" /><strong>正在读取评测任务</strong><p>稍后即可查看状态和结果</p></div>
-      <div v-else-if="!items.length" class="evaluation-empty"><FileSearch :size="32" /><strong>{{ error ? '暂时无法读取任务' : keyword || filter !== 'all' ? '没有符合条件的任务' : '还没有评测任务' }}</strong><p>{{ error ? '请重新加载后再试' : keyword || filter !== 'all' ? '试试其他关键词或切换状态' : '发起一次评测，检查镜头之间的画面衔接' }}</p><button v-if="!error && !keyword && filter === 'all'" class="evaluation-button primary" type="button" :disabled="!canCreate" @click="emit('create')">发起评测</button><button v-else-if="!error" class="evaluation-button" type="button" @click="emit('search', ''); emit('filter', 'all')">清除筛选</button></div>
+      <div v-else-if="!items.length" class="evaluation-empty"><FileSearch :size="32" /><strong>{{ error ? '暂时无法读取任务' : keyword || filter !== 'all' ? '没有符合条件的任务' : '还没有评测任务' }}</strong><p>{{ error ? '请重新加载后再试' : keyword || filter !== 'all' ? '试试其他关键词或切换状态' : '发起规则检查或评测，查看分镜规划与画面衔接' }}</p><button v-if="!error && !keyword && filter === 'all'" class="evaluation-button primary" type="button" :disabled="!canCreate" @click="emit('create')">发起评测</button><button v-else-if="!error" class="evaluation-button" type="button" @click="emit('search', ''); emit('filter', 'all')">清除筛选</button></div>
       <button v-for="item in items" :key="item.key" class="evaluation-task-row" type="button" :class="`is-${item.status}`" :aria-label="taskAriaLabel(item)" @click="emit('select', item.key)">
         <span class="evaluation-preview"><img v-if="item.preview" :src="item.preview" alt="" loading="lazy" @error="($event.target as HTMLImageElement).style.visibility = 'hidden'"><Loader2 v-else-if="item.status === 'processing' || item.status === 'pending'" :size="21" :class="{ spin: item.status === 'processing' }" /><FileSearch v-else :size="23" /><span class="evaluation-type">{{ item.typeLabel }}</span></span>
         <span class="evaluation-task-copy"><strong :title="item.title">{{ item.title }}</strong><span class="evaluation-task-meta">{{ item.meta }}</span><span class="evaluation-task-summary" :class="{ 'is-error': item.status === 'failed' }" :title="item.summary">{{ item.summary }}</span><span class="evaluation-task-flags"><span v-if="!item.current" class="evaluation-label">历史结果</span><span v-if="item.attention" class="evaluation-label attention">需关注</span></span></span>
@@ -61,6 +64,7 @@ function taskAriaLabel(item: EvaluationListItem) {
 
 <style scoped>
 .evaluation-list-view{display:flex;flex-direction:column;min-height:0;flex:1}
+.evaluation-types{display:flex;gap:6px;padding:16px 24px 10px}.evaluation-types button{border:1px solid var(--border);border-radius:8px;padding:7px 10px;background:transparent;color:var(--text-2);font:inherit;font-size:11px;cursor:pointer}.evaluation-types button.on{color:var(--accent-text);background:var(--accent-bg);border-color:var(--accent-glow)}
 .evaluation-metrics{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:10px 16px;border-bottom:1px solid var(--surface-outline,#e7ebf1)}
 .metric{display:inline-flex;align-items:center;gap:5px;min-height:22px;padding:0 8px;border:1px solid var(--surface-outline,#e7ebf1);border-radius:999px;background:var(--overlay-track,#f1f3f6);color:var(--text-2,#7a8796);font:inherit;font-size:11px;font-weight:750;white-space:nowrap;cursor:pointer;transition:box-shadow .15s}
 /* 数字：等宽数字 + 走 UA 的 bolder（与制作/预演筛选按钮一致）。不要在这里写

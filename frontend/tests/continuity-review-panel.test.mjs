@@ -5,6 +5,7 @@ import { runInNewContext } from 'node:vm'
 import ts from 'typescript'
 import * as vue from 'vue'
 import { compileScript, compileTemplate, parse } from '@vue/compiler-sfc'
+import { parse as parseDOM } from '@vue/compiler-dom'
 const read = p => readFileSync(new URL(p, import.meta.url), 'utf8')
 const intervals = []
 function evaluate(source, deps = {}) {
@@ -45,27 +46,35 @@ test('六类风险和阈值边界完整，低分和低置信合并一条', () =>
 const descriptor = parse(read('../app/components/previs/ContinuityReviewPanel.vue')).descriptor
 const script = compileScript(descriptor, { id: 'review' })
 const flush = async () => { for (let i = 0; i < 6; i++) await vue.nextTick() }
-function mount({ current = snapshot('idle'), saveOK = true, unavailable = false, historyResponse, detailResponse, postResult, settingsResponse, settingsFailure } = {}) {
+function mount({ current = snapshot('idle'), saveOK = true, unavailable = false, historyResponse, detailResponse, postResult, settingsResponse, settingsFailure, qualityResponse } = {}) {
   const calls = [], unmounts = []
   let exposed
-  const component = evaluate(script.content, {
-    vue: { ...vue, onUnmounted: fn => unmounts.push(fn) },
-    '~/composables/usePrevis': { previsRequest: async (path, method = 'GET', body) => {
+  const request = async (path, method = 'GET', body) => {
       calls.push({ path, method, body })
       if (path === '/settings/evaluation-tasks' || path.endsWith('continuity-review-settings')) {
         if (method === 'PUT' && settingsFailure) throw settingsFailure
         return body ? { ...body, globalTotal: 6, stats: {} } : (typeof settingsResponse === 'function' ? settingsResponse() : settingsResponse) || { revision: 1, concurrency: 1, paused: false, enabled: false, threshold: 70, globalTotal: 6, stats: {} }
       }
       if (unavailable) throw Error('模拟离线')
+      if (path.endsWith('/production-quality')) return qualityResponse || { inputHash: 'quality-hash', rules: { issues: [] }, task: null, latest: null }
       if (method === 'POST' && postResult) return postResult
+      if (/production-quality\/tasks\/\d+$/.test(path)) return detailResponse
       if (/continuity-review-tasks\/\d+$/.test(path)) return detailResponse || { id: 12, type: 'continuity', status: 'processing', current: false, images: { from: null, to: null } }
-      if (path.includes('continuity-review-tasks')) return (typeof historyResponse === 'function' ? historyResponse(path) : historyResponse) || { type: 'continuity', page: 1, pageSize: 20, total: 1, activeCount: 2, lowScore: 0, items: [{ id: 12, type: 'continuity', status: 'processing', current: false, images: { from: null, to: null } }] }
+      if (path.includes('evaluation-tasks?')) return (typeof historyResponse === 'function' ? historyResponse(path) : historyResponse) || { type: 'all', page: 1, pageSize: 20, total: 1, activeCount: 2, lowScore: 0, items: [{ id: 12, type: 'continuity', status: 'processing', current: false, images: { from: null, to: null } }] }
       return current
-    } },
+    }
+  const vueDeps = { ...vue, onUnmounted: fn => unmounts.push(fn) }
+  const quality = evaluate(read('../app/composables/useProductionQuality.ts'), { vue: vueDeps, './usePrevis': { previsRequest: request } })
+  const component = evaluate(script.content, {
+    vue: vueDeps,
+    '~/composables/usePrevis': { previsRequest: request },
     '~/composables/useContinuityReview': domain,
     '../QueueSettingsButton.vue': { default: {} },
     './EvaluationTaskList.vue': { default: {} },
     './ContinuityReviewDetail.vue': { default: {} },
+    './PlanningQualityDetail.vue': { default: {} },
+    './ProductionPlanPanel.vue': { default: {} },
+    '~/composables/useProductionQuality': quality,
   }).default
   const props = vue.reactive({ version: { id: 9, revision: 1 }, timeline, panelIds: [2], textModel: { configId: 1, model: 'mock' }, dirty: false,
     save: async () => { calls.push({ path: 'save' }); return saveOK } })
@@ -95,7 +104,7 @@ test('抽屉关闭仍GET历史与活跃数，切页携带分页参数、版本�
   assert.equal(m.s.expanded.value, false)
   await intervals.at(-1)(); await flush()
   assert.equal(m.s.history.value.activeCount, 2)
-  assert.ok(m.calls.some(c => c.path.includes('continuity-review-tasks?page=1&pageSize=20')))
+  assert.ok(m.calls.some(c => c.path.includes('evaluation-tasks?page=1&pageSize=20')))
   assert.ok(m.calls.every(c => c.method === 'GET'))
   m.s.selectTask(m.s.history.value.items[0]); assert.equal(m.s.selected.value.id, 12)
   m.s.page.value = 2; await flush()
@@ -157,6 +166,41 @@ test('通用任务行适配器区分完成与需关注，并保持历史图片�
   assert.equal(row.status, 'completed'); assert.equal(row.attention, true); assert.equal(row.current, false)
   assert.equal(row.preview, '/old.png'); assert.match(row.title, /旧镜头/); assert.equal(row.typeLabel, '连续性')
   assert.equal(domain.evaluationTaskRow({ ...base, result: result(70) }, 70).attention, false)
+})
+test('规划与连续性同号任务使用类型加ID，规则检查不伪造评分', () => {
+  const planning = domain.evaluationTaskRow({ id: 12, type: 'planning', kind: 'rules', status: 'completed', current: true, result: { overallScore: null, confidence: 'high', summary: '2 项待处理', issues: [{ id: 'a' }] } }, 70)
+  const continuity = domain.evaluationTaskRow({ id: 12, type: 'continuity', images: {}, status: 'completed' }, 70)
+  assert.equal(planning.key, 'planning:12'); assert.equal(continuity.key, 'continuity:12')
+  assert.equal(planning.score, undefined); assert.equal(planning.attention, true)
+  assert.equal(planning.typeLabel, '分镜规划质量')
+})
+test('统一类型筛选与规划详情路由区分同号任务，打开规划入口不触发模型', async () => {
+  const planning = { id: 12, type: 'planning', versionId: 9, kind: 'review', round: 0, status: 'completed', current: true, inputHash: 'quality-hash', result: { overallScore: 80, confidence: 'high', issues: [], summary: '通过' } }
+  const m = mount({ historyResponse: { type: 'all', page: 1, pageSize: 20, total: 2, activeCount: 0, lowScore: 0, items: [{ id: 12, type: 'continuity', images: {}, status: 'completed' }, planning] }, detailResponse: planning,
+    qualityResponse: { inputHash: 'quality-hash', rules: planning.result, task: planning, latest: planning } }); await flush()
+  m.s.selectRow('planning:12'); assert.equal(m.s.selected.value.type, 'planning')
+  m.s.expanded.value = true; await flush(); m.s.selectRow('planning:12'); await flush()
+  assert.ok(m.calls.some(call => call.path.endsWith('/production-quality/tasks/12')))
+  m.s.changeTypeFilter('planning'); await flush()
+  assert.ok(m.calls.some(call => call.path.includes('type=planning')))
+  await m.exposed.openPlanning(); await flush()
+  assert.equal(m.s.view.value, 'detail'); assert.equal(m.s.selected.value.type, 'planning')
+  assert.ok(m.calls.every(call => !call.method || call.method === 'GET')); m.unmount()
+})
+test('重新发起规划评测默认回到免费规则检查', async () => {
+  const m = mount(); await flush()
+  m.s.planningMode.value = 'ai'
+  m.s.openCreate()
+  assert.equal(m.s.planningMode.value, 'rules')
+  m.unmount()
+})
+test('规则修复控制器常驻抽屉入口，版本轮询切走详情时仍能接收应用响应', () => {
+  const template = parseDOM(descriptor.template.content)
+  const section = template.children.find(node => node.type === 1 && node.tag === 'section')
+  const repair = section.children.find(node => node.type === 1 && node.tag === 'ProductionPlanPanel')
+  assert.ok(repair, 'The rule repair controller must be a persistent direct child, outside conditional Teleport/task detail content')
+  assert.equal(repair.props.some(prop => prop.type === 7 && ['if', 'else-if'].includes(prop.name)), false)
+  assert.ok(repair.props.some(prop => prop.type === 6 && prop.name === 'headless'))
 })
 test('新任务把选中记录挤出列表页时，单独查询详情并保持原有详情视图', async () => {
   let newer = false

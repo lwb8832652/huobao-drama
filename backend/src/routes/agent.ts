@@ -8,6 +8,8 @@ import { mastra } from '../mastra/index.js'
 import { success, badRequest } from '../utils/response.js'
 import { logTaskError, logTaskPayload, logTaskProgress, logTaskStart, logTaskSuccess } from '../utils/task-logger.js'
 
+import { finishStoryboardBreakdown } from '../services/production-quality-breakdown.js'
+
 const app = new Hono()
 
 // Mastra v1.17 的 ToolCallChunk / ToolResultChunk 结构：
@@ -81,10 +83,10 @@ app.post('/:type/chat', async (c) => {
   }
 
   try {
-    const result = await agent.generate(
-      [{ role: 'user', content: message }],
+    const run = (content: string, maxSteps: number) => agent.generate(
+      [{ role: 'user', content }],
       {
-        maxSteps: 20,
+        maxSteps,
         requestContext,
         abortSignal: abortController.signal,
         // 步骤级观测：定位「LLM 返回 200 但工具从未执行」类问题。
@@ -133,6 +135,19 @@ app.post('/:type/chat', async (c) => {
       },
     )
 
+    const result = await run(message, 20)
+    let quality
+    if (agentType === 'storyboard_breaker') {
+      quality = await finishStoryboardBreakdown(episode_id, {
+        requestContext, configId: body.config_id || undefined, model: body.model || undefined,
+        repair: async issues => {
+          consecutiveToolFailures = 0
+          const correction = await run(`整集拆分后的规则检查发现以下问题。请先调用 read_storyboard_context 对照完整原剧本和已保存分镜，只修正这些问题。已有分镜用 update_storyboard 更新，缺失段落用 save_storyboards 追加并按自然剧情顺序修正 shot_number；禁止 replace_existing:true，禁止删减、改写对白或仅回复已完成。修正描述时同步修正完整视频提示词及时长，不能只更改文字说明。单段超过视频模型上限时在自然语义边界拆段。此次仅有一次纠错机会。问题及证据：${JSON.stringify(issues)}`, 8)
+          result.toolCalls.push(...(correction.toolCalls || []))
+          result.toolResults.push(...(correction.toolResults || []))
+        },
+      })
+    }
     const elapsed = ((performance.now() - startTime) / 1000).toFixed(1)
     logTaskSuccess('Agent', agentType, { elapsedSeconds: elapsed })
 
@@ -158,6 +173,7 @@ app.post('/:type/chat', async (c) => {
     return success(c, {
       type: 'done',
       text: result.text || '',
+      ...(quality ? { quality } : {}),
       toolCalls: normalizedToolCalls,
       toolResults: normalizedToolResults,
     })

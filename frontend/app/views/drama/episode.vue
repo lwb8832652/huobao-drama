@@ -66,7 +66,7 @@
             {{ t('episode.topbar.tasks') }}
             <span v-if="genTaskActiveCount" class="task-drawer-badge">{{ genTaskActiveCount }}</span>
           </button>
-          <ContinuityReviewPanel ref="continuityPanel" :version="productionVersion" :timeline="productionTimeline" :text-model="textModelOptions.find(option => option.key === chatModel) || textModelOptions[0]" :save="saveProduction" :dirty="productionDirty" />
+          <ContinuityReviewPanel ref="continuityPanel" :version="productionVersion" :timeline="productionTimeline" :text-model="textModelOptions.find(option => option.key === chatModel) || textModelOptions[0]" :save="saveProduction" :dirty="productionDirty" :busy="productionWorking || productionFramePlanBusy || productionGridBusy" :editable="productionEditable" :panel-id="selectedSb?.id" :apply-quality="acceptProductionPlan" @select="selectProductionPanel" />
         </div>
       </div>
     </header>
@@ -633,12 +633,7 @@
 
                 </div>
 
-                <ProductionPlanPanel
-                  :version="productionVersion" :panel-id="selectedSb?.id"
-                  :editable="productionEditable" :busy="productionWorking || productionFramePlanBusy || productionGridBusy"
-                  :before-action="beforeProductionGridAction"
-                  @applied="acceptProductionPlan" @select="selectProductionPanel"
-                />
+                <button type="button" class="production-quality-row" :disabled="!productionVersion" @click="continuityPanel?.openPlanning()"><span>分镜质检</span><i aria-hidden="true">·</i><span role="status">{{ continuityPanel?.planningSummary || '读取中…' }}</span><strong>查看评测 <ChevronRight :size="13" /></strong></button>
 
                   <section
                     v-if="productionPanel"
@@ -1505,7 +1500,6 @@ import ContinuityReviewPanel from '~/components/previs/ContinuityReviewPanel.vue
 import VideoContinuityControl from '~/components/previs/VideoContinuityControl.vue'
 import StoryboardGridTools from '~/components/previs/StoryboardGridTools.vue'
 import StoryboardReferencePicker from '~/components/previs/StoryboardReferencePicker.vue'
-import ProductionPlanPanel from '~/components/previs/ProductionPlanPanel.vue'
 import { productionBlockingMessage } from '../../../../backend/src/services/shot-planning'
 import { buildReferencePatch } from '~/composables/useStoryboardReferences'
 import FramePlanDialog from '~/components/previs/FramePlanDialog.vue'
@@ -2872,7 +2866,8 @@ async function acceptProductionPlan(version) {
     if (productionVersion.value?.id !== version.id) throw new Error('新工作版尚未加载，请先保存当前修改后重新切换。')
     await refresh()
     toast.success('已应用到新工作版，请核对画面后再生成视频')
-  } catch (error) { toastError(error) }
+    return true
+  } catch (error) { toastError(error); return false }
 }
 function selectProductionPanel(id) {
   const sb = sbs.value.find(item => item.id === id)
@@ -3099,6 +3094,7 @@ async function syncExtractStatus() {
 
 // ─── 批量视频提示词：后端异步逐分镜生成，前端轮询进度 ──────────
 const videoPromptBatch = ref({ running: false, total: 0, completed: 0 })
+let videoPromptBatchPolling
 // 单个视频提示词生成：按分镜 ID 跟踪，允许不同分镜并行生成（不走全局 rn 锁）
 const videoPromptGeneratingIds = ref([])
 // 视频制作页多选快捷操作：全选 / 仅选未生成视频（勾选集与批量视频共用 selectedVideoSbIds）
@@ -3109,32 +3105,41 @@ function selectMissingVideos() {
   selectedVideoSbIds.value = sbs.value.filter(sb => !hasVid(sb)).map(sb => sb.id)
 }
 
-async function batchVideoPrompts() {
-  if (videoPromptBatch.value.running || !epId.value) return
+async function batchVideoPrompts(waitForCompletion = false) {
+  if (!epId.value) return
+  if (videoPromptBatch.value.running) return waitForCompletion === true ? pollVideoPromptBatch() : undefined
   if (!sbs.value.length) { toast.warning(t('episode.sb.breakFirst')); return }
   // 选择模式下有勾选 → 仅补齐所选；否则全量补齐缺失
-  const ids = (videoSelectMode.value && selectedVideoSbIds.value.length) ? [...selectedVideoSbIds.value] : undefined
+  const ids = (waitForCompletion !== true && videoSelectMode.value && selectedVideoSbIds.value.length) ? [...selectedVideoSbIds.value] : undefined
   try {
     const res = await episodeAPI.generateVideoPrompts(epId.value, chatModelOverride(), chatConfigId(), ids)
     if (!res?.total) {
       if (res?.already_running) {
         videoPromptBatch.value = { running: true, total: 0, completed: 0 }
-        pollVideoPromptBatch()
+        const polling = pollVideoPromptBatch()
+        if (waitForCompletion === true) return await polling
       } else toast.info(ids ? t('episode.sb.selectedMissing') : t('episode.sb.allHavePrompts'))
       return
     }
     videoPromptBatch.value = { running: true, total: res.total, completed: 0 }
     toast.info(t('episode.sb.batchStarted', { n: res.total }))
-    pollVideoPromptBatch()
+    const polling = pollVideoPromptBatch()
+    if (waitForCompletion === true) return await polling
   } catch (e) {
     toastError(e)
   }
 }
 
 function pollVideoPromptBatch(attempts = 240) {
+  if (videoPromptBatchPolling) return videoPromptBatchPolling
+  const episodeId = epId.value
+  videoPromptBatchPolling = new Promise(resolve => {
+  const finish = result => { videoPromptBatchPolling = undefined; resolve(result) }
   const tick = async (left) => {
+    if (epId.value !== episodeId) { finish(null); return }
     try {
-      const st = await episodeAPI.videoPromptsStatus(epId.value)
+      const st = await episodeAPI.videoPromptsStatus(episodeId)
+      if (epId.value !== episodeId) { finish(null); return }
       if (st && st.status !== 'running') {
         videoPromptBatch.value = { running: false, total: 0, completed: 0 }
         await refresh()
@@ -3143,7 +3148,7 @@ function pollVideoPromptBatch(attempts = 240) {
         } else {
           toastError(st.error, { fallback: 'episode.sb.batchFailed' })
         }
-        return
+        finish(st); return
       }
       if (st) {
         const prev = videoPromptBatch.value.completed
@@ -3152,9 +3157,11 @@ function pollVideoPromptBatch(attempts = 240) {
       }
     } catch {}
     if (left > 0) setTimeout(() => tick(left - 1), 2500)
-    else videoPromptBatch.value = { running: false, total: 0, completed: 0 }
+    else { videoPromptBatch.value = { running: false, total: 0, completed: 0 }; finish(null) }
   }
   setTimeout(() => tick(attempts), 2500)
+  })
+  return videoPromptBatchPolling
 }
 function doBreakdown() {
   const charList = chars.value.length
@@ -3182,10 +3189,14 @@ function doBreakdown() {
 }
 
 /** 拆分完成后刷新并自动补齐缺失的视频提示词（兜住 Agent 漏写/截断） */
-async function onBreakdownDone() {
+async function onBreakdownDone(data) {
   await refresh()
   const missing = sbs.value.filter(sb => !(sb.video_prompt || sb.videoPrompt || '').trim())
-  if (missing.length) batchVideoPrompts()
+  if (missing.length) {
+    const completion = await batchVideoPrompts(true)
+    if (data && completion?.quality) data.quality = completion.quality
+  }
+  await continuityPanel.value?.refresh()
 }
 
 // 按需为单个分镜生成视频提示词：由 prompt_generator 读取分镜字段生成并保存到 video_prompt
@@ -5424,6 +5435,7 @@ button.video-task-metric:focus-visible { outline: 2px solid var(--accent); outli
 }
 .video-frame-readiness.ready { background: var(--success-bg); color: var(--success); }
 .video-inspector-section { display: flex; flex-direction: column; gap: 7px; }
+.production-quality-row{display:flex;align-items:center;gap:8px;width:100%;border:1px solid var(--surface-outline);border-radius:8px;background:var(--overlay-track);padding:10px 12px;color:var(--text-2);font:inherit;font-size:11px;text-align:left;cursor:pointer}.production-quality-row i{font-style:normal;color:var(--text-3)}.production-quality-row>span:first-child{font-weight:650;color:var(--text-1)}.production-quality-row strong{display:flex;align-items:center;gap:3px;margin-left:auto;font-size:11px;font-weight:500;color:var(--accent-text)}.production-quality-row:hover{border-color:var(--accent-glow);background:var(--accent-bg)}.production-quality-row:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.production-quality-row:disabled{opacity:.45;cursor:not-allowed}
 .video-inspector-label { color: var(--text-0); font-size: 12px; font-weight: 700; }
 .video-inspector-label-hero {
   color: var(--accent);

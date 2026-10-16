@@ -16,7 +16,7 @@ db.insert(schema.episodes).values({ id: 1, dramaId: 1, episodeNumber: 1, title: 
 db.insert(schema.aiServiceConfigs).values({ id: 1, name: 'test', serviceType: 'text', provider: 'openai', baseUrl: 'http://127.0.0.1:1', apiKey: 'test', model: '["mock"]', isActive: true, createdAt: ts, updatedAt: ts }).run()
 let versionNo = 0
 function version() {
-  const panels = [1, 2].map(id => ({ id, title: '', description: '', atmosphere: '', imagePrompt: '', videoPrompt: '', durationMs: 4000,
+  const panels = [1, 2].map(id => ({ id, title: '', description: '【镜头1】人物站在木门旁，望向窗外。', atmosphere: '', imagePrompt: '', videoPrompt: '', durationMs: 4000,
     sceneId: null, scene: '', shotType: '', angle: '', movement: '', characterIds: [], propIds: [], referenceImages: [], videoUrl: '',
     frames: [{ ...makeFrame(`${id}`), url: `/static/${id}.png` }] }))
   return Number(db.insert(schema.animaticVersions).values({ episodeId: 1, versionNo: ++versionNo, timelineJson: JSON.stringify({ schemaVersion: 2, panels,

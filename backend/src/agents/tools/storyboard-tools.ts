@@ -74,6 +74,22 @@ function validateStoryboardProduction(row: { id?: number; title?: string | null;
 
 interface PromptWriteReceipt { videoPrompt: string; updatedAt: string }
 const promptWrites = new WeakMap<object, Map<number, PromptWriteReceipt>>()
+const breakdownWrites = new WeakMap<object, Set<number>>()
+const correctionContexts = new WeakSet<object>()
+export function setStoryboardCorrectionMode(requestContext: object, enabled: boolean) {
+  if (enabled) correctionContexts.add(requestContext)
+  else correctionContexts.delete(requestContext)
+}
+/** Successful writes only; text responses and failed transactions never count. */
+export function getStoryboardBreakdownReceipt(requestContext: object | undefined) {
+  return requestContext ? [...(breakdownWrites.get(requestContext) || [])] : []
+}
+function recordBreakdownWrites(requestContext: object | undefined, ids: number[], replace = false) {
+  if (!requestContext) return
+  const written = replace ? new Set<number>() : breakdownWrites.get(requestContext) || new Set<number>()
+  ids.forEach(id => written.add(id))
+  breakdownWrites.set(requestContext, written)
+}
 /** A receipt proves a successful prompt write from this exact agent request, even if text is unchanged. */
 export function getStoryboardPromptWriteReceipt(requestContext: object | undefined, storyboardId: number) {
   return requestContext ? promptWrites.get(requestContext)?.get(storyboardId) : undefined
@@ -252,6 +268,9 @@ const saveStoryboards = createTool({
     const ids = requireIds(context)
     if ('error' in ids) return ids
     const { episodeId, dramaId } = ids
+    if (replace_existing && context?.requestContext && correctionContexts.has(context.requestContext)) {
+      throw new Error('纠错期间不能清空或替换已保存分镜，请更新已有分镜或追加缺失段落')
+    }
     const ts = now()
     logTaskProgress('StoryboardTool', 'save-begin', {
       episodeId, dramaId, replaceExisting: replace_existing === true,
@@ -265,6 +284,7 @@ const saveStoryboards = createTool({
         description?: string | null; videoPrompt?: string | null; duration?: number | null; sceneId?: number | null
       }>(replace_existing ? [] : existingByShot)
       // Preflight the ENTIRE batch before clearing rows or creating any asset links.
+      const failures: string[] = []
       const prepared = storyboards.map(sb => {
         const previous = effectiveByShot.get(sb.shot_number)
         const values = {
@@ -277,11 +297,14 @@ const saveStoryboards = createTool({
         }
         const characterIds = sb.character_ids ?? []
         const propIds = sb.prop_ids ?? []
-        validateStoryboardProduction(values, sb.video_prompt === undefined)
-        validateStoryboardBindings(store, dramaId, values.sceneId, characterIds, propIds)
+        try {
+          validateStoryboardProduction(values, sb.video_prompt === undefined)
+          validateStoryboardBindings(store, dramaId, values.sceneId, characterIds, propIds)
+        } catch (error: any) { failures.push(`分镜 #${sb.shot_number}：${error.message}`) }
         effectiveByShot.set(sb.shot_number, values)
         return { sb, values, characterIds, propIds }
       })
+      if (failures.length) throw new Error(`本批分镜未保存，请修正后重试：\n${failures.join('\n')}`)
       if (replace_existing === true) {
         for (const previous of existingRows) {
           store.delete(schema.storyboardCharacters).where(eq(schema.storyboardCharacters.storyboardId, previous.id)).run()
@@ -307,6 +330,9 @@ const saveStoryboards = createTool({
       return total
     })
 
+    const writtenIds = db.select().from(schema.storyboards).where(eq(schema.storyboards.episodeId, episodeId)).all()
+      .filter(row => !row.deletedAt && storyboards.some(sb => sb.shot_number === row.storyboardNumber)).map(row => row.id)
+    recordBreakdownWrites(context?.requestContext, writtenIds, replace_existing === true)
     logTaskSuccess('StoryboardTool', 'save-complete', {
       episodeId,
       count: storyboards.length,
@@ -322,6 +348,7 @@ const updateStoryboard = createTool({
   inputSchema: z.object({
     storyboard_id: looseNum(z.number()),
     title: z.string().optional(),
+    shot_number: looseNum(z.number().int().positive().optional()),
     shot_type: z.string().optional(),
     angle: z.string().optional(),
     movement: z.string().optional(),
@@ -364,6 +391,7 @@ const updateStoryboard = createTool({
     })
 
     const updates: Record<string, any> = { updatedAt: now() }
+    if ('shot_number' in fields) updates.storyboardNumber = fields.shot_number
     if ('title' in fields) updates.title = fields.title
     if ('shot_type' in fields) updates.shotType = fields.shot_type
     if ('angle' in fields) updates.angle = fields.angle
@@ -383,6 +411,8 @@ const updateStoryboard = createTool({
       requireOwnedEpisode(store, episodeId, dramaId)
       const current = store.select().from(schema.storyboards).where(eq(schema.storyboards.id, storyboard_id)).get()
       if (!current || current.deletedAt || current.episodeId !== episodeId) throw new Error(`Storyboard ${storyboard_id} not found in current episode`)
+      if ('shot_number' in fields && store.select().from(schema.storyboards).where(eq(schema.storyboards.episodeId, episodeId)).all()
+        .some(row => !row.deletedAt && row.id !== storyboard_id && row.storyboardNumber === fields.shot_number)) throw new Error('镜头编号已被占用，请先使用空闲编号调整顺序')
       if ('description' in fields || 'duration' in fields || 'video_prompt' in fields) validateStoryboardProduction({ ...current, ...updates }, false)
       const sceneId = 'scene_id' in fields ? fields.scene_id : current.sceneId
       const currentCharacterIds = fields.character_ids ?? store.select().from(schema.storyboardCharacters)
@@ -395,6 +425,7 @@ const updateStoryboard = createTool({
       if ('character_ids' in fields) syncStoryboardCharacters(store, storyboard_id, fields.character_ids || [])
       if ('prop_ids' in fields) syncStoryboardProps(store, storyboard_id, fields.prop_ids || [])
     })
+    if ('description' in fields || 'duration' in fields || 'video_prompt' in fields) recordBreakdownWrites(context?.requestContext, [storyboard_id])
     if ('video_prompt' in fields && context?.requestContext) {
       const receipts = promptWrites.get(context.requestContext) || new Map<number, PromptWriteReceipt>()
       receipts.set(storyboard_id, { videoPrompt: fields.video_prompt!, updatedAt: updates.updatedAt })

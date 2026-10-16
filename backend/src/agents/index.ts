@@ -488,7 +488,7 @@ export const agentRegistry: Record<string, Agent> = Object.fromEntries(
       model: buildModel(type),
       tools: AGENT_TOOLS[type],
       ...(TOOL_FREE_AGENTS.has(type) ? {} : { workspace: skillWorkspaces[type], skillsFormat: 'markdown' as const }),
-      ...(['frame_splitter', 'continuity-reviewer'].includes(type) ? { maxRetries: 0 } : {}),
+      ...(['frame_splitter', 'continuity-reviewer', 'storyboard_breaker'].includes(type) ? { maxRetries: 0 } : {}),
     }),
   ]),
 )

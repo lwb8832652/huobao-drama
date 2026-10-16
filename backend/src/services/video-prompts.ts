@@ -7,6 +7,7 @@ import { db, schema } from '../db/index.js'
 import { mastra } from '../mastra/index.js'
 import { buildAgentRequestContext } from '../agents/context.js'
 import { getStoryboardPromptWriteReceipt } from '../agents/tools/storyboard-tools.js'
+import { finalizeEpisodeQuality } from './production-quality-breakdown.js'
 import { productionBlockingMessage } from './shot-planning.js'
 import { logTaskError, logTaskProgress, logTaskStart, logTaskSuccess } from '../utils/task-logger.js'
 
@@ -19,6 +20,8 @@ export interface VideoPromptBatchStatus {
   started_at: string
   finished_at?: string
   error?: string
+  quality?: Awaited<ReturnType<typeof finalizeEpisodeQuality>>
+  quality_error?: string
 }
 
 const tasks = new Map<number, VideoPromptBatchStatus>()
@@ -99,7 +102,12 @@ export async function startVideoPromptBatch(
       }
     }
   })()
-    .then(() => {
+    .then(async () => {
+      try { task.quality = await finalizeEpisodeQuality(episodeId, opts) }
+      catch (error: any) {
+        task.quality_error = error.message || '拆分质检未完成，请在评测中重新检查'
+        logTaskError('VideoPrompt', 'quality-finalization', { episodeId, error: task.quality_error })
+      }
       task.status = 'done'
       task.finished_at = new Date().toISOString()
       task.current_storyboard_id = undefined

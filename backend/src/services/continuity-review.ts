@@ -386,7 +386,7 @@ export function getContinuityReviewTask(versionId: number, taskId: number) {
   return serializeReviewTask(row, current)
 }
 
-export function listContinuityReviewTasks(versionId: number, pagination: unknown = {}) {
+export function listContinuityReviewTasks(versionId: number, pagination: unknown = {}, unpaged = false) {
   const { page, pageSize, status, keyword } = continuityReviewTaskPageSchema.parse(pagination)
   const timeline = normalizeTimeline(JSON.parse(versionRow(versionId).timelineJson))
   const settings = getContinuityReviewSettings()
@@ -418,7 +418,7 @@ export function listContinuityReviewTasks(versionId: number, pagination: unknown
     activeCount: summary.active,
     lowScore: rows.filter(row => currentInput(row) && row.status === 'completed'
       && (reviewTaskResult(row)?.overallScore ?? 100) < settings.threshold).length,
-    items: items.slice((page - 1) * pageSize, page * pageSize),
+    items: unpaged ? items : items.slice((page - 1) * pageSize, page * pageSize),
   }
 }
 

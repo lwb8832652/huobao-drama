@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { previsRequest, type AnimaticVersion, type Timeline } from '~/composables/usePrevis'
-import { continuityRisks, relevantContinuityEdges, evaluationTaskRow, type EvaluationTaskSettings, type ContinuityReviewStatus, type EvaluationTaskPage, type EvaluationTask, type EvaluationTaskFilter } from '~/composables/useContinuityReview'
+import { continuityRisks, relevantContinuityEdges, evaluationTaskRow, type EvaluationTaskSettings, type ContinuityReviewStatus, type EvaluationTaskPage, type AnyEvaluationTask, type EvaluationTaskFilter, type EvaluationTypeFilter } from '~/composables/useContinuityReview'
+import { useProductionQuality } from '~/composables/useProductionQuality'
 import QueueSettingsButton from '../QueueSettingsButton.vue'
 import EvaluationTaskList from './EvaluationTaskList.vue'
 import ContinuityReviewDetail from './ContinuityReviewDetail.vue'
+import PlanningQualityDetail from './PlanningQualityDetail.vue'
+import ProductionPlanPanel from './ProductionPlanPanel.vue'
 
 const props = defineProps<{
   version?: AnimaticVersion | null
@@ -13,7 +16,16 @@ const props = defineProps<{
   textModel?: { configId: number; model: string } | null
   save: () => Promise<boolean>
   dirty?: boolean
+  busy?: boolean
+  editable?: boolean
+  panelId?: number
+  applyQuality?: (version: AnimaticVersion) => Promise<void | boolean>
 }>()
+const emit = defineEmits<{ select: [panelId: number] }>()
+const quality = useProductionQuality({ version: () => props.version, save: () => props.save(), dirty: () => props.dirty, busy: () => props.busy,
+  model: () => props.textModel, applied: async version => props.applyQuality ? await props.applyQuality(version) : false })
+const planningSummary = quality.summary
+const ruleRepair = ref<InstanceType<typeof ProductionPlanPanel>>()
 const settings = ref<EvaluationTaskSettings>({ revision: 0, concurrency: 1, paused: false, enabled: false, threshold: 70, globalTotal: 6, stats: { active: 0, pending: 0 } })
 const concurrency = ref(1), paused = ref(false), settingsConflict = ref(false)
 const threshold = ref(70), enabled = ref(false), settingsLoaded = ref(false)
@@ -23,20 +35,23 @@ const dialog = ref<HTMLDialogElement>(), confirming = ref(false)
 const expanded = ref(false)
 const view = ref<'tasks' | 'detail' | 'create' | 'settings'>('tasks')
 const taskFilter = ref<EvaluationTaskFilter>('all'), keyword = ref('')
+const typeFilter = ref<EvaluationTypeFilter>('all'), createType = ref<'planning' | 'continuity'>('planning')
+const planningMode = ref<'rules' | 'ai'>('rules')
 const statusError = ref(''), statusLoaded = ref(false), settingsMessage = ref('')
 const taskMessage = ref('')
 const newReviewGroupId = ref('')
 const history = ref<EvaluationTaskPage>({ type: 'continuity', page: 1, pageSize: 20, total: 0, activeCount: 0, lowScore: 0, items: [] })
 const page = ref(1), selectedId = ref<number | null>(null), historyLoading = ref(false), historyError = ref('')
-const selectedRecord = ref<EvaluationTask | null>(null), detailError = ref(''), detailLoading = ref(false)
-const selected = computed(() => selectedRecord.value?.id === selectedId.value ? selectedRecord.value : history.value.items.find(item => item.id === selectedId.value))
+const selectedType = ref<'planning' | 'continuity'>('continuity')
+const selectedRecord = ref<AnyEvaluationTask | null>(null), detailError = ref(''), detailLoading = ref(false)
+const selected = computed(() => selectedRecord.value?.id === selectedId.value && selectedRecord.value?.type === selectedType.value ? selectedRecord.value : history.value.items.find(item => item.id === selectedId.value && item.type === selectedType.value))
 const taskRows = computed(() => history.value.items.map(item => evaluationTaskRow(item, settings.value.threshold)))
 const settingsDirty = computed(() => enabled.value !== settings.value.enabled || threshold.value !== settings.value.threshold || concurrency.value !== settings.value.concurrency || paused.value !== settings.value.paused)
 let historyToken = 0, detailToken = 0, settingsToken = 0, polling = false
 let correctingPage = false
 let searchTimer: ReturnType<typeof setTimeout> | undefined
-function selectTask(item: EvaluationTask) { selectedRecord.value = item; selectedId.value = item.id; detailError.value = ''; view.value = 'detail'; if (expanded.value) void loadSelectedTask() }
-function selectRow(key: string) { const item = history.value.items.find(item => String(item.id) === key); if (item) selectTask(item) }
+function selectTask(item: AnyEvaluationTask) { selectedRecord.value = item; selectedId.value = item.id; selectedType.value = item.type; detailError.value = ''; view.value = 'detail'; if (expanded.value) void loadSelectedTask() }
+function selectRow(key: string) { const item = history.value.items.find(item => `${item.type}:${item.id}` === key); if (item) selectTask(item) }
 const taskListScroll = ref(0)
 function backToTasks() { view.value = 'tasks' }
 function changeFilter(filter: EvaluationTaskFilter) {
@@ -45,13 +60,19 @@ function changeFilter(filter: EvaluationTaskFilter) {
   if (page.value !== 1) page.value = 1
   else void loadHistory()
 }
+function changeTypeFilter(filter: EvaluationTypeFilter) {
+  if (filter === typeFilter.value) return
+  typeFilter.value = filter; selectedId.value = null; view.value = 'tasks'
+  if (page.value !== 1) page.value = 1
+  else void loadHistory()
+}
 async function loadHistory() {
   const id = props.version?.id, token = ++historyToken
   if (!id) return
   historyLoading.value = true
   try {
-    const query = `page=${page.value}&pageSize=20&status=${taskFilter.value}&keyword=${encodeURIComponent(keyword.value.trim())}`
-    const result = await previsRequest<EvaluationTaskPage>(`/animatic-versions/${id}/continuity-review-tasks?${query}`)
+    const query = `page=${page.value}&pageSize=20&status=${taskFilter.value}&keyword=${encodeURIComponent(keyword.value.trim())}&type=${typeFilter.value}`
+    const result = await previsRequest<EvaluationTaskPage>(`/animatic-versions/${id}/evaluation-tasks?${query}`)
     if (disposed || token !== historyToken || id !== props.version?.id) return
     history.value = result; historyError.value = ''
     if (view.value === 'detail' && selectedId.value !== null) await loadSelectedTask()
@@ -65,20 +86,22 @@ async function loadHistory() {
   finally { if (token === historyToken) historyLoading.value = false }
 }
 async function loadSelectedTask() {
-  const versionId = props.version?.id, taskId = selectedId.value, token = ++detailToken
+  const versionId = props.version?.id, taskId = selectedId.value, taskType = selectedType.value, token = ++detailToken
   if (!versionId || taskId === null) return
   detailLoading.value = true
   try {
-    const item = await previsRequest<EvaluationTask>(`/animatic-versions/${versionId}/continuity-review-tasks/${taskId}`)
-    if (disposed || token !== detailToken || versionId !== props.version?.id || taskId !== selectedId.value) return
+    const path = taskType === 'planning' ? `production-quality/tasks/${taskId}` : `continuity-review-tasks/${taskId}`
+    const item = await previsRequest<AnyEvaluationTask>(`/animatic-versions/${versionId}/${path}`)
+    if (disposed || token !== detailToken || versionId !== props.version?.id || taskId !== selectedId.value || taskType !== selectedType.value) return
     selectedRecord.value = item; detailError.value = ''
   } catch (cause: any) {
-    if (!disposed && token === detailToken && versionId === props.version?.id && taskId === selectedId.value) detailError.value = cause.message || '读取任务详情失败'
+    if (!disposed && token === detailToken && versionId === props.version?.id && taskId === selectedId.value && taskType === selectedType.value) detailError.value = cause.message || '读取任务详情失败'
   } finally { if (token === detailToken) detailLoading.value = false }
 }
 const drawer = ref<HTMLElement>(), trigger = ref<HTMLButtonElement>()
 let originalBodyOverflow: string | undefined, lastTaskKey = ''
 function closeDrawer() { expanded.value = false }
+function locatePanel(panelId: number) { emit('select', panelId); closeDrawer() }
 function trapDrawerFocus(event: KeyboardEvent) {
   if (event.key !== 'Tab') return
   const nodes = Array.from(drawer.value?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex="0"]') || []).filter(node => node.getClientRects().length)
@@ -111,7 +134,7 @@ watch(view, async (current, previous) => {
   if (!expanded.value || !drawer.value) return
   if (previous === 'tasks') {
     taskListScroll.value = drawer.value.querySelector('.evaluation-records')?.scrollTop || 0
-    lastTaskKey = selectedId.value === null ? '' : String(selectedId.value)
+    lastTaskKey = selectedId.value === null ? '' : `${selectedType.value}:${selectedId.value}`
   }
   await nextTick()
   if (current === 'tasks') {
@@ -151,13 +174,44 @@ const retryDisabledReason = computed(() => {
   if (detailLoading.value) return '正在更新任务状态'
   if (detailError.value) return '详情查询失败，请刷新后再试'
   const item = selected.value
-  if (!item) return '请选择评测任务'
+  if (!item || item.type !== 'continuity') return '请选择连续性评测任务'
   if (!item.current) return '画面已变化，请通过「发起评测」检查当前镜头'
   return disabledReason(item.toGroupId)
 })
-async function retrySelected() { if (selected.value && !retryDisabledReason.value) await score(selected.value.toGroupId) }
-function openCreate() { view.value = 'create'; taskMessage.value = ''; newReviewGroupId.value = ''; void refresh().catch(() => {}) }
-async function refreshAll() { await Promise.all([loadHistory(), refresh().catch(() => {})]) }
+async function retrySelected() { if (selected.value?.type === 'continuity' && !retryDisabledReason.value) await score(selected.value.toGroupId) }
+function openCreate() { createType.value = typeFilter.value === 'continuity' ? 'continuity' : 'planning'; planningMode.value = 'rules'; view.value = 'create'; taskMessage.value = ''; newReviewGroupId.value = ''; void refresh().catch(() => {}) }
+async function refreshAll() { await Promise.all([loadHistory(), quality.refresh(), refresh().catch(() => {})]) }
+async function openPlanning() {
+  expanded.value = true
+  await nextTick()
+  changeTypeFilter('planning')
+  await quality.refresh()
+  if (disposed || !expanded.value) return
+  const current = quality.state.value?.latest?.kind === 'optimization' && quality.state.value.latest.current ? quality.state.value.latest : quality.state.value?.task
+  if (current) selectTask(current)
+  else { createType.value = 'planning'; planningMode.value = 'rules'; view.value = 'create' }
+}
+async function runQuality(action: 'check' | 'review') {
+  const id = props.version?.id
+  const task = await quality[action]()
+  if (disposed || id !== props.version?.id || !task) return
+  await loadHistory()
+  if (expanded.value) selectTask(task)
+}
+async function optimizeQuality(issueIds: string[]) {
+  if (selected.value?.type !== 'planning' || detailLoading.value || detailError.value) return
+  const selectedKey = `${selectedType.value}:${selectedId.value}`, id = props.version?.id
+  const task = await quality.optimize(selected.value, issueIds)
+  if (disposed || id !== props.version?.id || !task) return
+  await loadHistory()
+  if (expanded.value && selectedKey === `${selectedType.value}:${selectedId.value}`) selectTask(task)
+}
+async function applyQuality(confirmed: boolean) {
+  if (selected.value?.type !== 'planning' || detailLoading.value || detailError.value) return
+  if (await quality.apply(selected.value, confirmed)) { await refreshAll(); taskMessage.value = '候选已应用到新工作版。请重新检查并审阅画面。'; view.value = 'tasks' }
+}
+async function beforeRuleRepair() { if (!await props.save() || !props.version) return false; return { versionId: props.version.id, revision: props.version.revision } }
+async function applyRuleRepair(version: AnimaticVersion) { await props.applyQuality?.(version); await refreshAll() }
 let disposed = false, loadToken = 0, resolveConfirmation: ((ok: boolean) => void) | undefined
 function finish(ok = false) {
   const resolve = resolveConfirmation
@@ -278,16 +332,17 @@ void loadSettings()
 const timer = setInterval(async () => {
   if (disposed || busy.value || polling) return
   polling = true
-  try { await Promise.all([loadHistory(), refresh(), ...(expanded.value && view.value === 'settings' ? [loadSettings(false)] : [])]) }
+  try { await Promise.all([loadHistory(), refresh(), quality.refresh(), ...(expanded.value && view.value === 'settings' ? [loadSettings(false)] : [])]) }
   catch { /* refresh 已记录有效上下文的异常；历史异常由 loadHistory 记录。 */ }
   finally { polling = false }
 }, 4000)
 onUnmounted(() => { if (typeof window !== 'undefined') window.removeEventListener('keydown', handleDrawerKeys, true); disposed = true; ++settingsToken; ++loadToken; ++historyToken; ++detailToken; clearTimeout(searchTimer); clearInterval(timer); finish(false); if (typeof document !== 'undefined' && originalBodyOverflow !== undefined) document.body.style.overflow = originalBodyOverflow })
-defineExpose({ confirmGeneration, refresh })
+defineExpose({ confirmGeneration, refresh: refreshAll, openPlanning, planningSummary })
 </script>
 
 <template>
-  <section class="evaluation-entry" aria-label="连续性评测" data-testid="continuity-review-panel">
+  <section class="evaluation-entry" aria-label="分镜与连续性评测" data-testid="continuity-review-panel">
+    <ProductionPlanPanel ref="ruleRepair" headless :version="version || null" :panel-id="panelId" :editable="editable" :busy="props.busy || quality.busy.value" :before-action="beforeRuleRepair" @applied="applyRuleRepair" @select="locatePanel" />
     <button type="button" ref="trigger" class="btn evaluation-trigger" data-testid="evaluation-trigger" aria-haspopup="dialog" :aria-expanded="expanded" :title="historyError ? '评测状态查询异常' : '查看评测任务'" @click="expanded = !expanded">
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5H5v16h14V5h-4M9 3h6v4H9zM8 12h8M8 16h5" /></svg>
       评测 <span v-if="history.activeCount" class="evaluation-badge" role="status" :aria-label="`${history.activeCount} 项评测排队或执行中`">{{ history.activeCount }}</span><span v-if="historyError" class="evaluation-query-error" aria-label="状态查询异常">!</span>
@@ -299,12 +354,13 @@ defineExpose({ confirmGeneration, refresh })
             <div class="evaluation-head-title"><button v-if="view !== 'tasks'" class="evaluation-back evaluation-icon-button" type="button" aria-label="返回评测任务列表" @click="backToTasks"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m14 6-6 6 6 6" /></svg></button><span v-else class="evaluation-head-icon"><svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="5" y="4" width="14" height="17" rx="2" /><path d="M9 4V2h6v2M9 10h6m-6 4h6m-6 4h3" /></svg></span><div><h2 id="evaluation-title">{{ { tasks: '评测任务', detail: '任务详情', create: '发起评测', settings: '评测任务设置' }[view] }}</h2><p>{{ view === 'tasks' ? '查看评测进度与结果，点击任务查看详情' : view === 'settings' ? '全局设置 · 对所有项目生效' : view === 'create' ? '选择需要检查的镜头衔接' : '画面对比、评分与改进建议' }}</p></div></div>
             <div class="evaluation-head-actions"><template v-if="view === 'tasks'"><button class="evaluation-icon-button" type="button" :disabled="historyLoading" aria-label="刷新评测任务" title="刷新" @click="refreshAll"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" :class="{ spin: historyLoading }"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-1l2 6M4 12l2 6a7 7 0 0 0 12-1" /></svg></button><QueueSettingsButton label="评测任务设置" @click="view = 'settings'; settingsMessage = ''; loadSettings(false)" /><button class="evaluation-button primary evaluation-create" type="button" :disabled="!version" @click="openCreate"><span aria-hidden="true">+</span>发起评测</button></template><button type="button" class="evaluation-icon-button evaluation-close" aria-label="关闭评测抽屉" @click="closeDrawer"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m6 6 12 12M18 6 6 18" /></svg></button></div>
           </header>
-          <p v-if="error" role="alert" class="evaluation-notice">{{ error }}</p>
+          <p v-if="error || quality.error.value" role="alert" class="evaluation-notice">{{ error || quality.error.value }}</p>
           <p v-if="view === 'tasks' && taskMessage" role="status" class="evaluation-notice is-success">{{ taskMessage }}</p>
           <p v-if="view === 'detail' && detailError" role="alert" class="evaluation-notice">{{ detailError }} · 暂时显示上次读取的详情<button type="button" @click="loadSelectedTask">重新加载</button></p>
           <p v-if="dirty" class="evaluation-notice">有未保存的修改，发起评测和生成视频前会先保存并检查当前画面。</p>
-          <EvaluationTaskList v-if="view === 'tasks'" :items="taskRows" :total="history.total" :summary="history.summary" :active-count="history.activeCount" :page="page" :page-size="history.pageSize" :filter="taskFilter" :keyword="keyword" :loading="historyLoading" :error="historyError" :can-create="!!version" @select="selectRow" @filter="changeFilter" @search="keyword = $event" @page="page = $event" @refresh="loadHistory" @create="openCreate" />
-          <ContinuityReviewDetail v-else-if="view === 'detail' && selected" :key="selected.id" :item="selected" :threshold="settings.threshold" :retry-disabled-reason="retryDisabledReason" :busy="busy || confirming" @retry="retrySelected" @changed="refreshAll" />
+          <EvaluationTaskList v-if="view === 'tasks'" :items="taskRows" :total="history.total" :summary="history.summary" :active-count="history.activeCount" :page="page" :page-size="history.pageSize" :filter="taskFilter" :type-filter="typeFilter" :keyword="keyword" :loading="historyLoading" :error="historyError" :can-create="!!version" @select="selectRow" @filter="changeFilter" @type="changeTypeFilter" @search="keyword = $event" @page="page = $event" @refresh="loadHistory" @create="openCreate" />
+          <PlanningQualityDetail v-else-if="view === 'detail' && selected?.type === 'planning'" :key="`planning:${selected.id}`" :item="selected" :version="version" :panel-id="panelId" :editable="editable" :busy="quality.busy.value || !!props.busy" :optimize-disabled-reason="detailLoading ? '正在读取当前任务' : detailError || quality.optimizeReason(selected)" :apply-disabled-reason="detailLoading ? '正在读取当前候选' : detailError || quality.applyReason(selected)" @optimize="optimizeQuality" @apply="applyQuality" @check="runQuality('check')" @review="runQuality('review')" @select="locatePanel" @changed="refreshAll"><template #rule-repair><button type="button" class="btn btn-sm" :disabled="!version || !editable || props.busy || quality.busy.value" @click="ruleRepair?.openDialog()">规则修复预览 · 免费</button></template></PlanningQualityDetail>
+          <ContinuityReviewDetail v-else-if="view === 'detail' && selected?.type === 'continuity'" :key="`continuity:${selected.id}`" :item="selected" :threshold="settings.threshold" :retry-disabled-reason="retryDisabledReason" :busy="busy || confirming" @retry="retrySelected" @changed="refreshAll" />
           <div v-else-if="view === 'settings'" class="evaluation-form" data-testid="evaluation-settings">
             <div class="evaluation-form-intro"><span class="evaluation-type-chip">全局设置 · 对所有项目生效</span><h3>评测任务设置</h3><p>手动与自动评测共享并发。后台任务总并发 {{ settings.globalTotal }}（只读），在任务设置中调整；服务商配额组也可能约束评测。</p><p>全局评测执行 {{ settings.stats.byKind?.evaluation?.active ?? settings.stats.active }} / {{ settings.concurrency }} · 排队 {{ settings.stats.byKind?.evaluation?.pending ?? settings.stats.pending }}</p><p v-if="(settings.stats.byKind?.evaluation?.active ?? settings.stats.active) > settings.concurrency">等待已有任务完成</p></div>
             <p v-if="settingsConflict" class="evaluation-notice" role="alert">草稿已保留<button type="button" @click="loadSettings()">舍弃草稿并重新载入</button></p>
@@ -316,6 +372,14 @@ defineExpose({ confirmGeneration, refresh })
             <div class="evaluation-form-footer"><span v-if="!settingsLoaded" class="evaluation-form-muted">设置未载入<button type="button" class="evaluation-button" @click="loadSettings()">重新加载</button></span><span v-else-if="settingsMessage && !settingsDirty" class="evaluation-success" role="status">✓ {{ settingsMessage }}</span><span v-else-if="settingsDirty" class="evaluation-form-muted">设置尚未保存</span><span v-else class="evaluation-form-muted">当前设置已生效</span><button type="button" class="evaluation-button primary" :disabled="!settingsLoaded || savingSettings || !settingsDirty || settingsConflict" @click="saveSettings">{{ savingSettings ? '保存中…' : '保存设置' }}</button></div>
           </div>
           <div v-else-if="view === 'create'" class="evaluation-form evaluation-new" data-testid="evaluation-create-form">
+            <div class="evaluation-create-types" role="group" aria-label="选择评测类型"><button type="button" class="evaluation-button" :aria-pressed="createType === 'planning'" @click="createType = 'planning'">分镜规划质量</button><button type="button" class="evaluation-button" :aria-pressed="createType === 'continuity'" @click="createType = 'continuity'">连续性评测</button></div>
+            <template v-if="createType === 'planning'">
+              <div class="evaluation-form-intro"><span class="evaluation-type-chip">分镜规划质量</span><h3>检查对白、时间与镜头规划</h3><p>从原剧本核对对白完整性、表演时长、画面覆盖与衔接，生成的问题可单独选择后优化。</p></div>
+              <div class="evaluation-planning-modes"><label><input v-model="planningMode" type="radio" value="rules" :disabled="quality.busy.value">规则检查 · 免费</label><p>检查文字与时间规则，不调用模型。</p><label><input v-model="planningMode" type="radio" value="ai" :disabled="quality.busy.value">AI 评测 · 手动发起</label><p>结合剧本与相邻镜头评估五个维度，使用 {{ textModel?.model || '当前文本模型' }}，会产生模型调用费用。</p></div>
+              <p v-if="quality.state.value" class="evaluation-form-muted">当前规则检查：{{ quality.state.value.rules.summary }}</p>
+              <div class="evaluation-form-footer"><span class="evaluation-form-muted">先保存内容，再检查当前工作版</span><button type="button" class="evaluation-button primary" :disabled="!version || props.busy || quality.busy.value || (planningMode === 'ai' && !textModel)" @click="runQuality(planningMode === 'rules' ? 'check' : 'review')">{{ quality.busy.value ? '正在提交…' : planningMode === 'rules' ? '开始规则检查' : '加入 AI 评测队列' }}</button></div>
+            </template>
+            <template v-else>
             <div class="evaluation-form-intro"><span class="evaluation-type-chip">连续性评测</span><h3>检查前后镜头是否接得上</h3><p>对比前镜头的结束画面与后镜头的起始画面，检查人物、场景、动作和构图。</p></div>
             <p v-if="statusError" class="evaluation-notice" role="alert">{{ statusError }}<button type="button" @click="refreshAll">重新加载</button></p>
             <p v-if="!statusLoaded && !statusError" class="evaluation-form-muted" role="status">正在读取镜头衔接…</p>
@@ -323,6 +387,7 @@ defineExpose({ confirmGeneration, refresh })
             <div v-else class="evaluation-form-empty"><strong>暂无可评测的镜头衔接</strong><p>请先规划相邻镜头，并生成两侧的边界画面。</p></div>
             <div class="evaluation-form-info"><strong>使用模型</strong><p>{{ textModel?.model || '请先选择支持视觉的文本模型' }}</p><p>每次开始会产生模型调用费用。内容会先保存，再对当前画面发起评测。</p></div>
             <div class="evaluation-form-footer"><span class="evaluation-form-muted">{{ newReviewGroupId ? disabledReason(newReviewGroupId) || '已选择 1 项衔接' : '请选择要评测的镜头衔接' }}</span><button type="button" class="evaluation-button primary" :disabled="!newReviewGroupId || busy || confirming || !!disabledReason(newReviewGroupId)" @click="score(newReviewGroupId)">{{ busy ? '正在提交…' : '加入评测队列' }}</button></div>
+            </template>
           </div>
           <slot />
         </aside>
@@ -339,6 +404,7 @@ defineExpose({ confirmGeneration, refresh })
 
 <style scoped>
 .evaluation-entry { display: inline-flex; flex-shrink: 0; }
+.evaluation-create-types{display:flex;gap:8px;margin-bottom:24px}.evaluation-create-types button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent-text);background:var(--accent-bg)}.evaluation-planning-modes{display:grid;gap:9px}.evaluation-planning-modes label{display:flex;align-items:center;gap:8px;font-size:12px}.evaluation-planning-modes p{margin:0 0 18px 24px}
 .evaluation-trigger { position: relative; gap: 6px; white-space: nowrap; }
 .evaluation-trigger:focus-visible { outline: none; box-shadow: 0 0 0 3.5px var(--button-focus); }
 .evaluation-badge { min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px; background: var(--accent); color: var(--action-primary-text, #fff); font-size: 10px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; line-height: 1; font-variant-numeric: tabular-nums; }
