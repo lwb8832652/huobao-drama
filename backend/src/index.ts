@@ -109,7 +109,7 @@ const stopQueue = await startTaskQueueWorker(async () => {
   await recoverPrevisTasks()
   await migrateContinuityQueue()
   await migrateFramePlanQueue()
-  migrateContactSheetQueue()
+  ;await migrateContactSheetQueue()
   await migrateVideoMergeQueue()
 })
 process.once('exit', stopQueue)

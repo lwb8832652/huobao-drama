@@ -1,6 +1,6 @@
 import { hasGridTask } from './previs-grid.js'
 import { and, eq, gt, inArray } from 'drizzle-orm'
-import { db, schema } from '../db/index.js'
+import { db, getInsertId, schema } from '../db/index.js'
 import { getActiveConfigId, getConfigById } from './ai.js'
 import { getImageAdapter, getVideoAdapter } from './adapters/registry.js'
 import { generateImage, generateVideo, recoverPrevisTasks, startQueuedPrevisTask, cancelUnsubmittedPrevisTask } from './generation.js'
@@ -90,8 +90,8 @@ export function videoInputs(
   }
 }
 export async function createBatch(versionId: number, options: BatchOptions) {
-  const row = versionRow(versionId)
-  const ep = episodeForPrevis(row.episodeId)
+  const row = (await versionRow(versionId))
+  const ep = (await episodeForPrevis(row.episodeId))
   const raw = JSON.parse(row.timelineJson)
   const t = normalizeTimeline(raw)
   if (row.revision !== options.revision) throw new PrevisError('版本已更新，请刷新后生成', 409)
@@ -101,9 +101,9 @@ export async function createBatch(versionId: number, options: BatchOptions) {
   }
   if (row.status === 'locked' && row.contentHash !== hashContent(raw)) throw new PrevisError('锁定版本内容校验失败', 409)
   if (options.type === 'image') {
-    requireEditable(versionId, options.revision)
+    ;await requireEditable(versionId, options.revision)
     if (t.panels.some(p => (!options.panelIds?.length || options.panelIds.includes(p.id)) && p.framePlanNeedsReview)) throw new PrevisError('时序已调整，请先重新规划并审阅画面后生成图片')
-    if (hasGridTask(versionId, options.panelIds)) throw new PrevisError('所选分镜正在生成宫格，请等待或取消后再逐张生成', 409)
+    if ((await hasGridTask(versionId, options.panelIds))) throw new PrevisError('所选分镜正在生成宫格，请等待或取消后再逐张生成', 409)
   }
   if (options.type === 'video' && options.generationMode === 'storyboard_frames') {
     const oversized = t.panels.find(panel => (!options.panelIds?.length || options.panelIds.includes(panel.id))
@@ -111,7 +111,7 @@ export async function createBatch(versionId: number, options: BatchOptions) {
     if (oversized) throw new PrevisError(`「${oversized.title}」共有 ${oversized.frames.length} 张分镜画面，最多支持 ${FRAME_COUNT_MAX} 张，请先删减画面再生成视频`)
   }
   const configId = options.configId || (options.type === 'image' ? ep.imageConfigId : ep.videoConfigId) || await getActiveConfigId(options.type)
-  const configRow = configId ? db.select().from(schema.aiServiceConfigs).where(eq(schema.aiServiceConfigs.id, configId)).get() : null
+  const configRow = configId ? (await db.select().from(schema.aiServiceConfigs).where(eq(schema.aiServiceConfigs.id, configId)).get()) : null
   if (!configRow?.isActive || configRow.serviceType !== options.type) throw new PrevisError(`请先在设置中启用${options.type === 'image' ? '图片' : '视频'}模型`)
   const config = await getConfigById(configRow.id)
   if (!config) throw new PrevisError('生成模型配置不可用')
@@ -119,7 +119,7 @@ export async function createBatch(versionId: number, options: BatchOptions) {
   const generationMode = options.generationMode || 'storyboard_frames'
   const allowedModels: string[] = JSON.parse(configRow.model || '[]')
   if (!allowedModels.includes(model)) throw new PrevisError('所选模型不属于当前服务配置')
-  const drama = db.select().from(schema.dramas).where(eq(schema.dramas.id, ep.dramaId)).get()
+  const drama = (await db.select().from(schema.dramas).where(eq(schema.dramas.id, ep.dramaId)).get())
   const style = await getDramaStylePrompt(ep.dramaId)
   const items: { groupId: string; panelId: number | null; frameType: FrameType | null; requestJson: string }[] = []
   if (options.panelIds?.some(id => !t.panels.some(p => p.id === id))) throw new PrevisError('选择的分镜不属于当前版本')
@@ -128,7 +128,7 @@ export async function createBatch(versionId: number, options: BatchOptions) {
   const selectedIds = t.groups.flatMap(group => group.panelIds).filter(id => !options.panelIds?.length || options.panelIds.includes(id))
   const groups = generationScope === 'group' ? [{ id: `selection-${selectedIds.join('-')}`, title: '所选分镜', note: '', panelIds: selectedIds, entry: {}, exit: {} }] : t.groups
   const frozenSources = new Map<string, Promise<{ url: string; digest: string }>>()
-  const freezeSource = (url: string) => {
+  const freezeSource = async (url: string) => {
     const canonical = /^\/?static\//.test(url) ? `/${url.replace(/^\//, '')}` : url
     if (!frozenSources.has(canonical)) frozenSources.set(canonical, freezeReferenceMedia(url))
     return frozenSources.get(canonical)!
@@ -235,50 +235,50 @@ export async function createBatch(versionId: number, options: BatchOptions) {
     ? '没有可生成的视频镜头'
     : '没有需要生成的画面；请先添加画面，已有图片会自动跳过')
   const baseHash = hashContent({ type: options.type, configId, model, items })
-  const prior = db.select().from(schema.batchRuns)
-    .where(and(eq(schema.batchRuns.versionId, versionId), eq(schema.batchRuns.requestHash, baseHash))).get()
+  const prior = (await db.select().from(schema.batchRuns)
+    .where(and(eq(schema.batchRuns.versionId, versionId), eq(schema.batchRuns.requestHash, baseHash))).get())
   // Rapid duplicate clicks share an active batch. Once it finishes, the same inputs may be regenerated.
   const requestHash = prior && !['pending', 'processing'].includes(prior.status)
     ? hashContent({ baseHash, afterBatch: prior.id, requestedAt: now() })
     : baseHash
-  db.transaction(tx => {
+  await db.transaction(async tx => {
     // Config lookup above is asynchronous; recheck revision and locks inside the write transaction.
     if (options.type === 'image') {
-      requireEditable(versionId, options.revision)
-      if (hasGridTask(versionId, options.panelIds)) throw new PrevisError('所选分镜正在生成宫格，请等待或取消后再逐张生成', 409)
+      ;await requireEditable(versionId, options.revision)
+      if ((await hasGridTask(versionId, options.panelIds))) throw new PrevisError('所选分镜正在生成宫格，请等待或取消后再逐张生成', 409)
     }
     else {
-      if (versionRow(versionId).revision !== options.revision) throw new PrevisError('版本已更新，请刷新后生成', 409)
-      const currentDrama = tx.select().from(schema.dramas).where(eq(schema.dramas.id, ep.dramaId)).get()
+      if ((await versionRow(versionId)).revision !== options.revision) throw new PrevisError('版本已更新，请刷新后生成', 409)
+      const currentDrama = (await tx.select().from(schema.dramas).where(eq(schema.dramas.id, ep.dramaId)).get())
       if ((currentDrama?.aspectRatio || '16:9') !== (drama?.aspectRatio || '16:9')) throw new PrevisError('项目画布比例已更新，请刷新后生成', 409)
     }
-    if (tx.select().from(schema.batchRuns).where(and(eq(schema.batchRuns.versionId, versionId), eq(schema.batchRuns.requestHash, requestHash))).get()) return
-    const batchId = Number(tx.insert(schema.batchRuns).values({
+    if ((await tx.select().from(schema.batchRuns).where(and(eq(schema.batchRuns.versionId, versionId), eq(schema.batchRuns.requestHash, requestHash))).get())) return
+    const batchId = getInsertId(await tx.insert(schema.batchRuns).values({
       versionId, type: options.type, requestHash, configId: configRow.id, model, createdAt: now(),
-    }).run().lastInsertRowid)
-    for (const item of items) tx.insert(schema.batchRunItems).values({ ...item, batchId }).run()
+    }).run())
+    for (const item of items) await tx.insert(schema.batchRunItems).values({ ...item, batchId }).run()
   })
   void tickPrevisBatches().catch(e => console.error('Previs worker:', e.message))
-  return getVersion(versionId)
+  return (await getVersion(versionId))
 }
 
 /** Completion binding is guarded by the version and batch item, so later drafts cannot be overwritten. */
-function reconcile() {
-  const activeBatches = db.select().from(schema.batchRuns)
-    .where(inArray(schema.batchRuns.status, ['pending', 'processing'])).all()
-  const processingItems = db.select().from(schema.batchRunItems)
-    .where(inArray(schema.batchRunItems.status, ['pending', 'processing'])).all().filter(item => item.taskId)
+async function reconcile() {
+  const activeBatches = (await db.select().from(schema.batchRuns)
+    .where(inArray(schema.batchRuns.status, ['pending', 'processing'])).all())
+  const processingItems = (await db.select().from(schema.batchRunItems)
+    .where(inArray(schema.batchRunItems.status, ['pending', 'processing'])).all()).filter(item => item.taskId)
   const knownBatchIds = new Set(activeBatches.map(batch => batch.id))
   const missingBatchIds = [...new Set(processingItems
     .map(item => item.batchId)
     .filter(batchId => !knownBatchIds.has(batchId)))]
   const batches = missingBatchIds.length
-    ? [...activeBatches, ...db.select().from(schema.batchRuns).where(inArray(schema.batchRuns.id, missingBatchIds)).all()]
+    ? [...activeBatches, ...(await db.select().from(schema.batchRuns).where(inArray(schema.batchRuns.id, missingBatchIds)).all())]
     : activeBatches
   if (!batches.length) return
   const batchById = new Map(batches.map(batch => [batch.id, batch]))
-  const items = db.select().from(schema.batchRunItems)
-    .where(inArray(schema.batchRunItems.batchId, batches.map(batch => batch.id))).all()
+  const items = (await db.select().from(schema.batchRunItems)
+    .where(inArray(schema.batchRunItems.batchId, batches.map(batch => batch.id))).all())
   const itemsByBatch = new Map<number, typeof items>()
   for (const item of items) {
     const group = itemsByBatch.get(item.batchId) || []
@@ -287,7 +287,7 @@ function reconcile() {
   }
   const taskIds = [...new Set(processingItems.flatMap(item => item.taskId ? [item.taskId] : []))]
   const tasks = taskIds.length
-    ? db.select().from(schema.sysTask).where(inArray(schema.sysTask.id, taskIds)).all()
+    ? (await db.select().from(schema.sysTask).where(inArray(schema.sysTask.id, taskIds)).all())
     : []
   const taskById = new Map(tasks.map(task => [task.id, task]))
   const completedFloor = new Map<string, number>()
@@ -299,11 +299,11 @@ function reconcile() {
   }
   type SiblingItem = Pick<typeof schema.batchRunItems.$inferSelect, 'id' | 'panelId' | 'frameType' | 'requestJson'>
   const siblingCache = new Map<string, SiblingItem[]>()
-  const siblingsFor = (batch: typeof schema.batchRuns.$inferSelect) => {
+  const siblingsFor = async (batch: typeof schema.batchRuns.$inferSelect) => {
     const key = `${batch.versionId}:${batch.type}`
     const cached = siblingCache.get(key)
     if (cached) return cached
-    const siblings = db.select({
+    const siblings = (await db.select({
       id: schema.batchRunItems.id,
       panelId: schema.batchRunItems.panelId,
       frameType: schema.batchRunItems.frameType,
@@ -315,7 +315,7 @@ function reconcile() {
       eq(schema.batchRuns.versionId, batch.versionId),
       eq(schema.batchRuns.type, batch.type),
       gt(schema.batchRunItems.id, completedFloor.get(key) || 0),
-    )).all()
+    )).all())
     siblingCache.set(key, siblings)
     return siblings
   }
@@ -324,14 +324,14 @@ function reconcile() {
     for (const item of batchItems.filter(i => i.taskId && ['pending', 'processing'].includes(i.status || ''))) {
       const task = item.taskId ? taskById.get(item.taskId) : null
       if (task && ['pending', 'processing'].includes(task.status || '') && item.status !== task.status) {
-        db.update(schema.batchRunItems).set({ status: task.status! }).where(eq(schema.batchRunItems.id, item.id)).run()
+        await db.update(schema.batchRunItems).set({ status: task.status! }).where(eq(schema.batchRunItems.id, item.id)).run()
         item.status = task.status!
       }
       if (!task || !['completed', 'failed', 'cancelled'].includes(task.status || '')) continue
-      const siblings = task.status === 'completed' ? siblingsFor(batch) : []
-      db.transaction(tx => {
+      const siblings = task.status === 'completed' ? (await siblingsFor(batch)) : []
+      await db.transaction(async tx => {
         if (task.status === 'completed') {
-          const row = tx.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, batch.versionId)).get()
+          const row = (await tx.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, batch.versionId)).get())
           if (row) {
             const timeline = normalizeTimeline(JSON.parse(row.timelineJson))
             const request = JSON.parse(item.requestJson)
@@ -362,20 +362,20 @@ function reconcile() {
                 const r = JSON.parse(i.requestJson)
                 return i.id > item.id && (r.panelIds || (i.panelId ? [i.panelId] : [])).includes(panel.id)
               })
-              if (!newer && (!request.videoContinuity || videoContinuityMatchesTimeline(request.videoContinuity, timeline, [panel])) && (!request.referenceInput || videoReferenceMatchesSource(row.id, request.referenceInput, [panel])) && (!request.inputHash || request.inputHash === videoFingerprint(
+              if (!newer && (!request.videoContinuity || videoContinuityMatchesTimeline(request.videoContinuity, timeline, [panel])) && (!request.referenceInput || (await videoReferenceMatchesSource(row.id, request.referenceInput, [panel]))) && (!request.inputHash || request.inputHash === videoFingerprint(
                 timeline, [panel], request.generationMode || 'storyboard_frames', request.referenceInput, request.videoContinuity,
               ))) {
                 if (row.status !== 'locked') { panel.videoUrl = url; changed = true }
-                if (isCurrentVersion(row.id)) tx.update(schema.storyboards).set({ videoUrl: url, updatedAt: now() })
+                if ((await isCurrentVersion(row.id))) await tx.update(schema.storyboards).set({ videoUrl: url, updatedAt: now() })
                   .where(eq(schema.storyboards.id, panel.id)).run()
               }
             }
             if (changed) {
-              tx.update(schema.animaticVersions).set({ timelineJson: JSON.stringify(timeline), revision: row.revision + 1, status: 'draft', contentHash: null, updatedAt: now() })
+              await tx.update(schema.animaticVersions).set({ timelineJson: JSON.stringify(timeline), revision: row.revision + 1, status: 'draft', contentHash: null, updatedAt: now() })
                 .where(eq(schema.animaticVersions.id, row.id)).run()
-              if (batch.type === 'image' && panel && isCurrentVersion(row.id)) {
+              if (batch.type === 'image' && panel && (await isCurrentVersion(row.id))) {
                 const cover = panel.frames.find(f => frameKey(f) === panel.coverFrameId && f.url) || panel.frames.find(f => f.url)
-                tx.update(schema.storyboards).set({
+                ;await tx.update(schema.storyboards).set({
                   composedImage: cover?.url || null,
                   firstFrameImage: panel.frames.find(f => f.type === 'start')?.url || null,
                   lastFrameImage: panel.frames.find(f => f.type === 'end')?.url || null,
@@ -383,13 +383,13 @@ function reconcile() {
                 }).where(eq(schema.storyboards.id, panel.id)).run()
               }
               if (batch.type === 'image') {
-                scheduleContactSheets(row.id)
-                scheduleContinuityReviews(row.id, panel ? [panel.id] : undefined)
+                ;await scheduleContactSheets(row.id)
+                ;await scheduleContinuityReviews(row.id, panel ? [panel.id] : undefined)
               }
             }
           }
         }
-        tx.update(schema.batchRunItems).set({ status: task.status!, error: task.errorMsg }).where(eq(schema.batchRunItems.id, item.id)).run()
+        await tx.update(schema.batchRunItems).set({ status: task.status!, error: task.errorMsg }).where(eq(schema.batchRunItems.id, item.id)).run()
       })
       item.status = task.status!
       item.error = task.errorMsg
@@ -398,7 +398,7 @@ function reconcile() {
     const status = batch.status === 'cancelled' ? 'cancelled'
       : states.some(s => s === 'pending' || s === 'processing') ? 'processing'
       : states.some(s => s === 'failed') ? 'partial_failed' : 'completed'
-    if (status !== batch.status) db.update(schema.batchRuns).set({ status }).where(eq(schema.batchRuns.id, batch.id)).run()
+    if (status !== batch.status) await db.update(schema.batchRuns).set({ status }).where(eq(schema.batchRuns.id, batch.id)).run()
   }
 }
 let ticking = false
@@ -406,21 +406,22 @@ export async function tickPrevisBatches() {
   if (ticking) return
   ticking = true
   try {
-    reconcile()
+    ;await reconcile()
     // Shared configuration slots may leave linked tasks pending. Retry their
     // existing IDs each tick; never recreate a paid job when a slot frees up.
-    for (const item of db.select().from(schema.batchRunItems)
-      .where(inArray(schema.batchRunItems.status, ['pending', 'processing'])).all().filter(item => item.taskId)) {
+    const activeItems = await db.select().from(schema.batchRunItems)
+      .where(inArray(schema.batchRunItems.status, ['pending', 'processing'])).all()
+    for (const item of activeItems.filter(item => item.taskId)) {
       await startQueuedPrevisTask(item.taskId!)
     }
-    const batches = db.select().from(schema.batchRuns)
-      .where(inArray(schema.batchRuns.status, ['pending', 'processing'])).all()
+    const batches = (await db.select().from(schema.batchRuns)
+      .where(inArray(schema.batchRuns.status, ['pending', 'processing'])).all())
     const batchIds = batches.map(batch => batch.id)
     const pendingItems = batchIds.length
-      ? db.select().from(schema.batchRunItems).where(and(
+      ? (await db.select().from(schema.batchRunItems).where(and(
         inArray(schema.batchRunItems.batchId, batchIds),
         eq(schema.batchRunItems.status, 'pending'),
-      )).all()
+      )).all())
       : []
     const pendingByBatch = new Map<number, typeof pendingItems>()
     for (const item of pendingItems.filter(item => !item.taskId)) {
@@ -430,41 +431,41 @@ export async function tickPrevisBatches() {
     }
     const itemKeys = pendingItems.map(item => `${item.id}:${item.attempt}`)
     const existingTasks = itemKeys.length
-      ? db.select().from(schema.sysTask).where(inArray(schema.sysTask.previsItemKey, itemKeys)).all()
+      ? (await db.select().from(schema.sysTask).where(inArray(schema.sysTask.previsItemKey, itemKeys)).all())
       : []
     const existingTaskByKey = new Map(existingTasks.map(task => [task.previsItemKey, task]))
     for (const batch of batches) {
       for (const item of pendingByBatch.get(batch.id) || []) {
-        if (db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, batch.id)).get()?.status === 'cancelled') break
-        if (db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, item.id)).get()?.status !== 'pending') continue
+        if ((await db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, batch.id)).get())?.status === 'cancelled') break
+        if ((await db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, item.id)).get())?.status !== 'pending') continue
         try {
           const itemKey = `${item.id}:${item.attempt}`
           const existing = existingTaskByKey.get(itemKey)
           const request = { ...JSON.parse(item.requestJson), previs: { versionId: batch.versionId, itemKey } }
-          const taskId = existing?.id || await (batch.type === 'image' ? generateImage(request) : generateVideo(request))
-          const latestItem = db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, item.id)).get()
-          const latestBatch = db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, batch.id)).get()
+          const taskId = existing?.id || await (batch.type === 'image' ? (await generateImage(request)) : (await generateVideo(request)))
+          const latestItem = (await db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, item.id)).get())
+          const latestBatch = (await db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, batch.id)).get())
           if (latestItem?.status !== 'pending' || latestBatch?.status === 'cancelled') {
-            cancelUnsubmittedPrevisTask(taskId)
+            ;await cancelUnsubmittedPrevisTask(taskId)
             continue
           }
-          db.update(schema.batchRunItems).set({ taskId, status: 'pending' }).where(eq(schema.batchRunItems.id, item.id)).run()
+          await db.update(schema.batchRunItems).set({ taskId, status: 'pending' }).where(eq(schema.batchRunItems.id, item.id)).run()
           await startQueuedPrevisTask(taskId)
         } catch (e: any) {
-          db.update(schema.batchRunItems).set({ status: 'failed', error: e.message }).where(eq(schema.batchRunItems.id, item.id)).run()
+          await db.update(schema.batchRunItems).set({ status: 'failed', error: e.message }).where(eq(schema.batchRunItems.id, item.id)).run()
         }
       }
     }
-    reconcile()
+    ;await reconcile()
   } finally { ticking = false }
 }
-export function updateBatch(batchId: number, action: 'retry' | 'cancel', itemIds?: number[]) {
-  const batch = db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, batchId)).get()
+export async function updateBatch(batchId: number, action: 'retry' | 'cancel', itemIds?: number[]) {
+  const batch = (await db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, batchId)).get())
   if (!batch) throw new PrevisError('批次不存在', 404)
-  const row = versionRow(batch.versionId)
-  if (action === 'retry' && batch.type === 'image') requireEditable(row.id, row.revision)
-  db.transaction(tx => {
-    const items = tx.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.batchId, batchId)).all()
+  const row = (await versionRow(batch.versionId))
+  if (action === 'retry' && batch.type === 'image') await requireEditable(row.id, row.revision)
+  await db.transaction(async tx => {
+    const items = (await tx.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.batchId, batchId)).all())
     if (action === 'retry' && batch.type === 'image') {
       const timeline = normalizeTimeline(JSON.parse(row.timelineJson))
       for (const item of items.filter(item => item.status === 'failed' && (!itemIds?.length || itemIds.includes(item.id)))) {
@@ -474,37 +475,38 @@ export function updateBatch(batchId: number, action: 'retry' | 'cancel', itemIds
         if (frame?.locked) throw new PrevisError('画面已锁定，请解除画面锁定后再重试', 409)
       }
     }
-    if(action==='retry'&&batch.type==='image'&&hasGridTask(row.id,items.filter(i=>i.status==='failed'&&(!itemIds?.length||itemIds.includes(i.id))).flatMap(i=>i.panelId?[i.panelId]:[]))) {
+    if(action==='retry'&&batch.type==='image'&&(await hasGridTask(row.id,items.filter(i=>i.status==='failed'&&(!itemIds?.length||itemIds.includes(i.id))).flatMap(i=>i.panelId?[i.panelId]:[])))) {
       throw new PrevisError('该分镜正在生成宫格，请等待或取消后重试逐张生图',409)
     }
     for (const item of items) {
       if (itemIds?.length && !itemIds.includes(item.id)) continue
       if (action === 'retry' && item.status === 'failed') {
-        const task = item.taskId ? tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, item.taskId)).get() : null
-        const job = task ? getQueueJob('sys_task', task.id) : null
+        const task = item.taskId ? (await tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, item.taskId)).get()) : null
+        const job = task ? (await getQueueJob('sys_task', task.id)) : null
         const localRetry = !!(task && (task.resultUrl || task.localPath) && job?.status === 'failed')
-        tx.update(schema.batchRunItems).set({ status: 'pending', error: null,
+        ;await tx.update(schema.batchRunItems).set({ status: 'pending', error: null,
           taskId: localRetry ? item.taskId : null, attempt: localRetry ? item.attempt : item.attempt + 1 })
           .where(eq(schema.batchRunItems.id, item.id)).run()
-        if (localRetry) retryQueueJob(job!.id)
+        if (localRetry) (await retryQueueJob(job!.id))
       }
-      if (action === 'cancel' && item.status === 'pending') tx.update(schema.batchRunItems)
+      if (action === 'cancel' && item.status === 'pending') await tx.update(schema.batchRunItems)
         .set({ status: 'cancelled' }).where(eq(schema.batchRunItems.id, item.id)).run()
       if (action === 'cancel' && ['pending', 'processing'].includes(item.status || '') && item.taskId) {
-        cancelUnsubmittedPrevisTask(item.taskId)
-        if (tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, item.taskId)).get()?.status === 'cancelled')
-          tx.update(schema.batchRunItems).set({ status: 'cancelled' }).where(eq(schema.batchRunItems.id, item.id)).run()
+        ;await cancelUnsubmittedPrevisTask(item.taskId)
+        if ((await tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, item.taskId)).get())?.status === 'cancelled')
+          await tx.update(schema.batchRunItems).set({ status: 'cancelled' }).where(eq(schema.batchRunItems.id, item.id)).run()
       }
     }
-    tx.update(schema.batchRuns).set({ status: action === 'cancel' ? 'cancelled' : 'pending' }).where(eq(schema.batchRuns.id, batchId)).run()
+    await tx.update(schema.batchRuns).set({ status: action === 'cancel' ? 'cancelled' : 'pending' }).where(eq(schema.batchRuns.id, batchId)).run()
   })
-  return readBatches(batch.versionId).find(b => b.id === batchId)
+  return (await readBatches(batch.versionId)).find(b => b.id === batchId)
 }
 export async function startPrevisWorker() {
   await recoverPrevisTasks()
   // A crash can leave a linked but not yet started task. Resume these without creating a new task.
-  for (const item of db.select().from(schema.batchRunItems)
-    .where(inArray(schema.batchRunItems.status, ['pending', 'processing'])).all().filter(item => item.taskId)) {
+  const linkedItems = await db.select().from(schema.batchRunItems)
+    .where(inArray(schema.batchRunItems.status, ['pending', 'processing'])).all()
+  for (const item of linkedItems.filter(item => item.taskId)) {
     await startQueuedPrevisTask(item.taskId!)
   }
   await tickPrevisBatches()

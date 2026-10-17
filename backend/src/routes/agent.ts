@@ -58,12 +58,12 @@ app.post('/:type/chat', async (c) => {
     return badRequest(c, 'Agent 不存在')
   }
 
-  const requestContext = buildAgentRequestContext({
+  const requestContext = (await buildAgentRequestContext({
     episodeId: episode_id,
     dramaId: drama_id,
     modelOverride: body.model || undefined,
     textConfigId: body.config_id || undefined,
-  })
+  }))
 
   const startTime = performance.now()
 

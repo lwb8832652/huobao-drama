@@ -37,8 +37,8 @@ app.get('/:type', async (c) => {
   if (!checkType(type)) return badRequest(c, '未知的 Agent 类型')
   const lang = normalizeLang(c.req.query('lang'))
   const [file, base] = await Promise.all([
-    loadAgentPromptFile(type, lang),
-    lang === 'zh' ? Promise.resolve(null) : loadAgentPromptFile(type),
+    (await loadAgentPromptFile(type, lang)),
+    lang === 'zh' ? Promise.resolve(null) : (await loadAgentPromptFile(type)),
   ])
   // 非 zh 且变体不存在时 file 即基础版；通过路径再确认一次变体存在性
   const variantExists = lang !== 'zh' && await fsm().exists(promptFilePath(type, lang))

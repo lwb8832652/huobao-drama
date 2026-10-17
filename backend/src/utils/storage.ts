@@ -121,7 +121,7 @@ export async function readImageAsCompressedDataUrl(
     quality?: number
   } = {},
 ): Promise<string> {
-  return compressImageAsDataUrl(getAbsolutePath(relativePath), options)
+  return (await compressImageAsDataUrl(getAbsolutePath(relativePath), options))
 }
 
 /**
@@ -137,7 +137,7 @@ export async function fetchImageAsCompressedDataUrl(
 ): Promise<string> {
   const resp = await fetch(url, { signal: AbortSignal.timeout(30_000) })
   if (!resp.ok) throw new Error(`下载参考图失败: HTTP ${resp.status}`)
-  return compressImageAsDataUrl(Buffer.from(await resp.arrayBuffer()), options)
+  return (await compressImageAsDataUrl(Buffer.from(await resp.arrayBuffer()), options))
 }
 
 /** sharp 输入 → 压缩 JPEG data URL（本地路径与远程下载共享同一压缩管线） */

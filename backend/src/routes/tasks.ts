@@ -200,7 +200,7 @@ app.post('/', async (c) => {
     const [record] = await db.select().from(schema.sysTask)
       .where(eq(schema.sysTask.id, id))
     logTaskSuccess('TaskAPI', 'generate', { taskId: id, type, provider: record?.provider })
-    return created(c, record ? { ...record, ...queueJobView('sys_task', record.id) } : record)
+    return created(c, record ? { ...record, ...(await queueJobView('sys_task', record.id)) } : record)
   } catch (err: any) {
     logTaskError('TaskAPI', 'generate', { type, error: err.message })
     return badRequest(c, err.message)
@@ -212,7 +212,7 @@ app.get('/:id', async (c) => {
   const id = Number(c.req.param('id'))
   const [row] = await db.select().from(schema.sysTask)
     .where(eq(schema.sysTask.id, id))
-  return success(c, row ? { ...row, ...queueJobView('sys_task', row.id) } : null)
+  return success(c, row ? { ...row, ...(await queueJobView('sys_task', row.id)) } : null)
 })
 
 // GET /tasks — 按 type / storyboard_id / drama_id / character_id / scene_id / prop_id 过滤
@@ -251,14 +251,16 @@ app.get('/', async (c) => {
   const rows = filters.length
     ? await query.where(and(...filters)).orderBy(desc(schema.sysTask.createdAt), desc(schema.sysTask.id)).limit(limit)
     : await query.orderBy(desc(schema.sysTask.createdAt), desc(schema.sysTask.id)).limit(limit)
-  return success(c, rows.map(row => ({ ...row, ...queueJobView('sys_task', row.id) })))
+  return success(c, await Promise.all(
+    rows.map(async row => ({ ...row, ...(await queueJobView('sys_task', row.id)) })),
+  ))
 })
 
 // DELETE /tasks/:id
 app.delete('/:id', async (c) => {
   const id = Number(c.req.param('id'))
-  const row = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
-  const queued = getQueueJob('sys_task', id)
+  const row = (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get())
+  const queued = (await getQueueJob('sys_task', id))
   if (row && ['pending', 'processing'].includes(queued?.status || row.status || '')) return badRequest(c, '进行中的任务不能删除，请取消排队或等待任务结束')
   await db.delete(schema.sysTask).where(eq(schema.sysTask.id, id))
   return success(c)

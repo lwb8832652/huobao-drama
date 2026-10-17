@@ -25,7 +25,7 @@ function referenceUrl(url: string) {
 }
 
 /** Metadata only: no freezing, file access, network requests, or provider work. */
-export function resolvePanelGridReferences(panel: Panel, dramaId: number, context?: { timeline: Timeline; versionId: number; includeBoundary?: boolean }): GridReferenceManifest {
+export async function resolvePanelGridReferences(panel: Panel, dramaId: number, context?: { timeline: Timeline; versionId: number; includeBoundary?: boolean }): Promise<GridReferenceManifest> {
   const items: GridReferenceItem[] = []
   const labels = new Map<string, string[]>()
   const errors: string[] = []
@@ -51,15 +51,15 @@ export function resolvePanelGridReferences(panel: Panel, dramaId: number, contex
     add({ url: reason ? null : row!.imageUrl, label, kind, required: true })
   }
   if (panel.sceneId) {
-    const row = db.select().from(schema.scenes).where(eq(schema.scenes.id, panel.sceneId)).get()
+    const row = (await db.select().from(schema.scenes).where(eq(schema.scenes.id, panel.sceneId)).get())
     bound(row, `场景「${row && row.dramaId === dramaId && !row.deletedAt ? row.location : panel.scene || panel.sceneId}」`, 'scene')
   }
   for (const id of new Set(panel.characterIds)) {
-    const row = db.select().from(schema.characters).where(eq(schema.characters.id, id)).get()
+    const row = (await db.select().from(schema.characters).where(eq(schema.characters.id, id)).get())
     bound(row, `人物「${row && row.dramaId === dramaId && !row.deletedAt ? row.name : id}」`, 'character')
   }
   for (const id of new Set(panel.propIds)) {
-    const row = db.select().from(schema.props).where(eq(schema.props.id, id)).get()
+    const row = (await db.select().from(schema.props).where(eq(schema.props.id, id)).get())
     bound(row, `道具「${row && row.dramaId === dramaId && !row.deletedAt ? row.name : id}」`, 'prop')
   }
   panel.referenceImages.forEach((url, index) => add({ url, label: panel.referenceLabels?.[index] || `共同参考素材${index + 1}`, kind: 'custom', required: false }))
@@ -73,15 +73,15 @@ export function resolvePanelGridReferences(panel: Panel, dramaId: number, contex
   return { items, ready: !errors.length, error: errors.join('；'), ...(continuity ? { continuity } : {}) }
 }
 
-export function readGridReferences(versionId: number, panelId: number): GridReferenceManifest {
-  const version = versionRow(versionId)
-  const episode = episodeForPrevis(version.episodeId)
+export async function readGridReferences(versionId: number, panelId: number): Promise<GridReferenceManifest> {
+  const version = (await versionRow(versionId))
+  const episode = (await episodeForPrevis(version.episodeId))
   const timeline = normalizeTimeline(JSON.parse(version.timelineJson))
   const panel = timeline.panels.find(panel => panel.id === panelId)
   if (!panel) throw new PrevisError('分镜不属于当前版本', 404)
-  const manifest = resolvePanelGridReferences(panel, episode.dramaId, { timeline, versionId })
+  const manifest = (await resolvePanelGridReferences(panel, episode.dramaId, { timeline, versionId }))
   const sourceId = orderedFrames(panel)[0]?.source?.candidateId
-  const candidate = sourceId ? db.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, sourceId)).get() : undefined
+  const candidate = sourceId ? (await db.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, sourceId)).get()) : undefined
   const saved: PanelContinuity | undefined = candidate && JSON.parse(candidate.snapshotJson).continuity
   if (saved) {
     manifest.continuityStale = !continuityMatchesTimeline(saved, timeline)

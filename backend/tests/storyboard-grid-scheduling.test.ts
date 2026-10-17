@@ -44,7 +44,7 @@ const grid = await import('../src/services/previs-grid.js')
 const generation = await import('../src/services/generation.js')
 const batches = await import('../src/services/previs-batch.js')
 const configId = Number(
-  db
+  (await db
     .insert(schema.aiServiceConfigs)
     .values({
       name: 'local scheduling test',
@@ -57,9 +57,9 @@ const configId = Number(
       createdAt: 'now',
       updatedAt: 'now',
     })
-    .run().lastInsertRowid,
+    .run()).lastInsertRowid,
 )
-db.insert(schema.dramas)
+await db.insert(schema.dramas)
   .values({
     id: 1,
     title: 'test',
@@ -68,7 +68,7 @@ db.insert(schema.dramas)
     updatedAt: 'now',
   })
   .run()
-db.insert(schema.episodes)
+await db.insert(schema.episodes)
   .values({
     id: 1,
     dramaId: 1,
@@ -98,7 +98,7 @@ const panels = [1, 2, 3].map((id) => ({
   frames: [makeFrame(`f${id}`, 0)],
 }))
 const versionId = Number(
-  db
+  (await db
     .insert(schema.animaticVersions)
     .values({
       episodeId: 1,
@@ -115,7 +115,7 @@ const versionId = Number(
       createdAt: 'now',
       updatedAt: 'now',
     })
-    .run().lastInsertRowid,
+    .run()).lastInsertRowid,
 )
 const payload = {
   revision: 1,
@@ -125,34 +125,33 @@ const payload = {
   mode: 'generate' as const,
   resolution: '1K' as const,
 }
-async function until(check: () => boolean) {
+async function until(check: () => boolean | Promise<boolean>) {
   for (let i = 0; i < 100; i++) {
-    if (check()) return
+    if (await check()) return
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
-  assert.ok(check(), 'mock task did not reach expected state')
+  assert.ok(await check(), 'mock task did not reach expected state')
 }
 
 test('discard after claim but before upstream submission cancels all paid requests', async () => {
   const candidates = (await grid.startGridCandidates(versionId, payload)).items
   await grid.tickGridCandidates()
   assert.equal(calls, 0, 'references are still being read before the submission boundary')
-  candidates.forEach((candidate) => grid.discardGridCandidate(versionId, candidate.id))
+  for (const candidate of candidates) await grid.discardGridCandidate(versionId, candidate.id)
   await new Promise((resolve) => setTimeout(resolve, 100))
   assert.equal(calls, 0)
   assert.ok(
-    db
+    (await db
       .select()
       .from(schema.sysTask)
-      .all()
-      .every((task) => task.status === 'cancelled'),
+      .all()).every((task) => task.status === 'cancelled'),
   )
 })
 
 test('grid and legacy queued image jobs share two configuration slots, including submitted discarded jobs', async () => {
   const candidates = (await grid.startGridCandidates(versionId, payload)).items
   await grid.tickGridCandidates()
-  await until(() => calls >= 2)
+  await until(async () => calls >= 2)
   assert.equal(calls, 2)
   assert.equal(maxActive, 2)
   const legacyId = await generation.generateImage({
@@ -164,28 +163,27 @@ test('grid and legacy queued image jobs share two configuration slots, including
   })
   await generation.startQueuedPrevisTask(legacyId)
   assert.equal(
-    db.select().from(schema.sysTask).where(eq(schema.sysTask.id, legacyId)).get()!.status,
+    (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, legacyId)).get()!).status,
     'pending',
   )
-  candidates.forEach((candidate) => grid.discardGridCandidate(versionId, candidate.id))
+  for (const candidate of candidates) await grid.discardGridCandidate(versionId, candidate.id)
   await generation.startQueuedPrevisTask(legacyId)
   assert.equal(calls, 2, 'submitted discarded jobs retain their slots until they finish')
   releases.splice(0).forEach((release) => release())
   await until(
-    () =>
-      db
+    async () =>
+      (await db
         .select()
         .from(schema.sysTask)
-        .all()
-        .filter((task) => task.previsItemKey?.startsWith('grid-') && task.status === 'processing').length ===
+        .all()).filter((task) => task.previsItemKey?.startsWith('grid-') && task.status === 'processing').length ===
       0,
   )
   await generation.startQueuedPrevisTask(legacyId)
-  await until(() => calls === 3)
+  await until(async () => calls === 3)
   releases.splice(0).forEach((release) => release())
   await until(
-    () =>
-      db.select().from(schema.sysTask).where(eq(schema.sysTask.id, legacyId)).get()!.status === 'completed',
+    async () =>
+      (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, legacyId)).get()!).status === 'completed',
   )
   assert.equal(maxActive, 2)
 })
@@ -194,9 +192,9 @@ test('cancelling a legacy batch also cancels linked tasks waiting for shared gri
   const before = calls,
     candidates = (await grid.startGridCandidates(versionId, payload)).items
   await grid.tickGridCandidates()
-  await until(() => calls === before + 2)
+  await until(async () => calls === before + 2)
   const batchId = Number(
-    db
+    (await db
       .insert(schema.batchRuns)
       .values({
         versionId,
@@ -206,10 +204,10 @@ test('cancelling a legacy batch also cancels linked tasks waiting for shared gri
         requestHash: 'cancel-test',
         createdAt: 'now',
       })
-      .run().lastInsertRowid,
+      .run()).lastInsertRowid,
   )
   const itemId = Number(
-    db
+    (await db
       .insert(schema.batchRunItems)
       .values({
         batchId,
@@ -219,7 +217,7 @@ test('cancelling a legacy batch also cancels linked tasks waiting for shared gri
         requestJson: '{}',
         status: 'processing',
       })
-      .run().lastInsertRowid,
+      .run()).lastInsertRowid,
   )
   const taskId = await generation.generateImage({
     previs: { versionId, itemKey: `${itemId}:1` },
@@ -228,34 +226,33 @@ test('cancelling a legacy batch also cancels linked tasks waiting for shared gri
     model: 'gpt-image-2',
     size: '1920x1080',
   })
-  db.update(schema.batchRunItems).set({ taskId }).where(eq(schema.batchRunItems.id, itemId)).run()
+  await db.update(schema.batchRunItems).set({ taskId }).where(eq(schema.batchRunItems.id, itemId)).run()
   await generation.startQueuedPrevisTask(taskId)
-  assert.equal(db.select().from(schema.sysTask).where(eq(schema.sysTask.id, taskId)).get()!.status, 'pending')
-  batches.updateBatch(batchId, 'cancel')
+  assert.equal((await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, taskId)).get()!).status, 'pending')
+  await batches.updateBatch(batchId, 'cancel')
   assert.equal(
-    db.select().from(schema.sysTask).where(eq(schema.sysTask.id, taskId)).get()!.status,
+    (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, taskId)).get()!).status,
     'cancelled',
   )
   assert.equal(
-    db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, itemId)).get()!.status,
+    (await db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, itemId)).get()!).status,
     'cancelled',
   )
-  candidates.forEach((candidate) => grid.discardGridCandidate(versionId, candidate.id))
+  for (const candidate of candidates) await grid.discardGridCandidate(versionId, candidate.id)
   releases.splice(0).forEach((release) => release())
   await until(
-    () =>
-      db
+    async () =>
+      (await db
         .select()
         .from(schema.sysTask)
-        .all()
-        .filter((task) => task.status === 'processing').length === 0,
+        .all()).filter((task) => task.status === 'processing').length === 0,
   )
   await batches.tickPrevisBatches()
   assert.equal(calls, before + 2)
 })
 
 test('legacy image preflight and late completion cannot replace a locked frame', async () => {
-  const v = db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, versionId)).get()!
+  const v = await db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, versionId)).get()!
   const timeline = JSON.parse(v.timelineJson)
   timeline.panels[0].frames[0] = {
     ...timeline.panels[0].frames[0],
@@ -268,7 +265,7 @@ test('legacy image preflight and late completion cannot replace a locked frame',
       bounds: { left: 0, top: 0, width: 640, height: 360 },
     },
   }
-  db.update(schema.animaticVersions)
+  await db.update(schema.animaticVersions)
     .set({ timelineJson: JSON.stringify(timeline) })
     .where(eq(schema.animaticVersions.id, versionId))
     .run()
@@ -283,7 +280,7 @@ test('legacy image preflight and late completion cannot replace a locked frame',
     /锁定/,
   )
   const batchId = Number(
-    db
+    (await db
       .insert(schema.batchRuns)
       .values({
         versionId,
@@ -294,10 +291,10 @@ test('legacy image preflight and late completion cannot replace a locked frame',
         status: 'processing',
         createdAt: 'now',
       })
-      .run().lastInsertRowid,
+      .run()).lastInsertRowid,
   )
   const taskId = Number(
-    db
+    (await db
       .insert(schema.sysTask)
       .values({
         type: 'image',
@@ -307,9 +304,9 @@ test('legacy image preflight and late completion cannot replace a locked frame',
         createdAt: 'now',
         updatedAt: 'now',
       })
-      .run().lastInsertRowid,
+      .run()).lastInsertRowid,
   )
-  db.insert(schema.batchRunItems)
+  await db.insert(schema.batchRunItems)
     .values({
       batchId,
       groupId: 'test',
@@ -323,16 +320,15 @@ test('legacy image preflight and late completion cannot replace a locked frame',
   await batches.tickPrevisBatches()
   assert.deepEqual(
     JSON.parse(
-      db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, versionId)).get()!
+      (await db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, versionId)).get())!
         .timelineJson,
     ).panels[0].frames[0],
     timeline.panels[0].frames[0],
   )
-  const item = db
+  const item = (await db
     .select()
     .from(schema.batchRunItems)
-    .all()
-    .find((item) => item.batchId === batchId)!
-  db.update(schema.batchRunItems).set({ status: 'failed' }).where(eq(schema.batchRunItems.id, item.id)).run()
-  assert.throws(() => batches.updateBatch(batchId, 'retry'), /锁定/)
+    .all()).find((item) => item.batchId === batchId)!
+  await db.update(schema.batchRunItems).set({ status: 'failed' }).where(eq(schema.batchRunItems.id, item.id)).run()
+  await assert.rejects(async () => batches.updateBatch(batchId, 'retry'), /锁定/)
 })

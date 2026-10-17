@@ -34,35 +34,47 @@ export async function startVideoPromptBatch(
   opts: { model?: string; configId?: number } = {},
   storyboardIds?: number[],
 ): Promise<{ started: boolean; total: number }> {
-  // SQLite reads are synchronous so ownership/pending lookup and claiming the task cannot interleave.
-  const ep = db.select().from(schema.episodes).where(eq(schema.episodes.id, episodeId)).get()
-  if (!ep || ep.deletedAt || ep.dramaId !== dramaId) throw new Error('Episode not found in current project')
+  // 原实现依赖 SQLite 同步读保证「运行中检查 → 占位」不交错；DB 异步化后读库会让出事件循环，
+  // 并发调用会同时通过检查。改为进入即同步占位，读库失败/无待处理分镜时再清理。
   if (tasks.get(episodeId)?.status === 'running') return { started: false, total: -1 }
-
-  const sbs = db.select().from(schema.storyboards)
-    .where(eq(schema.storyboards.episodeId, episodeId))
-    .orderBy(schema.storyboards.storyboardNumber).all()
-  const live = sbs.filter(sb => !sb.deletedAt)
-  const pending = storyboardIds?.length
-    ? live.filter(sb => storyboardIds.includes(sb.id))
-    : live.filter(sb => !(sb.videoPrompt || '').trim())
-  if (!pending.length) return { started: false, total: 0 }
-
-  // 视频模型标签：跟随该集锁定的视频配置，供 Agent 按模型特性生成
-  let videoLabel = '默认'
-  if (ep?.videoConfigId) {
-    const cfg = db.select().from(schema.aiServiceConfigs).where(eq(schema.aiServiceConfigs.id, ep.videoConfigId)).get()
-    if (cfg) videoLabel = `${cfg.name} (${cfg.provider})`
-  }
-
-  const task: VideoPromptBatchStatus = {
+  const claim: VideoPromptBatchStatus = {
     status: 'running',
-    total: pending.length,
+    total: 0,
     completed: 0,
     failed: 0,
     started_at: new Date().toISOString(),
   }
-  tasks.set(episodeId, task)
+  tasks.set(episodeId, claim)
+  let pending: typeof schema.storyboards.$inferSelect[]
+  let videoLabel: string
+  try {
+    const ep = (await db.select().from(schema.episodes).where(eq(schema.episodes.id, episodeId)).get())
+    if (!ep || ep.deletedAt || ep.dramaId !== dramaId) throw new Error('Episode not found in current project')
+
+    const sbs = (await db.select().from(schema.storyboards)
+      .where(eq(schema.storyboards.episodeId, episodeId))
+      .orderBy(schema.storyboards.storyboardNumber).all())
+    const live = sbs.filter(sb => !sb.deletedAt)
+    pending = storyboardIds?.length
+      ? live.filter(sb => storyboardIds.includes(sb.id))
+      : live.filter(sb => !(sb.videoPrompt || '').trim())
+    if (!pending.length) {
+      tasks.delete(episodeId)
+      return { started: false, total: 0 }
+    }
+
+    // 视频模型标签：跟随该集锁定的视频配置，供 Agent 按模型特性生成
+    videoLabel = '默认'
+    if (ep?.videoConfigId) {
+      const cfg = (await db.select().from(schema.aiServiceConfigs).where(eq(schema.aiServiceConfigs.id, ep.videoConfigId)).get())
+      if (cfg) videoLabel = `${cfg.name} (${cfg.provider})`
+    }
+  } catch (error) {
+    tasks.delete(episodeId)
+    throw error
+  }
+  const task = claim
+  task.total = pending.length
 
   logTaskStart('VideoPrompt', 'batch', { episodeId, dramaId, total: pending.length, model: opts.model || undefined })
   ;(async () => {
@@ -73,11 +85,11 @@ export async function startVideoPromptBatch(
       logTaskProgress('VideoPrompt', 'batch-shot', { episodeId, storyboardId: sb.id, index: task.completed + task.failed + 1, total: task.total })
       try {
         // Isolate write receipts for each attempt; old content or other shots cannot count as a save.
-        const requestContext = buildAgentRequestContext({
+        const requestContext = (await buildAgentRequestContext({
           episodeId, dramaId,
           modelOverride: opts.model || undefined,
           textConfigId: opts.configId || undefined,
-        })
+        }))
         await agent.generate([{
           role: 'user',
           content: `请为分镜 #${sb.storyboardNumber}(ID:${sb.id})生成视频提示词(video_prompt)。视频模型:${videoLabel},请根据该模型的特性和时长限制生成。

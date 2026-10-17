@@ -7,7 +7,7 @@
  */
 import { Hono } from 'hono'
 import { DATA_ROOT, STORAGE_ROOT } from '../utils/paths.js'
-import { dbPath } from '../db/index.js'
+import { dbDialect, dbPath } from '../db/index.js'
 import { dirUsage, volumeFreeBytes } from '../utils/dirsize.js'
 import { success } from '../utils/response.js'
 
@@ -26,7 +26,7 @@ async function computeUsage() {
   if (cache.computing) return
   cache.computing = true
   try {
-    const usage = await dirUsage(DATA_ROOT, dbPath)
+    const usage = await dirUsage(DATA_ROOT, dbDialect === 'sqlite' ? dbPath : null)
     cache.usage = usage
     cache.computedAt = new Date().toISOString()
   } finally {
@@ -55,9 +55,10 @@ app.get('/', async (c) => {
   const mode = process.env.HUOBAO_DESKTOP === '1' ? 'desktop' : 'server'
   return success(c, {
     mode,
+    databaseDialect: dbDialect,
     dataDir: DATA_ROOT,
     storageRoot: STORAGE_ROOT,
-    sqlitePath: dbPath,
+    sqlitePath: dbDialect === 'sqlite' ? dbPath : null,
     usage: cache.usage,
     usageStale: usageStale || cache.computing,
     computedAt: cache.computedAt,

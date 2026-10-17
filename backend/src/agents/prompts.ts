@@ -58,8 +58,8 @@ async function readPromptFile(path: string): Promise<AgentPromptFile | null> {
 }
 
 /** 读取基础版（中文）prompt 文件 — model 字段永远只从基础版解析，避免多语言文件漂移 */
-export function loadBasePromptFile(agentType: string): Promise<AgentPromptFile | null> {
-  return readPromptFile(promptFilePath(agentType))
+export async function loadBasePromptFile(agentType: string): Promise<AgentPromptFile | null> {
+  return (await readPromptFile(promptFilePath(agentType)))
 }
 
 /**

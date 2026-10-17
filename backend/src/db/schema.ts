@@ -3,7 +3,7 @@
  * 自 MySQL 迁移：varchar(x)→text（SQLite 不校验长度）、int→integer、
  * boolean→integer boolean mode、时间戳仍为 text 存 ISO 字符串，表/列名不变。
  */
-import { sqliteTable, text, integer, primaryKey } from 'drizzle-orm/sqlite-core'
+import { sqliteTable, text, integer, primaryKey, uniqueIndex } from 'drizzle-orm/sqlite-core'
 export { animaticVersions, batchRuns, batchRunItems, continuityReviews, framePlans, frameContactSheets } from './previs-schema.js'
 
 export const dramas = sqliteTable('dramas', {
@@ -230,8 +230,8 @@ export const videoMerges = sqliteTable('video_merges', {
   episodeId: integer('episode_id'),
   dramaId: integer('drama_id'),
   title: text('title'),
-  provider: text('provider'),
-  model: text('model'),
+  provider: text('provider').notNull(),
+  model: text('model').notNull(),
   status: text('status').default('pending'),
   scenes: text('scenes'), // JSON
   mergedUrl: text('merged_url'),
@@ -292,5 +292,58 @@ export const appSettings = sqliteTable('app_settings', {
   value: text('value').notNull(),
   updatedAt: text('updated_at').notNull(),
 })
+
+export const taskQueueJobs = sqliteTable('task_queue_jobs', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  ownerType: text('owner_type').notNull(),
+  ownerId: integer('owner_id').notNull(),
+  kind: text('kind').notNull(),
+  projectId: integer('project_id').notNull().default(0),
+  configId: integer('config_id').notNull().default(0),
+  inputHash: text('input_hash').notNull(),
+  snapshotJson: text('snapshot_json').notNull().default('{}'),
+  source: text('source').notNull().default('manual'),
+  status: text('status').notNull().default('pending'),
+  phase: text('phase').notNull().default('queued'),
+  ready: integer('ready', { mode: 'boolean' }).notNull().default(true),
+  submitted: integer('submitted', { mode: 'boolean' }).notNull().default(false),
+  externalTaskId: text('external_task_id'),
+  upstreamDone: integer('upstream_done', { mode: 'boolean' }).notNull().default(false),
+  attempt: integer('attempt').notNull().default(0),
+  error: text('error'),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+  startedAt: text('started_at'),
+  finishedAt: text('finished_at'),
+}, table => [
+  uniqueIndex('idx_task_queue_owner').on(table.ownerType, table.ownerId),
+])
+
+export const taskQueueCursors = sqliteTable('task_queue_cursors', {
+  key: text('key').primaryKey(),
+  value: text('value').notNull(),
+})
+
+export const productionQualityTasks = sqliteTable('production_quality_tasks', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  versionId: integer('version_id').notNull(),
+  kind: text('kind').notNull(),
+  parentId: integer('parent_id'),
+  round: integer('round').notNull().default(0),
+  inputHash: text('input_hash').notNull(),
+  requestKey: text('request_key').notNull(),
+  configId: integer('config_id').notNull().default(0),
+  model: text('model').notNull().default(''),
+  status: text('status').notNull().default('pending'),
+  inputJson: text('input_json').notNull(),
+  resultJson: text('result_json').notNull().default(''),
+  error: text('error'),
+  appliedVersionId: integer('applied_version_id'),
+  createdAt: text('created_at').notNull(),
+  startedAt: text('started_at'),
+  finishedAt: text('finished_at'),
+}, table => [
+  uniqueIndex('idx_quality_request_key').on(table.requestKey),
+])
 
 export { gridCandidates } from './previs-grid-schema.js'

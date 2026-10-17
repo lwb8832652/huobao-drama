@@ -44,7 +44,7 @@ async function walkFiles(dir: string, onFile: (filePath: string, size: number) =
 }
 
 /** 统计数据目录占用（按用途分桶）；db 桶 = SQLITE_PATH 主库 + -wal/-shm 三文件 */
-export async function dirUsage(dataRoot: string, sqlitePath: string): Promise<UsageBuckets> {
+export async function dirUsage(dataRoot: string, sqlitePath: string | null): Promise<UsageBuckets> {
   const usage: UsageBuckets = { db: 0, images: 0, videos: 0, merged: 0, uploads: 0, temp: 0, other: 0, total: 0 }
   const add = (bucket: keyof UsageBuckets, size: number) => {
     usage[bucket] += size
@@ -52,7 +52,7 @@ export async function dirUsage(dataRoot: string, sqlitePath: string): Promise<Us
   }
 
   // db 桶：直接 stat 三个文件（无论是否在 dataRoot 内，walk 侧会跳过避免双计）
-  for (const suffix of ['', '-wal', '-shm']) {
+  for (const suffix of sqlitePath ? ['', '-wal', '-shm'] : []) {
     try {
       const st = await fsp.stat(sqlitePath + suffix)
       if (st.isFile()) add('db', st.size)
@@ -61,7 +61,7 @@ export async function dirUsage(dataRoot: string, sqlitePath: string): Promise<Us
 
   await walkFiles(dataRoot, (filePath, size) => {
     const rel = path.relative(dataRoot, filePath)
-    if (rel === DB_FILE_BASE || rel.startsWith(DB_FILE_BASE + '-')) return // 已单独计入 db 桶
+    if (sqlitePath && (rel === DB_FILE_BASE || rel.startsWith(DB_FILE_BASE + '-'))) return // 已单独计入 db 桶
     const parts = rel.split(path.sep)
     if (parts[0] === 'static' && parts.length >= 2) {
       const sub = parts[1]

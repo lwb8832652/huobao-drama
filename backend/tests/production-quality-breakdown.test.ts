@@ -1,17 +1,24 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
-import {eq} from 'drizzle-orm'
+import {eq, sql} from 'drizzle-orm'
 process.env.SQLITE_PATH=':memory:'
 const {db,schema}=await import('../src/db/index.js')
+
+// 还原后的 db 是 drizzle sqlite-proxy 异步封装，不再暴露 better-sqlite3 的 $client；
+// 测试里的裸 SQL 改为统一的 raw 执行入口（? 占位按字面量内联，仅测试使用）。
+// rawGet/rawAll 返回按列顺序排列的位置数组（sqlite-proxy 的 raw 模式不带列名）。
+const lit=(v:any)=>(typeof v==='number'?String(v):`'${String(v).replace(/'/g,"''")}'`)
+const build=(text:string,args:any[])=>{let out=text;for(const a of args)out=out.replace('?',lit(a));return sql.raw(out)}
+const rawGet=async(text:string,...args:any[])=>(await db.get(build(text,args))) as any[]
 const {storyboardTools,getStoryboardBreakdownReceipt}=await import('../src/agents/tools/storyboard-tools.js') as any
 const {buildAgentRequestContext}=await import('../src/agents/context.js')
 const quality=await import('../src/services/production-quality-breakdown.js').catch(()=>null)
 const settings=await import('../src/services/task-queue-settings.js')
 const stamp=new Date().toISOString()
-function seed(script='小明：你好。\n小红：再见。'){
- const dramaId=Number(db.insert(schema.dramas).values({title:'整集质检',createdAt:stamp,updatedAt:stamp}).run().lastInsertRowid)
- const episodeId=Number(db.insert(schema.episodes).values({dramaId,episodeNumber:1,title:'第1集',scriptContent:script,createdAt:stamp,updatedAt:stamp}).run().lastInsertRowid)
- const rc=buildAgentRequestContext({episodeId,dramaId})
+async function seed(script='小明：你好。\n小红：再见。'){
+ const dramaId=Number((await db.insert(schema.dramas).values({title:'整集质检',createdAt:stamp,updatedAt:stamp}).run()).lastInsertRowid)
+ const episodeId=Number((await db.insert(schema.episodes).values({dramaId,episodeNumber:1,title:'第1集',scriptContent:script,createdAt:stamp,updatedAt:stamp}).run()).lastInsertRowid)
+ const rc=await buildAgentRequestContext({episodeId,dramaId})
  return {dramaId,episodeId,rc}
 }
 async function save(f:ReturnType<typeof seed>,number:number,description:string,video_prompt?:string){
@@ -19,12 +26,12 @@ async function save(f:ReturnType<typeof seed>,number:number,description:string,v
 }
 test('a text-only breakdown cannot claim successful completion without an owned write receipt',async()=>{
  assert.ok(quality)
- const f=seed()
+ const f=await seed()
  await assert.rejects(()=>quality.finishStoryboardBreakdown(f.episodeId,{requestContext:f.rc}),/未保存|未完成/)
 })
 test('completed breakdown checks the entire script and gives AI one actionable correction opportunity',async()=>{
  assert.ok(quality)
- const f=seed();await save(f,1,'【镜头1】小明挥手。小明：「你好。」','0-8秒：小明挥手。小明：「你好。」')
+ const f=await seed();await save(f,1,'【镜头1】小明挥手。小明：「你好。」','0-8秒：小明挥手。小明：「你好。」')
  assert.ok(getStoryboardBreakdownReceipt(f.rc)?.length)
  let calls=0
  const result=await quality.finishStoryboardBreakdown(f.episodeId,{requestContext:f.rc,repair:async(issues:any[])=>{
@@ -36,39 +43,39 @@ test('completed breakdown checks the entire script and gives AI one actionable c
 })
 test('unfixed coverage is reported instead of saying the breakdown passed or retrying indefinitely',async()=>{
  assert.ok(quality)
- const f=seed();await save(f,1,'【镜头1】小明挥手。小明：「你好。」','0-8秒：小明挥手。小明：「你好。」')
+ const f=await seed();await save(f,1,'【镜头1】小明挥手。小明：「你好。」','0-8秒：小明挥手。小明：「你好。」')
  let calls=0
  const result=await quality.finishStoryboardBreakdown(f.episodeId,{requestContext:f.rc,repair:async()=>{calls++}})
  assert.equal(calls,1);assert.equal(result.status,'needs_attention');assert.ok(result.issueCount>0)
 })
 test('missing prompts persist a free check and defer automatic review until supplementation settles',async()=>{
  assert.ok(quality)
- const f=seed('小明：你好。');await save(f,1,'【镜头1】小明挥手。小明：「你好。」')
- settings.saveEvaluationSettings({...settings.readEvaluationSettings(),enabled:true})
+ const f=await seed('小明：你好。');await save(f,1,'【镜头1】小明挥手。小明：「你好。」')
+ await settings.saveEvaluationSettings({...(await settings.readEvaluationSettings()),enabled:true})
  let result=await quality.finishStoryboardBreakdown(f.episodeId,{requestContext:f.rc})
  assert.equal(result.status,'awaiting_prompts');assert.equal(result.missingPrompts,1)
- assert.equal(db.$client.prepare("SELECT count(*) n FROM production_quality_tasks WHERE kind='review'").get().n,0)
- const panel=db.select().from(schema.storyboards).where(eq(schema.storyboards.episodeId,f.episodeId)).get()!
- db.update(schema.storyboards).set({videoPrompt:'0-8秒：小明挥手。小明：「你好。」'}).where(eq(schema.storyboards.id,panel.id)).run()
+ assert.equal((await rawGet("SELECT count(*) n FROM production_quality_tasks WHERE kind='review'"))[0],0)
+ const panel=await db.select().from(schema.storyboards).where(eq(schema.storyboards.episodeId,f.episodeId)).get()!
+ await db.update(schema.storyboards).set({videoPrompt:'0-8秒：小明挥手。小明：「你好。」'}).where(eq(schema.storyboards.id,panel.id)).run()
  result=await quality.finalizeEpisodeQuality(f.episodeId)
  assert.equal(result.missingPrompts,0);assert.equal(result.status,'passed')
  // Missing model settings cannot erase the completed free report.
  assert.ok(result.taskId);assert.match(result.aiError||'',/模型/)
- settings.saveEvaluationSettings({...settings.readEvaluationSettings(),enabled:false})
+ await settings.saveEvaluationSettings({...(await settings.readEvaluationSettings()),enabled:false})
 })
 test('a correction cannot clear all previously saved storyboards',async()=>{
  assert.ok(quality)
- const f=seed();await save(f,1,'【镜头1】小明挥手。小明：「你好。」','0-8秒：小明挥手。小明：「你好。」')
- const before=db.select().from(schema.storyboards).where(eq(schema.storyboards.episodeId,f.episodeId)).all()
+ const f=await seed();await save(f,1,'【镜头1】小明挥手。小明：「你好。」','0-8秒：小明挥手。小明：「你好。」')
+ const before=await db.select().from(schema.storyboards).where(eq(schema.storyboards.episodeId,f.episodeId)).all()
  const result=await quality.finishStoryboardBreakdown(f.episodeId,{requestContext:f.rc,repair:async()=>{await save(f,1,'【镜头1】小明站在门外。')}})
  assert.match(result.correctionError||'',/替换|清空/)
  const project=(rows:any[])=>rows.map(({id,description,duration,videoPrompt})=>({id,description,duration,videoPrompt}))
- assert.deepEqual(project(db.select().from(schema.storyboards).where(eq(schema.storyboards.episodeId,f.episodeId)).all()),project(before))
+ assert.deepEqual(project(await db.select().from(schema.storyboards).where(eq(schema.storyboards.episodeId,f.episodeId)).all()),project(before))
 })
 test('agent endpoint returns whole-episode findings, not an unconditional done toast',async t=>{
  assert.ok(quality)
  const {mastra}=await import('../src/mastra/index.js'),{default:route}=await import('../src/routes/agent.js')
- const f=seed();let calls=0
+ const f=await seed();let calls=0
  // The tool must use the exact endpoint request context, not the fixture's.
  t.mock.method(mastra,'getAgent',()=>({generate:async(_messages:any,options:any)=>{
    calls++

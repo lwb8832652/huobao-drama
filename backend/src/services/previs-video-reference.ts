@@ -7,20 +7,20 @@ import { selectVideoReferenceStrategy, videoReferenceFramesMatch, type VideoRefe
 
 export async function buildVideoReferenceInput(versionId: number, panels: Panel[], requested: VideoReferenceInputStrategy, maxImages: number, generationScope: 'storyboard' | 'group' = 'storyboard'): Promise<VideoReferenceInput> {
   const effective = selectVideoReferenceStrategy(panels, requested, maxImages, generationScope)
-  const aspectRatio = contactSheetSource(versionId).aspectRatio
-  const sheets = readContactSheets(versionId)
+  const aspectRatio = (await contactSheetSource(versionId)).aspectRatio
+  const sheets = (await readContactSheets(versionId))
   if (effective === 'contact_sheet') {
     for (const panel of panels) {
       const sheet = sheets.find(sheet => sheet.panelId === panel.id)
       if (!sheet || sheet.status !== 'ready' || !sheet.artifactId) continue
-      const artifact = db.select().from(schema.frameContactSheets).where(eq(schema.frameContactSheets.id, sheet.artifactId)).get()!
+      const artifact = (await db.select().from(schema.frameContactSheets).where(eq(schema.frameContactSheets.id, sheet.artifactId)).get())!
       const digests = JSON.parse(artifact.sourceDigestsJson || '[]') as (string | null)[]
       for (const [i, frame] of orderedFrames(panel).entries()) {
         let digest: string
         try { digest = mediaDigest(await readReferenceMedia(frame.url)) }
         catch (error) { throw new Error(`「${panel.title}」画面 ${i + 1}（${frameKey(frame)}）读取失败：${(error as Error).message}`) }
         if (digest !== digests[i]) {
-          scheduleContactSheets(versionId, [panel.id], true)
+          ;await scheduleContactSheets(versionId, [panel.id], true)
           throw new Error(`「${panel.title}」画面 ${i + 1}（${frameKey(frame)}）已替换，宫格已过期，正在重新合成，请稍后重试`)
         }
       }
@@ -53,15 +53,15 @@ export async function buildVideoReferenceInput(versionId: number, panels: Panel[
     }) }
 }
 
-export function videoReferenceMatchesSource(versionId: number, input: VideoReferenceInput, panels: Panel[]) {
-  const source = contactSheetSource(versionId)
+export async function videoReferenceMatchesSource(versionId: number, input: VideoReferenceInput, panels: Panel[]) {
+  const source = (await contactSheetSource(versionId))
   if (!videoReferenceFramesMatch(input, panels) || source.aspectRatio !== input.aspectRatio) return false
   if (input.generationScope === 'group') {
     const order = source.timeline.groups.flatMap(group => group.panelIds).filter(id => input.panels.some(panel => panel.panelId === id))
     if (order.some((id, i) => id !== input.panels[i]?.panelId)) return false
   }
   if (input.effective !== 'contact_sheet') return true
-  const sheets = readContactSheets(versionId)
+  const sheets = (await readContactSheets(versionId))
   return input.panels.every(panel => {
     const current = sheets.find(sheet => sheet.panelId === panel.panelId)
     // Copied versions may not have composed their cache yet; the frame snapshot still defines the source.

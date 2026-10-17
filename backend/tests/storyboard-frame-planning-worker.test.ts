@@ -38,60 +38,60 @@ const { db, schema } = await import('../src/db/index.js')
 const planning = await import('../src/services/previs-frames.js')
 const { readFramePlanningContext } = await import('../src/agents/tools/frame-splitter-tools.js')
 const ts = new Date().toISOString()
-db.insert(schema.dramas).values({ id: 1, title: 'Test', createdAt: ts, updatedAt: ts }).run()
-db.insert(schema.episodes).values({ id: 1, dramaId: 1, episodeNumber: 1, title: 'Test', createdAt: ts, updatedAt: ts }).run()
-const characterId = Number(db.insert(schema.characters).values({ dramaId: 1, name: '小明', styling: '红色外套', appearance: '黑色短发', imageUrl: '/static/ming.png', createdAt: ts, updatedAt: ts }).run().lastInsertRowid)
-const configId = Number(db.insert(schema.aiServiceConfigs).values({ name: 'Local planner', serviceType: 'text', provider: 'openai', baseUrl: `http://127.0.0.1:${(server.address() as any).port}`, apiKey: 'test', model: JSON.stringify(['test-planner']), isActive: true, createdAt: ts, updatedAt: ts }).run().lastInsertRowid)
+await db.insert(schema.dramas).values({ id: 1, title: 'Test', createdAt: ts, updatedAt: ts }).run()
+await db.insert(schema.episodes).values({ id: 1, dramaId: 1, episodeNumber: 1, title: 'Test', createdAt: ts, updatedAt: ts }).run()
+const characterId = Number((await db.insert(schema.characters).values({ dramaId: 1, name: '小明', styling: '红色外套', appearance: '黑色短发', imageUrl: '/static/ming.png', createdAt: ts, updatedAt: ts }).run()).lastInsertRowid)
+const configId = Number((await db.insert(schema.aiServiceConfigs).values({ name: 'Local planner', serviceType: 'text', provider: 'openai', baseUrl: `http://127.0.0.1:${(server.address() as any).port}`, apiKey: 'test', model: JSON.stringify(['test-planner']), isActive: true, createdAt: ts, updatedAt: ts }).run()).lastInsertRowid)
 let versionNo = 0
 function panel(): Panel { return { id: 1, title: '接杯', description: '小明递杯，小红接杯，切到小红', imagePrompt: '右手白杯', videoPrompt: '0-2s递杯；2-5s接杯；5-6s松手', atmosphere: '左窗暖光', durationMs: 6000, sceneId: null, scene: 'Kitchen', shotType: 'medium', angle: 'eye', movement: 'fixed', characterIds: [characterId], propIds: [], referenceImages: ['/static/common.png'], referenceLabels: ['布局'], videoUrl: '', frames: [makeFrame('end', 5999), makeFrame('start', 0), makeFrame('middle', 1200)] } }
-function version() { return Number(db.insert(schema.animaticVersions).values({ episodeId: 1, versionNo: ++versionNo, timelineJson: JSON.stringify({ schemaVersion: 2, panels: [panel()], groups: [], transitions: [], audio: [], strategy: defaultStrategy, acknowledgements: {} }), createdAt: ts, updatedAt: ts }).run().lastInsertRowid) }
-function row(id: number) { return db.select().from(schema.framePlans).where(eq(schema.framePlans.id, id)).get()! }
-async function until(predicate: () => boolean) {
-  for (let index = 0; index < 200; index++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 10)) }
-  assert.ok(predicate(), 'worker/mock did not reach expected state')
+async function version() { return Number((await db.insert(schema.animaticVersions).values({ episodeId: 1, versionNo: ++versionNo, timelineJson: JSON.stringify({ schemaVersion: 2, panels: [panel()], groups: [], transitions: [], audio: [], strategy: defaultStrategy, acknowledgements: {} }), createdAt: ts, updatedAt: ts }).run()).lastInsertRowid) }
+async function row(id: number) { return await db.select().from(schema.framePlans).where(eq(schema.framePlans.id, id)).get()! }
+async function until(predicate: () => boolean | Promise<boolean>) {
+  for (let index = 0; index < 200; index++) { if (await predicate()) return; await new Promise(resolve => setTimeout(resolve, 10)) }
+  assert.ok(await predicate(), 'worker/mock did not reach expected state')
 }
 const options = { revision: 1, panelIds: [1], count: 3, configId, model: 'test-planner', force: true }
 async function seedPending(id: number) {
-  const r = db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, id)).get()!
+  const r = await db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, id)).get()!
   const p = normalizeTimeline(JSON.parse(r.timelineJson)).panels[0]
   const context = await readFramePlanningContext(id, [1], 1, 1)
-  return Number(db.insert(schema.framePlans).values({ versionId: id, panelId: 1, inputHash: planning.planInputHash(p, context), count: 3, configId, model: 'test-planner', status: 'pending', resultJson: '', createdAt: ts }).run().lastInsertRowid)
+  return Number((await db.insert(schema.framePlans).values({ versionId: id, panelId: 1, inputHash: planning.planInputHash(p, context), count: 3, configId, model: 'test-planner', status: 'pending', resultJson: '', createdAt: ts }).run()).lastInsertRowid)
 }
 
 test('queued plan rejects changed server context before any provider call', async () => {
-  const id = version(), taskId = await seedPending(id), before = requests.length
-  db.update(schema.characters).set({ styling: '蓝色外套' }).where(eq(schema.characters.id, characterId)).run()
+  const id = (await version()), taskId = await seedPending(id), before = requests.length
+  await db.update(schema.characters).set({ styling: '蓝色外套' }).where(eq(schema.characters.id, characterId)).run()
   const worker = planning.tickFramePlans()
   // Existing implementation starts a stale call: release it to let the assertion report the failure.
-  await until(() => requests.length > before || row(taskId).status === 'failed')
+  await until(async () => requests.length > before || (await row(taskId)).status === 'failed')
   releases.splice(0).forEach(release => release())
   await worker
-  assert.equal(row(taskId).status, 'failed')
-  assert.match(row(taskId).error || '', /资料.*变化/)
+  assert.equal((await row(taskId)).status, 'failed')
+  assert.match((await row(taskId)).error || '', /资料.*变化/)
   assert.equal(requests.length, before)
 })
 
 test('force reuses a processing plan and rejects changed options without resetting the claimed task', async () => {
-  const id = version(), before = requests.length
+  const id = (await version()), before = requests.length
   const first = await planning.startFramePlan(id, options)
-  await until(() => requests.length > before)
+  await until(async () => requests.length > before)
   try {
-    const claimedAt = row(first.taskIds[0]).createdAt
+    const claimedAt = (await row(first.taskIds[0])).createdAt
     const duplicate = await planning.startFramePlan(id, options)
     assert.deepEqual(duplicate.taskIds, first.taskIds)
     assert.equal(duplicate.queued, 0)
-    assert.equal(row(first.taskIds[0]).status, 'processing')
-    assert.equal(row(first.taskIds[0]).createdAt, claimedAt)
+    assert.equal((await row(first.taskIds[0])).status, 'processing')
+    assert.equal((await row(first.taskIds[0])).createdAt, claimedAt)
     await assert.rejects(planning.startFramePlan(id, { ...options, count: 4 }), /等待.*规划/)
   } finally { releases.splice(0).forEach(release => release()) }
-  await until(() => !['pending', 'processing'].includes(row(first.taskIds[0]).status))
+  await until(async () => !['pending', 'processing'].includes((await row(first.taskIds[0])).status))
   assert.equal(requests.length, before + 1)
 })
 
 test('a real tool-free response receives complete context and preserves ordered draft identities', async () => {
-  const id = version(), before = requests.length
+  const id = (await version()), before = requests.length
   const started = await planning.startFramePlan(id, options)
-  await until(() => requests.length > before)
+  await until(async () => requests.length > before)
   const message = JSON.stringify(requests.at(-1).messages.filter((message: any) => message.role === 'user'))
   assert.match(message, /目标画面数：3/)
   assert.match(message, /imagePrompt/)
@@ -100,38 +100,38 @@ test('a real tool-free response receives complete context and preserves ordered 
   assert.match(message, /ming.png/)
   assert.match(message, /orderedFrames/)
   releases.splice(0).forEach(release => release())
-  await until(() => row(started.taskIds[0]).status !== 'processing')
-  assert.equal(row(started.taskIds[0]).status, 'completed', row(started.taskIds[0]).error || '')
-  const result = JSON.parse(row(started.taskIds[0]).resultJson)
+  await until(async () => (await row(started.taskIds[0])).status !== 'processing')
+  assert.equal((await row(started.taskIds[0])).status, 'completed', (await row(started.taskIds[0])).error || '')
+  const result = JSON.parse((await row(started.taskIds[0])).resultJson)
   assert.equal(result.source, 'ai')
   assert.deepEqual(result.frames.map((frame: any) => frame.id), ['start', 'middle', 'end'])
   assert.deepEqual(result.frames.map((frame: any) => frame.offsetMs), [0, 1200, 5999])
   assert.equal(requests.length, before + 1)
-  assert.equal(db.select().from(schema.sysTask).all().length, 0, 'planning must not chain image generation')
+  assert.equal((await db.select().from(schema.sysTask).all()).length, 0, 'planning must not chain image generation')
 })
 
 test('context changed during a paid planning request fails without publishing an applicable result', async () => {
-  const id = version(), before = requests.length
+  const id = (await version()), before = requests.length
   const started = await planning.startFramePlan(id, options)
-  await until(() => requests.length > before)
-  db.update(schema.characters).set({ appearance: '长发' }).where(eq(schema.characters.id, characterId)).run()
+  await until(async () => requests.length > before)
+  await db.update(schema.characters).set({ appearance: '长发' }).where(eq(schema.characters.id, characterId)).run()
   releases.splice(0).forEach(release => release())
-  await until(() => row(started.taskIds[0]).status !== 'processing')
-  assert.equal(row(started.taskIds[0]).status, 'failed')
-  assert.match(row(started.taskIds[0]).error || '', /资料.*变化/)
-  assert.equal(planning.listFramePlans(id).plans.length, 0)
+  await until(async () => (await row(started.taskIds[0])).status !== 'processing')
+  assert.equal((await row(started.taskIds[0])).status, 'failed')
+  assert.match((await row(started.taskIds[0])).error || '', /资料.*变化/)
+  assert.equal((await planning.listFramePlans(id)).plans.length, 0)
 })
 
 test('a replaced processing claim cannot be completed or failed by the original worker', async () => {
-  const id = version(), taskId = await seedPending(id), before = requests.length
+  const id = (await version()), taskId = await seedPending(id), before = requests.length
   const worker = planning.tickFramePlans()
-  await until(() => requests.length > before)
+  await until(async () => requests.length > before)
   const replacement = { status: 'processing', createdAt: 'replacement-claim', resultJson: '{"marker":"new owner"}', error: 'new owner marker' }
-  db.update(schema.framePlans).set(replacement).where(eq(schema.framePlans.id, taskId)).run()
+  await db.update(schema.framePlans).set(replacement).where(eq(schema.framePlans.id, taskId)).run()
   releases.splice(0).forEach(release => release())
   await worker
-  assert.equal(row(taskId).status, replacement.status)
-  assert.equal(row(taskId).createdAt, replacement.createdAt)
-  assert.equal(row(taskId).resultJson, replacement.resultJson)
-  assert.equal(row(taskId).error, replacement.error)
+  assert.equal((await row(taskId)).status, replacement.status)
+  assert.equal((await row(taskId)).createdAt, replacement.createdAt)
+  assert.equal((await row(taskId)).resultJson, replacement.resultJson)
+  assert.equal((await row(taskId)).error, replacement.error)
 })

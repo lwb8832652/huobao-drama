@@ -427,8 +427,8 @@ async function getModel(fileModel: string | undefined, modelOverride?: string, t
 }
 
 /** Reuse the configured text-model transport for focused, tool-free AI calls. */
-export function resolveTextModel(modelOverride?: string, textConfigId?: number) {
-  return getModel(undefined, modelOverride, textConfigId)
+export async function resolveTextModel(modelOverride?: string, textConfigId?: number) {
+  return (await getModel(undefined, modelOverride, textConfigId))
 }
 
 const AGENT_TOOLS: Record<string, Record<string, any>> = {
@@ -466,7 +466,7 @@ function buildModel(type: string) {
     const promptFile = await loadBasePromptFile(type)
     const modelOverride = requestContext?.get('modelOverride' as never) as string | undefined
     const textConfigId = requestContext?.get('textConfigId' as never) as number | undefined
-    return getModel(promptFile?.model || undefined, modelOverride, textConfigId)
+    return (await getModel(promptFile?.model || undefined, modelOverride, textConfigId))
   }
 }
 

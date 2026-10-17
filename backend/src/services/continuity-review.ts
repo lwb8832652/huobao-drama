@@ -4,7 +4,7 @@ import { z } from 'zod'
 import { agentRegistry } from '../agents/index.js'
 import { loadBasePromptFile } from '../agents/prompts.js'
 import { getContentLanguage } from './app-settings.js'
-import { db, schema } from '../db/index.js'
+import { db, getInsertId, schema } from '../db/index.js'
 import { now } from '../utils/response.js'
 import { parseDataUrl, readImageAsCompressedDataUrl } from '../utils/storage.js'
 import { getActiveConfigId, getConfigById } from './ai.js'
@@ -119,35 +119,36 @@ export const continuityReviewSettingsSchema = z.object({
   enabled: z.boolean(),
   threshold: z.number().int().min(0).max(100),
 })
-export function getContinuityReviewSettings() {
-  const { enabled, threshold } = readEvaluationSettings()
+export async function getContinuityReviewSettings() {
+  const { enabled, threshold } = (await readEvaluationSettings())
   return { enabled, threshold }
 }
-export function updateContinuityReviewSettings(input: unknown) {
-  return patchLegacyEvaluationSettings(input)
+export async function updateContinuityReviewSettings(input: unknown) {
+  return (await patchLegacyEvaluationSettings(input))
 }
 
 const activeReviews = new Map<number, Promise<ContinuityReview>>()
 const queueReviewers = new Map<number, ContinuityReviewer>()
 
-function panelContext(
+async function panelContext(
   timeline: Timeline,
   groupId: string,
   panel: Panel,
   framePosition: 'first' | 'last',
-): ReviewPanelContext {
+): Promise<ReviewPanelContext> {
   const group = timeline.groups.find(item => item.id === groupId)!
   const frames = orderedFrames(panel).filter(frame => frame.url)
   const frame = framePosition === 'last' ? frames.at(-1) : frames[0]
   const scene = panel.sceneId
-    ? db.select().from(schema.scenes).where(eq(schema.scenes.id, panel.sceneId)).get()
+    ? (await db.select().from(schema.scenes).where(eq(schema.scenes.id, panel.sceneId)).get())
     : null
-  const characters = panel.characterIds.map(characterId =>
-    db.select().from(schema.characters).where(eq(schema.characters.id, characterId)).get(),
-  ).filter(Boolean)
-  const props = panel.propIds.map(propId =>
-    db.select().from(schema.props).where(eq(schema.props.id, propId)).get(),
-  ).filter(Boolean)
+  const present = <T,>(value: T | undefined | null): value is T => !!value
+  const characters = (await Promise.all(panel.characterIds.map(async characterId =>
+    (await db.select().from(schema.characters).where(eq(schema.characters.id, characterId)).get()),
+  ))).filter(present)
+  const props = (await Promise.all(panel.propIds.map(async propId =>
+    (await db.select().from(schema.props).where(eq(schema.props.id, propId)).get()),
+  ))).filter(present)
   return {
     group: { id: group.id, title: group.title, note: group.note },
     panel: {
@@ -163,18 +164,18 @@ function panelContext(
       id: scene.id, location: scene.location, time: scene.time, prompt: scene.prompt,
       lighting: scene.lighting, finalPrompt: scene.finalPrompt,
     } : null,
-    characters: characters.map(item => ({
+    characters: characters.map((item: NonNullable<typeof characters[number]>) => ({
       id: item!.id, name: item!.name, appearance: item!.appearance,
       styling: item!.styling, finalPrompt: item!.finalPrompt,
     })),
-    props: props.map(item => ({
+    props: props.map((item: NonNullable<typeof props[number]>) => ({
       id: item!.id, name: item!.name, type: item!.type,
       description: item!.description, finalPrompt: item!.finalPrompt,
     })),
   }
 }
 
-function reviewInput(timeline: Timeline, toGroupId: string): ContinuityReviewInput {
+async function reviewInput(timeline: Timeline, toGroupId: string): Promise<ContinuityReviewInput> {
   const transition = timeline.transitions.find(item => item.to === toGroupId)
   if (!transition) throw new PrevisError('首个镜头没有上一镜头，无需进行相邻镜头评分')
   const fromGroup = timeline.groups.find(item => item.id === transition.from)
@@ -188,8 +189,8 @@ function reviewInput(timeline: Timeline, toGroupId: string): ContinuityReviewInp
       continuity: transition.continuity,
       allowedChanges: transition.allowedChanges,
     },
-    from: panelContext(timeline, fromGroup.id, fromPanel, 'last'),
-    to: panelContext(timeline, toGroup.id, toPanel, 'first'),
+    from: (await panelContext(timeline, fromGroup.id, fromPanel, 'last')),
+    to: (await panelContext(timeline, toGroup.id, toPanel, 'first')),
   }
 }
 
@@ -257,7 +258,7 @@ export const runContinuityReviewer: ContinuityReviewer = async (input, options) 
   const requestContext = new RequestContext()
   requestContext.set('modelOverride', options.model)
   requestContext.set('textConfigId', options.configId)
-  requestContext.set('language', getContentLanguage())
+  requestContext.set('language', (await getContentLanguage()))
   const content: any[] = [{
     type: 'text',
     text: `请评估以下相邻镜头。结构化资料：\n${JSON.stringify(input, null, 2)}`,
@@ -272,19 +273,19 @@ export const runContinuityReviewer: ContinuityReviewer = async (input, options) 
   }
   const response = await retryRejectedRateLimit(async () => {
     if (options.queueJobId) {
-      const job = getQueueJobById(options.queueJobId)
+      const job = (await getQueueJobById(options.queueJobId))
       if (job?.status !== 'processing') throw new PrevisError('评测已取消')
       const snapshot = JSON.parse(job.snapshotJson)
       const config = await getConfigById(options.configId)
       if (!config || hashContent(config) !== snapshot.configHash) throw new PrevisError('评测模型配置已变化，请重新提交')
-      if (getQueueJobById(job.id)?.status !== 'processing') throw new PrevisError('评测已取消')
-      updateQueueJob(job.id, { submitted: true, phase: 'upstream' })
+      if ((await getQueueJobById(job.id))?.status !== 'processing') throw new PrevisError('评测已取消')
+      await updateQueueJob(job.id, { submitted: true, phase: 'upstream' })
     }
     return agent.generate([{ role: 'user', content }], { maxSteps: 1, requestContext })
-  }, () => {
-    if (options.queueJobId) updateQueueJob(options.queueJobId, { submitted: false, phase: 'retry_wait' })
+  }, async () => {
+    if (options.queueJobId) (await updateQueueJob(options.queueJobId, { submitted: false, phase: 'retry_wait' }))
   })
-  if (options.queueJobId) updateQueueJob(options.queueJobId, { upstreamDone: true, phase: 'saving' })
+  if (options.queueJobId) (await updateQueueJob(options.queueJobId, { upstreamDone: true, phase: 'saving' }))
   try { return parseReview(response.text) }
   catch (error: any) { error.upstreamDone = true; throw error }
 }
@@ -309,16 +310,16 @@ function serializeReview(
   }
 }
 
-export function listContinuityReviews(versionId: number): ContinuityReview[] {
-  const row = versionRow(versionId)
+export async function listContinuityReviews(versionId: number): Promise<ContinuityReview[]> {
+  const row = (await versionRow(versionId))
   const timeline = normalizeTimeline(JSON.parse(row.timelineJson))
-  const rows = db.select().from(schema.continuityReviews)
+  const rows = (await db.select().from(schema.continuityReviews)
     .where(eq(schema.continuityReviews.versionId, versionId))
-    .orderBy(desc(schema.continuityReviews.id)).all()
-  const currentInputs = new Map(timeline.transitions.map(transition => {
-    const input = reviewInput(timeline, transition.to)
+    .orderBy(desc(schema.continuityReviews.id)).all())
+  const currentInputs = new Map(await Promise.all(timeline.transitions.map(async transition => {
+    const input = (await reviewInput(timeline, transition.to))
     return [`${transition.from}:${transition.to}:${hashContent(input)}`, input] as const
-  }))
+  })))
   return rows.flatMap(review => {
     if (review.status !== 'completed') return []
     const input = currentInputs.get(`${review.fromGroupId}:${review.toGroupId}:${review.inputHash}`)
@@ -335,11 +336,11 @@ export const continuityReviewTaskPageSchema = z.object({
   keyword: z.string().trim().max(200).default(''),
 })
 
-function currentReviewInputs(timeline: Timeline) {
+async function currentReviewInputs(timeline: Timeline) {
   const inputs = new Map<string, ContinuityReviewInput>()
   for (const edge of timeline.transitions) {
     try {
-      const input = reviewInput(timeline, edge.to)
+      const input = (await reviewInput(timeline, edge.to))
       inputs.set(`${edge.from}:${edge.to}:${hashContent(input)}`, input)
     } catch { /* 已删除或不完整的边界没有有效输入。 */ }
   }
@@ -354,7 +355,7 @@ function reviewTaskResult(row: typeof schema.continuityReviews.$inferSelect) {
   } catch { return null }
 }
 
-function serializeReviewTask(
+async function serializeReviewTask(
   row: typeof schema.continuityReviews.$inferSelect,
   current: ContinuityReviewInput | undefined,
 ) {
@@ -371,29 +372,29 @@ function serializeReviewTask(
     fromGroupTitle: input?.from?.group?.title ?? null,
     toGroupTitle: input?.to?.group?.title ?? null,
     images: { from: input?.from?.frame?.url ?? null, to: input?.to?.frame?.url ?? null },
-    ...queueJobView('continuity_review', row.id),
+    ...(await queueJobView('continuity_review', row.id)),
   }
 }
 
-export function getContinuityReviewTask(versionId: number, taskId: number) {
-  const version = versionRow(versionId)
-  const row = db.select().from(schema.continuityReviews).where(and(
+export async function getContinuityReviewTask(versionId: number, taskId: number) {
+  const version = (await versionRow(versionId))
+  const row = (await db.select().from(schema.continuityReviews).where(and(
     eq(schema.continuityReviews.versionId, versionId), eq(schema.continuityReviews.id, taskId),
-  )).get()
+  )).get())
   if (!row) throw new PrevisError('评测任务不存在', 404)
   const timeline = normalizeTimeline(JSON.parse(version.timelineJson))
-  const current = currentReviewInputs(timeline).get(`${row.fromGroupId}:${row.toGroupId}:${row.inputHash}`)
-  return serializeReviewTask(row, current)
+  const current = (await currentReviewInputs(timeline)).get(`${row.fromGroupId}:${row.toGroupId}:${row.inputHash}`)
+  return await serializeReviewTask(row, current)
 }
 
-export function listContinuityReviewTasks(versionId: number, pagination: unknown = {}, unpaged = false) {
+export async function listContinuityReviewTasks(versionId: number, pagination: unknown = {}, unpaged = false) {
   const { page, pageSize, status, keyword } = continuityReviewTaskPageSchema.parse(pagination)
-  const timeline = normalizeTimeline(JSON.parse(versionRow(versionId).timelineJson))
-  const settings = getContinuityReviewSettings()
-  const inputs = currentReviewInputs(timeline)
-  const rows = db.select().from(schema.continuityReviews)
+  const timeline = normalizeTimeline(JSON.parse((await versionRow(versionId)).timelineJson))
+  const settings = await getContinuityReviewSettings()
+  const inputs = (await currentReviewInputs(timeline))
+  const rows = (await db.select().from(schema.continuityReviews)
     .where(eq(schema.continuityReviews.versionId, versionId))
-    .orderBy(desc(schema.continuityReviews.id)).all()
+    .orderBy(desc(schema.continuityReviews.id)).all())
   const currentInput = (row: typeof schema.continuityReviews.$inferSelect) =>
     inputs.get(`${row.fromGroupId}:${row.toGroupId}:${row.inputHash}`)
   const summary = {
@@ -405,7 +406,8 @@ export function listContinuityReviewTasks(versionId: number, pagination: unknown
     failed: rows.filter(row => row.status === 'failed').length,
   }
   const query = keyword.toLowerCase()
-  const items = rows.map(row => serializeReviewTask(row, currentInput(row))).filter(item => {
+  const serialized = await Promise.all(rows.map(row => serializeReviewTask(row, currentInput(row))))
+  const items = serialized.filter(item => {
     const matchesStatus = status === 'all' || (status === 'active'
       ? item.status === 'pending' || item.status === 'processing'
       : item.status === status)
@@ -422,74 +424,74 @@ export function listContinuityReviewTasks(versionId: number, pagination: unknown
   }
 }
 
-export function scheduleContinuityReviews(versionId: number, panelIds?: number[]) {
-  if (!getContinuityReviewSettings().enabled) return
-  const timeline = normalizeTimeline(JSON.parse(versionRow(versionId).timelineJson))
+export async function scheduleContinuityReviews(versionId: number, panelIds?: number[]) {
+  if (!(await getContinuityReviewSettings()).enabled) return
+  const timeline = normalizeTimeline(JSON.parse((await versionRow(versionId)).timelineJson))
   for (const edge of timeline.transitions) {
-    const input = reviewInput(timeline, edge.to)
+    const input = (await reviewInput(timeline, edge.to))
     if (panelIds && !panelIds.includes(input.from.panel.id) && !panelIds.includes(input.to.panel.id)) continue
     if (!input.from.frame?.url || !input.to.frame?.url) continue
-    db.insert(schema.continuityReviews).values({
+    await db.insert(schema.continuityReviews).values({
       versionId, fromGroupId: edge.from, toGroupId: edge.to, inputHash: hashContent(input),
       configId: 0, model: '', status: 'pending', resultJson: '', inputJson: JSON.stringify(input), createdAt: now(),
     }).onConflictDoNothing().run()
-    const row = db.select().from(schema.continuityReviews).where(and(eq(schema.continuityReviews.versionId, versionId),
+    const row = (await db.select().from(schema.continuityReviews).where(and(eq(schema.continuityReviews.versionId, versionId),
       eq(schema.continuityReviews.fromGroupId, edge.from), eq(schema.continuityReviews.toGroupId, edge.to),
-      eq(schema.continuityReviews.inputHash, hashContent(input)))).get()
-    const job = row && getQueueJob('continuity_review', row.id)
-    if (row?.status === 'cancelled' && (!job || job.source === 'automatic')) db.update(schema.continuityReviews)
+      eq(schema.continuityReviews.inputHash, hashContent(input)))).get())
+    const job = row && (await getQueueJob('continuity_review', row.id))
+    if (row?.status === 'cancelled' && (!job || job.source === 'automatic')) await db.update(schema.continuityReviews)
       .set({ status: 'pending', error: null, finishedAt: null }).where(eq(schema.continuityReviews.id, row.id)).run()
   }
 }
 
-onQueueSettingsChange(() => {
-  if (readEvaluationSettings().enabled) return
+onQueueSettingsChange(async () => {
+  if ((await readEvaluationSettings()).enabled) return
   // These records were scheduled automatically and have not yet been linked by
   // the worker. Manual admission creates the business record and link together.
-  for (const row of db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.status, 'pending')).all()) {
-    if (!getQueueJob('continuity_review', row.id)) db.update(schema.continuityReviews)
+  for (const row of (await db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.status, 'pending')).all())) {
+    if (!(await getQueueJob('continuity_review', row.id))) await db.update(schema.continuityReviews)
       .set({ status: 'cancelled', error: '自动评测已关闭', finishedAt: now() }).where(eq(schema.continuityReviews.id, row.id)).run()
   }
 })
 
-export function readContinuityReviewStatus(versionId: number) {
-  const settings = getContinuityReviewSettings()
-  const timeline = normalizeTimeline(JSON.parse(versionRow(versionId).timelineJson))
-  const rows = db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.versionId, versionId)).all()
-  return { settings, items: timeline.transitions.map(edge => {
-    const input = reviewInput(timeline, edge.to), inputHash = hashContent(input)
+export async function readContinuityReviewStatus(versionId: number) {
+  const settings = await getContinuityReviewSettings()
+  const timeline = normalizeTimeline(JSON.parse((await versionRow(versionId)).timelineJson))
+  const rows = (await db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.versionId, versionId)).all())
+  return { settings, items: await Promise.all(timeline.transitions.map(async edge => {
+    const input = (await reviewInput(timeline, edge.to)), inputHash = hashContent(input)
     const row = rows.find(row => row.fromGroupId === edge.from && row.toGroupId === edge.to && row.inputHash === inputHash)
     const result = row?.status === 'completed' ? continuityReviewResultSchema.parse(JSON.parse(row.resultJson)) : null
     return { id: row?.id ?? null, fromGroupId: edge.from, toGroupId: edge.to, inputHash,
       hasImages: !!(input.from.frame?.url && input.to.frame?.url),
       status: row?.status ?? (input.from.frame?.url && input.to.frame?.url ? 'idle' : 'missing_images'),
       result, error: row?.error ?? null, lowScore: !!result && result.overallScore < settings.threshold,
-      ...(row ? queueJobView('continuity_review', row.id) : {}) }
-  }) }
+      ...(row ? (await queueJobView('continuity_review', row.id)) : {}) }
+  })) }
 }
 
 let autoReviewTick: Promise<void> | undefined
 
-function pendingReview(row: typeof schema.continuityReviews.$inferSelect) {
-  return { id: row.id, status: row.status, ...queueJobView('continuity_review', row.id) }
+async function pendingReview(row: typeof schema.continuityReviews.$inferSelect) {
+  return { id: row.id, status: row.status, ...(await queueJobView('continuity_review', row.id)) }
 }
 
 export async function enqueueContinuityReview(
   versionId: number, options: ReviewOptions, reviewer: ContinuityReviewer = runContinuityReviewer,
   source: 'manual' | 'automatic' = 'manual',
 ) {
-  const version = versionRow(versionId)
+  const version = (await versionRow(versionId))
   if (!options.expectedInputHash && version.revision !== options.revision) throw new PrevisError('版本已更新，请刷新后重新评分', 409)
-  const input = reviewInput(normalizeTimeline(JSON.parse(version.timelineJson)), options.toGroupId)
+  const input = (await reviewInput(normalizeTimeline(JSON.parse(version.timelineJson)), options.toGroupId))
   const inputHash = hashContent(input)
   if (options.expectedInputHash && options.expectedInputHash !== inputHash) throw new PrevisError('评测输入已过期', 409)
   const identity = and(eq(schema.continuityReviews.versionId, versionId),
     eq(schema.continuityReviews.fromGroupId, input.from.group.id), eq(schema.continuityReviews.toGroupId, input.to.group.id),
     eq(schema.continuityReviews.inputHash, inputHash))
-  const prior = db.select().from(schema.continuityReviews).where(identity).get()
-  const priorJob = prior && getQueueJob('continuity_review', prior.id)
+  const prior = (await db.select().from(schema.continuityReviews).where(identity).get())
+  const priorJob = prior && (await getQueueJob('continuity_review', prior.id))
   if (prior && (priorJob?.status === 'pending' || priorJob?.status === 'processing')) {
-    if (source === 'manual' && priorJob.source === 'automatic') updateQueueJob(priorJob.id, { source: 'manual' })
+    if (source === 'manual' && priorJob.source === 'automatic') (await updateQueueJob(priorJob.id, { source: 'manual' }))
     if (reviewer !== runContinuityReviewer) queueReviewers.set(prior.id, reviewer)
     return pendingReview(prior)
   }
@@ -497,7 +499,7 @@ export async function enqueueContinuityReview(
   if (prior?.status === 'processing' && !priorJob) throw new PrevisError('该镜头边界正在评分，请核对提交状态', 409)
   const configId = options.configId || await getActiveConfigId('text')
   if (!configId) throw new PrevisError('未配置文本模型，请先到「设置」页添加并启用 AI 服务')
-  const configRow = db.select().from(schema.aiServiceConfigs).where(eq(schema.aiServiceConfigs.id, configId)).get()
+  const configRow = (await db.select().from(schema.aiServiceConfigs).where(eq(schema.aiServiceConfigs.id, configId)).get())
   const config = configRow?.isActive && configRow.serviceType === 'text' ? await getConfigById(configId) : null
   if (!config) throw new PrevisError('所选文本模型配置不可用')
   const promptFile = await loadBasePromptFile('continuity-reviewer')
@@ -513,85 +515,85 @@ export async function enqueueContinuityReview(
       side.frame.url = frozen.url
     }
   }
-  if (hashContent(reviewInput(normalizeTimeline(JSON.parse(versionRow(versionId).timelineJson)), options.toGroupId)) !== inputHash)
+  if (hashContent((await reviewInput(normalizeTimeline(JSON.parse((await versionRow(versionId)).timelineJson)), options.toGroupId))) !== inputHash)
     throw new PrevisError('评测输入已过期', 409)
-  const result = db.transaction(tx => {
-    if (source === 'automatic' && !readEvaluationSettings().enabled) throw new PrevisError('自动评测已关闭', 409)
-    const current = tx.select().from(schema.continuityReviews).where(identity).get()
-    const currentJob = current && getQueueJob('continuity_review', current.id)
+  const result = (await db.transaction(async tx => {
+    if (source === 'automatic' && !(await readEvaluationSettings()).enabled) throw new PrevisError('自动评测已关闭', 409)
+    const current = (await tx.select().from(schema.continuityReviews).where(identity).get())
+    const currentJob = current && (await getQueueJob('continuity_review', current.id))
     if (currentJob && ['pending', 'processing'].includes(currentJob.status)) {
-      if (source === 'manual' && currentJob.source === 'automatic') updateQueueJob(currentJob.id, { source: 'manual' })
+      if (source === 'manual' && currentJob.source === 'automatic') (await updateQueueJob(currentJob.id, { source: 'manual' }))
       return current!
     }
     if (current?.status === 'completed' && !options.force) return current
     const values = { versionId, fromGroupId: input.from.group.id, toGroupId: input.to.group.id, inputHash,
       configId, model, status: 'pending', error: null, resultJson: '', inputJson: JSON.stringify(frozenInput),
       startedAt: null, finishedAt: null, createdAt: current?.createdAt || now() }
-    const id = current?.id ?? Number(tx.insert(schema.continuityReviews).values(values).run().lastInsertRowid)
-    if (current) tx.update(schema.continuityReviews).set(values).where(eq(schema.continuityReviews.id, id)).run()
-    const episode = tx.select().from(schema.episodes).where(eq(schema.episodes.id, version.episodeId)).get()
+    const id = current?.id ?? getInsertId(await tx.insert(schema.continuityReviews).values(values).run())
+    if (current) await tx.update(schema.continuityReviews).set(values).where(eq(schema.continuityReviews.id, id)).run()
+    const episode = (await tx.select().from(schema.episodes).where(eq(schema.episodes.id, version.episodeId)).get())
     const snapshotJson = JSON.stringify({ configHash: hashContent(config), input: frozenInput, references, model })
-    if (currentJob) resetQueueJob('continuity_review', id, { inputHash, configId, snapshotJson, source })
-    else enqueueQueueJob({ ownerType: 'continuity_review', ownerId: id, kind: 'evaluation', projectId: episode?.dramaId,
-      configId, inputHash, snapshotJson, source })
-    return tx.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.id, id)).get()!
-  })
+    if (currentJob) (await resetQueueJob('continuity_review', id, { inputHash, configId, snapshotJson, source }))
+    else (await enqueueQueueJob({ ownerType: 'continuity_review', ownerId: id, kind: 'evaluation', projectId: episode?.dramaId,
+      configId, inputHash, snapshotJson, source }))
+    return (await tx.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.id, id)).get())!
+  }))
   queueReviewers.set(result.id, reviewer)
   // No model work is awaited by an HTTP submission. The durable worker starts it.
   return pendingReview(result)
 }
 
 async function executeQueuedReview(job: QueueJob): Promise<QueueOutcome> {
-  const row = db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.id, job.ownerId)).get()
+  const row = (await db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.id, job.ownerId)).get())
   if (!row) return { status: 'failed', error: '评测记录不存在' }
   if (job.submitted && !job.upstreamDone) return { status: 'needs_confirmation', error: '评分请求曾提交，请核对服务商记录后结束追踪' }
   let upstreamFinished = false
   try {
     const snapshot = JSON.parse(job.snapshotJson)
     const input = snapshot.input as ContinuityReviewInput
-    const current = reviewInput(normalizeTimeline(JSON.parse(versionRow(row.versionId).timelineJson)), row.toGroupId)
+    const current = (await reviewInput(normalizeTimeline(JSON.parse((await versionRow(row.versionId)).timelineJson)), row.toGroupId))
     if (hashContent(current) !== row.inputHash) throw new Error('评测输入已过期')
     const config = await getConfigById(row.configId)
     if (!config || hashContent(config) !== snapshot.configHash) throw new Error('评测模型配置已变化，请重新提交')
     for (const reference of snapshot.references || []) {
       if (mediaDigest(await readReferenceMedia(reference.url)) !== reference.digest) throw new Error('评测参考画面文件已变化，请重新提交')
     }
-    const currentJob = getQueueJobById(job.id)
+    const currentJob = (await getQueueJobById(job.id))
     if (currentJob?.status !== 'processing') return { status: 'failed', error: '评测已取消' }
-    db.update(schema.continuityReviews).set({ status: 'processing', startedAt: now(), error: null })
+    ;await db.update(schema.continuityReviews).set({ status: 'processing', startedAt: now(), error: null })
       .where(eq(schema.continuityReviews.id, row.id)).run()
     const reviewer = queueReviewers.get(row.id) || runContinuityReviewer
-    if (reviewer !== runContinuityReviewer) updateQueueJob(job.id, { submitted: true, phase: 'upstream' })
+    if (reviewer !== runContinuityReviewer) (await updateQueueJob(job.id, { submitted: true, phase: 'upstream' }))
     const result = normalizeReview(await reviewer(input, { configId: row.configId, model: row.model, queueJobId: job.id }))
     upstreamFinished = true
-    updateQueueJob(job.id, { upstreamDone: true, phase: 'saving' })
+    await updateQueueJob(job.id, { upstreamDone: true, phase: 'saving' })
     if (!input.from.frame?.url || !input.to.frame?.url) {
       result.confidence = 'low'
       if (!/图片|画面|文字/.test(result.summary)) result.summary = `边界画面不完整；${result.summary}`
     }
     let currentHash = ''
-    try { currentHash = hashContent(reviewInput(normalizeTimeline(JSON.parse(versionRow(row.versionId).timelineJson)), row.toGroupId)) } catch {}
+    try { currentHash = hashContent((await reviewInput(normalizeTimeline(JSON.parse((await versionRow(row.versionId)).timelineJson)), row.toGroupId))) } catch {}
     if (currentHash !== row.inputHash) {
-      db.update(schema.continuityReviews).set({ resultJson: JSON.stringify(result) }).where(eq(schema.continuityReviews.id, row.id)).run()
+      await db.update(schema.continuityReviews).set({ resultJson: JSON.stringify(result) }).where(eq(schema.continuityReviews.id, row.id)).run()
       throw new Error('评分期间输入已变化，本次结果仅保留在历史中，请重新评分')
     }
-    db.update(schema.continuityReviews).set({ status: 'completed', resultJson: JSON.stringify(result), error: null, finishedAt: now() })
+    await db.update(schema.continuityReviews).set({ status: 'completed', resultJson: JSON.stringify(result), error: null, finishedAt: now() })
       .where(eq(schema.continuityReviews.id, row.id)).run()
     return { status: 'completed' }
   } catch (error: any) {
-    const state = getQueueJobById(job.id)!
+    const state = (await getQueueJobById(job.id))!
     if (state.status === 'cancelled') return { status: 'failed', error: '评测已取消' }
     // Injected reviewers are local tests; unknown network outcomes in real paid requests remain held.
     const injected = queueReviewers.get(row.id) && queueReviewers.get(row.id) !== runContinuityReviewer
     const status = httpErrorStatus(error)
     const uncertain = state.submitted && !state.upstreamDone && !upstreamFinished && !error?.upstreamDone && !injected && (!Number.isInteger(status) || status! >= 500 || status === 408)
     if (uncertain) {
-      db.update(schema.continuityReviews).set({ status: 'processing', error: `请求结果不确定，请核对服务商记录：${error.message}` })
+      await db.update(schema.continuityReviews).set({ status: 'processing', error: `请求结果不确定，请核对服务商记录：${error.message}` })
         .where(eq(schema.continuityReviews.id, row.id)).run()
       return { status: 'needs_confirmation', error: error.message }
     }
-    if (state.submitted) updateQueueJob(job.id, { upstreamDone: true })
-    db.update(schema.continuityReviews).set({ status: 'failed', error: error?.message || '连续性评分失败', finishedAt: now() })
+    if (state.submitted) (await updateQueueJob(job.id, { upstreamDone: true }))
+    await db.update(schema.continuityReviews).set({ status: 'failed', error: error?.message || '连续性评分失败', finishedAt: now() })
       .where(eq(schema.continuityReviews.id, row.id)).run()
     return { status: 'failed', error: error?.message }
   } finally { queueReviewers.delete(row.id) }
@@ -599,27 +601,27 @@ async function executeQueuedReview(job: QueueJob): Promise<QueueOutcome> {
 registerQueueExecutor('continuity_review', {
   execute: executeQueuedReview,
   recover: async job => {
-    const row = db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.id, job.ownerId)).get()
+    const row = (await db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.id, job.ownerId)).get())
     if (row?.status === 'completed') return { status: 'completed' }
     if (job.upstreamDone) {
-      db.update(schema.continuityReviews).set({ status: 'failed', error: '评分结果未保存完整，请重新评测', finishedAt: now() }).where(eq(schema.continuityReviews.id, job.ownerId)).run()
+      await db.update(schema.continuityReviews).set({ status: 'failed', error: '评分结果未保存完整，请重新评测', finishedAt: now() }).where(eq(schema.continuityReviews.id, job.ownerId)).run()
       return { status: 'failed', error: '评分结果未保存完整，请重新评测' }
     }
     return { status: 'needs_confirmation', error: '服务重启，评分可能已提交，请核对服务商记录' }
   },
-  onRequeue: job => { db.update(schema.continuityReviews).set({ status: 'pending', startedAt: null, error: null }).where(eq(schema.continuityReviews.id, job.ownerId)).run() },
-  onCancel: job => { db.update(schema.continuityReviews).set({ status: 'cancelled', error: '已取消排队', finishedAt: now() }).where(eq(schema.continuityReviews.id, job.ownerId)).run() },
-  onRetry: job => {
-    updateQueueJob(job.id, { submitted: false, upstreamDone: false, externalTaskId: null })
-    db.update(schema.continuityReviews).set({ status: 'pending', error: null, startedAt: null, finishedAt: null }).where(eq(schema.continuityReviews.id, job.ownerId)).run()
+  onRequeue: async job => { await db.update(schema.continuityReviews).set({ status: 'pending', startedAt: null, error: null }).where(eq(schema.continuityReviews.id, job.ownerId)).run() },
+  onCancel: async job => { await db.update(schema.continuityReviews).set({ status: 'cancelled', error: '已取消排队', finishedAt: now() }).where(eq(schema.continuityReviews.id, job.ownerId)).run() },
+  onRetry: async job => {
+    (await updateQueueJob(job.id, { submitted: false, upstreamDone: false, externalTaskId: null }))
+    await db.update(schema.continuityReviews).set({ status: 'pending', error: null, startedAt: null, finishedAt: null }).where(eq(schema.continuityReviews.id, job.ownerId)).run()
   },
-  onReconcile: job => { db.update(schema.continuityReviews).set({ status: 'failed', error: '已人工确认服务商任务结束', finishedAt: now() }).where(eq(schema.continuityReviews.id, job.ownerId)).run() },
+  onReconcile: async job => { await db.update(schema.continuityReviews).set({ status: 'failed', error: '已人工确认服务商任务结束', finishedAt: now() }).where(eq(schema.continuityReviews.id, job.ownerId)).run() },
 })
 
 async function waitReview(id: number): Promise<ContinuityReview> {
   for (;;) {
-    const row = db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.id, id)).get()!
-    const job = getQueueJob('continuity_review', id)
+    const row = (await db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.id, id)).get())!
+    const job = (await getQueueJob('continuity_review', id))
     if (row.status === 'completed') return serializeReview(row, JSON.parse(row.inputJson || '{}'), false)
     if (['failed', 'cancelled'].includes(row.status) || job?.phase === 'needs_confirmation') throw new PrevisError(row.error || job?.error || '连续性评分失败', 409)
     await tickTaskQueue()
@@ -637,35 +639,35 @@ export async function reviewContinuity(versionId: number, options: ReviewOptions
 export function tickContinuityReviews(reviewer: ContinuityReviewer = runContinuityReviewer): Promise<void> {
   if (autoReviewTick) return autoReviewTick
   autoReviewTick = (async () => {
-    if (!getContinuityReviewSettings().enabled) return
-    const pending = db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.status, 'pending')).orderBy(schema.continuityReviews.id).all()
+    if (!(await getContinuityReviewSettings()).enabled) return
+    const pending = (await db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.status, 'pending')).orderBy(schema.continuityReviews.id).all())
     const ids: number[] = []
     for (const row of pending) {
-      const job = getQueueJob('continuity_review', row.id)
+      const job = (await getQueueJob('continuity_review', row.id))
       if (job && ['pending', 'processing'].includes(job.status)) continue
       try {
-        const version = versionRow(row.versionId)
+        const version = (await versionRow(row.versionId))
         const task = await enqueueContinuityReview(row.versionId, { revision: version.revision, toGroupId: row.toGroupId,
           expectedInputHash: row.inputHash }, reviewer, 'automatic')
         ids.push(task.id)
       } catch (error: any) {
-        db.update(schema.continuityReviews).set({ status: 'failed', error: error.message, finishedAt: now() })
+        await db.update(schema.continuityReviews).set({ status: 'failed', error: error.message, finishedAt: now() })
           .where(and(eq(schema.continuityReviews.id, row.id), eq(schema.continuityReviews.status, 'pending'))).run()
       }
     }
     await tickTaskQueue()
     // Tests injecting a local reviewer can await their own work without changing the HTTP contract.
-    if (reviewer !== runContinuityReviewer && !readEvaluationSettings().paused)
+    if (reviewer !== runContinuityReviewer && !(await readEvaluationSettings()).paused)
       await Promise.all(ids.map(id => waitReview(id).catch(() => undefined)))
   })().finally(() => { autoReviewTick = undefined })
   return autoReviewTick
 }
 export async function migrateContinuityQueue() {
-  for (const row of db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.status, 'processing')).all()) {
-    if (getQueueJob('continuity_review', row.id)) continue
-    const version = versionRow(row.versionId)
-    const episode = db.select().from(schema.episodes).where(eq(schema.episodes.id, version.episodeId)).get()
-    enqueueQueueJob({ ownerType: 'continuity_review', ownerId: row.id, kind: 'evaluation', projectId: episode?.dramaId,
+  for (const row of (await db.select().from(schema.continuityReviews).where(eq(schema.continuityReviews.status, 'processing')).all())) {
+    if ((await getQueueJob('continuity_review', row.id))) continue
+    const version = (await versionRow(row.versionId))
+    const episode = (await db.select().from(schema.episodes).where(eq(schema.episodes.id, version.episodeId)).get())
+    await enqueueQueueJob({ ownerType: 'continuity_review', ownerId: row.id, kind: 'evaluation', projectId: episode?.dramaId,
       configId: row.configId, inputHash: row.inputHash, initialStatus: 'processing', submitted: true })
   }
 }

@@ -67,15 +67,15 @@ test('planning hash changes with video action, existing plan state, and referenc
 test('readonly planning context includes actual visual identities, scene, props, action prompt, and existing frames', async () => {
   assert.equal(typeof contextApi.readFramePlanningContext, 'function')
   const ts = new Date().toISOString()
-  const dramaId = Number(db.insert(schema.dramas).values({ title: '测试剧', createdAt: ts, updatedAt: ts }).run().lastInsertRowid)
-  const episodeId = Number(db.insert(schema.episodes).values({ dramaId, episodeNumber: 1, title: '测试集', createdAt: ts, updatedAt: ts }).run().lastInsertRowid)
-  const characterId = Number(db.insert(schema.characters).values({ dramaId, name: '小明', description: '青年', appearance: '黑色短发', styling: '红色外套', finalPrompt: '固定身份', imageUrl: '/static/character.png', createdAt: ts, updatedAt: ts }).run().lastInsertRowid)
-  const propId = Number(db.insert(schema.props).values({ dramaId, name: '杯子', description: '白色陶瓷杯', prompt: '右侧杯柄', createdAt: ts, updatedAt: ts }).run().lastInsertRowid)
-  const sceneId = Number(db.insert(schema.scenes).values({ dramaId, location: '厨房', time: '早晨', prompt: '窗户在左侧，桌子在中央', lighting: '左侧暖光', imageUrl: '/static/scene.png', createdAt: ts, updatedAt: ts }).run().lastInsertRowid)
+  const dramaId = Number((await db.insert(schema.dramas).values({ title: '测试剧', createdAt: ts, updatedAt: ts }).run()).lastInsertRowid)
+  const episodeId = Number((await db.insert(schema.episodes).values({ dramaId, episodeNumber: 1, title: '测试集', createdAt: ts, updatedAt: ts }).run()).lastInsertRowid)
+  const characterId = Number((await db.insert(schema.characters).values({ dramaId, name: '小明', description: '青年', appearance: '黑色短发', styling: '红色外套', finalPrompt: '固定身份', imageUrl: '/static/character.png', createdAt: ts, updatedAt: ts }).run()).lastInsertRowid)
+  const propId = Number((await db.insert(schema.props).values({ dramaId, name: '杯子', description: '白色陶瓷杯', prompt: '右侧杯柄', createdAt: ts, updatedAt: ts }).run()).lastInsertRowid)
+  const sceneId = Number((await db.insert(schema.scenes).values({ dramaId, location: '厨房', time: '早晨', prompt: '窗户在左侧，桌子在中央', lighting: '左侧暖光', imageUrl: '/static/scene.png', createdAt: ts, updatedAt: ts }).run()).lastInsertRowid)
   const target = { ...panel(), imagePrompt: '小明红外套，右手持白杯，桌在中央', referenceImages: ['/static/common.png'], referenceLabels: ['空间布局'], characterIds: [characterId], propIds: [propId], sceneId }
   target.frames = [target.frames[2], target.frames[0], target.frames[1]]
   target.frames[0].referenceImages = []
-  const versionId = Number(db.insert(schema.animaticVersions).values({ episodeId, versionNo: 1, timelineJson: JSON.stringify({ schemaVersion: 2, panels: [target], groups: [], transitions: [], audio: [], strategy: defaultStrategy, acknowledgements: {} }), createdAt: ts, updatedAt: ts }).run().lastInsertRowid)
+  const versionId = Number((await db.insert(schema.animaticVersions).values({ episodeId, versionNo: 1, timelineJson: JSON.stringify({ schemaVersion: 2, panels: [target], groups: [], transitions: [], audio: [], strategy: defaultStrategy, acknowledgements: {} }), createdAt: ts, updatedAt: ts }).run()).lastInsertRowid)
   const context = await contextApi.readFramePlanningContext(versionId, [7], episodeId, dramaId)
   assert.ok(!('error' in context))
   const shot = context.panels[0] as any
@@ -109,7 +109,7 @@ test('readonly planning context includes actual visual identities, scene, props,
   assert.match(content, /description/)
   assert.doesNotMatch(content, /先调用 read_previs_context/)
   const unavailable = { ...target, sceneId: 99999, characterIds: [99999], propIds: [99999] }
-  const missingVersion = Number(db.insert(schema.animaticVersions).values({ episodeId, versionNo: 2, timelineJson: JSON.stringify({ schemaVersion: 2, panels: [unavailable], groups: [], transitions: [], audio: [], strategy: defaultStrategy, acknowledgements: {} }), createdAt: ts, updatedAt: ts }).run().lastInsertRowid)
+  const missingVersion = Number((await db.insert(schema.animaticVersions).values({ episodeId, versionNo: 2, timelineJson: JSON.stringify({ schemaVersion: 2, panels: [unavailable], groups: [], transitions: [], audio: [], strategy: defaultStrategy, acknowledgements: {} }), createdAt: ts, updatedAt: ts }).run()).lastInsertRowid)
   const missing = await contextApi.readFramePlanningContext(missingVersion, [7], episodeId, dramaId)
   assert.ok(!('error' in missing))
   const missingShot = missing.panels[0] as any
@@ -139,10 +139,10 @@ test('every frame splitter prompt layer declares the same static-state and conti
 })
 
 test('planning receives previous and next text/assets/boundary states in timeline order directly', async () => {
-  const episode = db.select().from(schema.episodes).all()[0]
+  const episode = (await db.select().from(schema.episodes).all())[0]
   const target = panel(), previous = { ...panel(), id: 90, title: 'Previous', description: 'Previous action', frames: [{ ...makeFrame('previous-last', 5999), prompt: 'Previous static end', url: '/static/end.png' }] }, next = { ...panel(), id: 3, title: 'Next', description: 'Next action', frames: [{ ...makeFrame('next-first'), prompt: 'Next static start' }] }
   const t = { schemaVersion: 2, panels: [next, target, previous], groups: [90, 7, 3].map(id => ({ id: `panel-${id}`, title: '', note: '', panelIds: [id], entry: { holding: 'cup' }, exit: { holding: 'cup' } })), transitions: [{ from: 'panel-90', to: 'panel-7', type: 'cut', continuity: 'strong', allowedChanges: [] }], audio: [], strategy: defaultStrategy, acknowledgements: {} }
-  const versionId = Number(db.insert(schema.animaticVersions).values({ episodeId: episode.id, versionNo: 3, timelineJson: JSON.stringify(t), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }).run().lastInsertRowid)
+  const versionId = Number((await db.insert(schema.animaticVersions).values({ episodeId: episode.id, versionNo: 3, timelineJson: JSON.stringify(t), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }).run()).lastInsertRowid)
   const result = await contextApi.readFramePlanningContext(versionId, [7], episode.id, episode.dramaId)
   assert.ok(!('error' in result))
   const shot = result.panels[0] as any

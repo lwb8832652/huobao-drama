@@ -37,6 +37,8 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 COPY --from=backend-build /build/backend/src ./backend/src
+COPY --from=backend-build /build/backend/scripts ./backend/scripts
+COPY --from=backend-build /build/backend/db ./backend/db
 COPY --from=backend-build /build/backend/node_modules ./backend/node_modules
 COPY --from=backend-build /build/backend/package.json ./backend/package.json
 COPY --from=backend-build /build/backend/tsconfig.json ./backend/tsconfig.json

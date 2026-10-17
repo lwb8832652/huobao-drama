@@ -7,8 +7,12 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "build": "tsc",
-    "typecheck": "tsc --noEmit",
-    "backfill-artwork": "tsx scripts/backfill-artwork.ts"
+    "typecheck": "tsc --noEmit --declaration false",
+    "test:db-dialects": "node --import tsx --test tests/db-dialect-sqlite.test.ts tests/db-dialect-mysql.test.ts tests/db-dialect-routes.test.ts tests/db-dialect-schema.test.ts",
+    "backfill-artwork": "tsx scripts/backfill-artwork.ts",
+    "db:migrate:mysql": "tsx db/migrate-mysql-schema.ts",
+    "db:migrate:sqlite-to-mysql": "tsx db/migrate-sqlite-to-mysql.ts",
+    "db:verify:mysql": "tsx db/verify-mysql-migration.ts"
   },
   "keywords": [],
   "author": "",
@@ -26,6 +30,7 @@
     "ffprobe-static": "^3.1.0",
     "fluent-ffmpeg": "^2.1.3",
     "hono": "^4.12.9",
+    "mysql2": "^3.22.5",
     "pino": "^10.3.1",
     "sharp": "^0.34.5",
     "undici": "^6.29.0",
@@ -38,7 +43,6 @@
     "@types/node": "^25.5.0",
     "@types/uuid": "^10.0.0",
     "drizzle-kit": "^0.31.10",
-    "mysql2": "^3.22.5",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"
   },

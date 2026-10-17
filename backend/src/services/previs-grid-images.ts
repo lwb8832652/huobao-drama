@@ -90,8 +90,8 @@ export async function mergeGridSelection(
 ) {
   validateGridTargets(grid, targets)
   const [base, proposed] = await Promise.all([
-    splitGrid(original, grid, aspectRatio),
-    splitGrid(model, grid, aspectRatio),
+    (await splitGrid(original, grid, aspectRatio)),
+    (await splitGrid(model, grid, aspectRatio)),
   ])
   const replacements = await Promise.all(
     grid.cells

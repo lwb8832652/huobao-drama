@@ -4,8 +4,8 @@ import { evaluateProductionRules, type QualityIssue } from './production-quality
 import { checkProductionQuality } from './production-quality.js'
 
 type Options = { configId?: number; model?: string }
-function inspect(episodeId: number) {
-  const episode = episodeForPrevis(episodeId), timeline = initialTimeline(episodeId)
+async function inspect(episodeId: number) {
+  const episode = (await episodeForPrevis(episodeId)), timeline = (await initialTimeline(episodeId))
   const input = { script: episode.scriptContent || episode.content || '', panels: timeline.panels }
   const rules = evaluateProductionRules(input)
   const missingIds = new Set(input.panels.filter(p => !p.videoPrompt.trim()).map(p => p.id))
@@ -18,7 +18,7 @@ function inspect(episodeId: number) {
 
 /** Called after breakdown or after the entire prompt batch settles. */
 export async function finalizeEpisodeQuality(episodeId: number, options: Options = {}) {
-  const state = inspect(episodeId), version = getWorkspace(episodeId)
+  const state = (await inspect(episodeId)), version = (await getWorkspace(episodeId))
   const report = await checkProductionQuality(version.id, { ai: !state.missingPrompts, source: 'automatic', ...options })
   return {
     status: state.actionable.length ? 'needs_attention' as const : state.missingPrompts ? 'awaiting_prompts' as const : 'passed' as const,
@@ -32,7 +32,7 @@ export async function finishStoryboardBreakdown(episodeId: number, options: Opti
   requestContext: object
   repair?: (issues: QualityIssue[]) => Promise<unknown>
 }) {
-  let state = inspect(episodeId)
+  let state = (await inspect(episodeId))
   if (!getStoryboardBreakdownReceipt(options.requestContext).some(id => state.panelIds.includes(id))) {
     throw new PrevisError('Agent 未保存本次分镜，拆分未完成；请重试或更换文本模型')
   }

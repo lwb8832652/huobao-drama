@@ -2,7 +2,7 @@ import path from 'node:path'
 import { mkdir, writeFile } from 'node:fs/promises'
 import sharp from 'sharp'
 import { and, desc, eq, inArray, ne } from 'drizzle-orm'
-import { db, schema } from '../db/index.js'
+import { db, getInsertId, schema } from '../db/index.js'
 import { STORAGE_ROOT } from '../utils/paths.js'
 import { now } from '../utils/response.js'
 import { getActiveConfigId, getConfigById } from './ai.js'
@@ -98,19 +98,19 @@ const snapshotFrameIds = (s: GridSnapshot) =>
   s.panel ? orderedFrames(s.panel).map((frame) => frame.id) : s.grid.cells.map((c) => c.frameId)
 const sameFrameStructure = (p: Panel, s: GridSnapshot) =>
   JSON.stringify(orderedFrames(p).map((frame) => frame.id)) === JSON.stringify(snapshotFrameIds(s))
-function candidateRow(versionId: number, id: number) {
-  versionRow(versionId)
-  const row = db
+async function candidateRow(versionId: number, id: number) {
+  await versionRow(versionId)
+  const row = (await db
     .select()
     .from(table)
     .where(and(eq(table.versionId, versionId), eq(table.id, id)))
-    .get()
+    .get())
   if (!row) throw new PrevisError('宫格候选不存在', 404)
   return row
 }
-function view(row: Row) {
+async function view(row: Row) {
   const s = snapshot(row)
-  const timeline = normalizeTimeline(JSON.parse(versionRow(row.versionId).timelineJson))
+  const timeline = normalizeTimeline(JSON.parse((await versionRow(row.versionId)).timelineJson))
   const continuityStale = s.continuity ? !continuityMatchesTimeline(s.continuity, timeline) : false
   return {
     continuity: s.continuity,
@@ -145,9 +145,9 @@ function view(row: Row) {
     baseCandidateId: s.baseCandidateId || null,
   }
 }
-export function listGridCandidates(versionId: number, panelId?: number) {
-  versionRow(versionId)
-  return db
+export async function listGridCandidates(versionId: number, panelId?: number) {
+  ;await versionRow(versionId)
+  const rows = await db
     .select()
     .from(table)
     .where(
@@ -158,7 +158,7 @@ export function listGridCandidates(versionId: number, panelId?: number) {
     .orderBy(desc(table.id))
     .limit(100)
     .all()
-    .map(view)
+  return Promise.all(rows.map(view))
 }
 export async function gridCapabilities(configId?: number, model?: string) {
   const id = configId || (await getActiveConfigId('image')),
@@ -242,9 +242,9 @@ export function promptFor(
     .filter(Boolean)
     .join('\n')
 }
-function assertNoLegacyConflict(versionId: number, panelId: number) {
+async function assertNoLegacyConflict(versionId: number, panelId: number) {
   if (
-    readBatches(versionId).some(
+    (await readBatches(versionId)).some(
       (b) =>
         b.type === 'image' && b.items.some((i) => i.panelId === panelId && activeStatuses.includes(i.status)),
     )
@@ -253,21 +253,21 @@ function assertNoLegacyConflict(versionId: number, panelId: number) {
   }
 }
 /** 宫格任务要进任务面板，必须带上所属剧集：sys_task 无 episode_id，靠 drama_id 聚合 */
-function dramaIdOfVersion(versionId: number): number | undefined {
-  const version = versionRow(versionId)
-  return db.select().from(schema.episodes).where(eq(schema.episodes.id, version.episodeId)).get()?.dramaId
+async function dramaIdOfVersion(versionId: number): Promise<number | undefined> {
+  const version = (await versionRow(versionId))
+  return (await db.select().from(schema.episodes).where(eq(schema.episodes.id, version.episodeId)).get())?.dramaId
 }
 
-export function hasGridTask(versionId: number, panelIds?: number[]) {
-  return db
+export async function hasGridTask(versionId: number, panelIds?: number[]) {
+  const rows = await db
     .select()
     .from(table)
     .where(and(eq(table.versionId, versionId), inArray(table.status, activeStatuses)))
     .all()
-    .some((c) => !panelIds || panelIds.includes(c.panelId))
+  return rows.some((c) => !panelIds || panelIds.includes(c.panelId))
 }
 export async function startGridCandidates(versionId: number, request: GridRequest) {
-  const row = requireEditable(versionId, request.revision),
+  const row = (await requireEditable(versionId, request.revision)),
     t = normalizeTimeline(JSON.parse(row.timelineJson))
   if (!request.panelIds.length || new Set(request.panelIds).size !== request.panelIds.length)
     throw new PrevisError('请选择不重复的分镜')
@@ -282,18 +282,18 @@ export async function startGridCandidates(versionId: number, request: GridReques
   const configId = request.configId || (await getActiveConfigId('image')),
     config = configId ? await getConfigById(configId) : null
   if (!config || !configId) throw new PrevisError('请先配置并启用图片模型')
-  const configRow = db
+  const configRow = (await db
     .select()
     .from(schema.aiServiceConfigs)
     .where(eq(schema.aiServiceConfigs.id, configId))
-    .get()
+    .get())
   if (configRow?.serviceType !== 'image') throw new PrevisError('所选配置不是图片服务')
   const model = request.model || config.model,
     caps = gridImageCapabilities(config, model)
   if (!caps.enabled || !caps.supportsReferences || (request.mode !== 'generate' && !caps.supportsEdit))
     throw new PrevisError(caps.reason || '当前模型不支持参考生图或图片微调')
-  const ep = db.select().from(schema.episodes).where(eq(schema.episodes.id, row.episodeId)).get()!
-  const drama = db.select().from(schema.dramas).where(eq(schema.dramas.id, ep.dramaId)).get()
+  const ep = (await db.select().from(schema.episodes).where(eq(schema.episodes.id, row.episodeId)).get())!
+  const drama = (await db.select().from(schema.dramas).where(eq(schema.dramas.id, ep.dramaId)).get())
   const style = await getDramaStylePrompt(ep.dramaId)
   const size = chooseGridSize(
     caps,
@@ -301,10 +301,10 @@ export async function startGridCandidates(versionId: number, request: GridReques
     request.resolution || caps.resolutions[0] || '1K',
   )
   // Validate all manifests and counts before reading/freezing any source, including remote uploads.
-  const assetsByPanel = new Map(panels.map(p => {
+  const assetsByPanel = new Map(await Promise.all(panels.map(async p => {
     const firstId = orderedFrames(p)[0]?.id
-    const manifest = resolvePanelGridReferences(p, ep.dramaId, { timeline: t, versionId,
-      includeBoundary: request.mode === 'generate' || Boolean(firstId && request.targetFrameIds?.includes(firstId)) })
+    const manifest = (await resolvePanelGridReferences(p, ep.dramaId, { timeline: t, versionId,
+      includeBoundary: request.mode === 'generate' || Boolean(firstId && request.targetFrameIds?.includes(firstId)) }))
     if (manifest.items.some(item => item.required && !item.url) || (request.mode === 'generate' && !manifest.ready))
       throw new PrevisError(manifest.error)
     const assets = manifest.items.filter((item): item is GridReferenceItem & { url: string } => Boolean(item.url))
@@ -314,11 +314,11 @@ export async function startGridCandidates(versionId: number, request: GridReques
         `需要 ${referenceSlots} 张参考图片，当前模型上限 ${caps.maxReferences}；请调整资产或更换模型`,
       )
     return [p.id, { assets, continuity: manifest.continuity }] as const
-  }))
+  })))
   // Freeze every unit first: an invalid later unit cannot create partial paid tasks.
   const prepared: { panelId: number; inputHash: string; s: GridSnapshot }[] = []
   for (const p of panels) {
-    assertNoLegacyConflict(versionId, p.id)
+    ;await assertNoLegacyConflict(versionId, p.id)
     const frames = orderedFrames(p),
       grid = generationGrid(frames.map((f) => f.id!), drama?.aspectRatio || '16:9')
     const requestedTargets =
@@ -353,7 +353,7 @@ export async function startGridCandidates(versionId: number, request: GridReques
     if (request.mode !== 'generate') {
       if (request.baseCandidateId) {
         if (request.mode === 'frame_edit') throw new PrevisError('请先采用并切分宫格，再进行单格精修')
-        const prior = candidateRow(versionId, request.baseCandidateId),
+        const prior = (await candidateRow(versionId, request.baseCandidateId)),
           s = snapshot(prior)
         if (
           prior.panelId !== p.id ||
@@ -378,7 +378,7 @@ export async function startGridCandidates(versionId: number, request: GridReques
         if (request.mode === 'frame_edit') base = currentSources.find((f) => f.frameId === targets[0])!.frozen
         else {
           const canvas = await composeGrid(
-            await Promise.all(currentSources.map((f) => readReferenceMedia(f.frozen.url))),
+            await Promise.all(currentSources.map(async (f) => (await readReferenceMedia(f.frozen.url)))),
             grid,
             size.width,
             size.height,
@@ -443,11 +443,11 @@ export async function startGridCandidates(versionId: number, request: GridReques
     const inputHash = hashContent({ mode: request.mode, ...s, revision: undefined })
     prepared.push({ panelId: p.id, inputHash, s })
   }
-  requireEditable(versionId, request.revision)
-  const items = db.transaction((tx) =>
-    prepared.map(({ panelId, inputHash, s }) => {
-      assertNoLegacyConflict(versionId, panelId)
-      const active = tx
+  ;await requireEditable(versionId, request.revision)
+  const items = await db.transaction(async tx =>
+    Promise.all(prepared.map(async ({ panelId, inputHash, s }) => {
+      ;await assertNoLegacyConflict(versionId, panelId)
+      const active = (await tx
         .select()
         .from(table)
         .where(
@@ -456,46 +456,42 @@ export async function startGridCandidates(versionId: number, request: GridReques
             eq(table.panelId, panelId),
             inArray(table.status, activeStatuses),
           ),
-        )
-        .get()
+        ).get())
       if (active) {
-        if (active.inputHash === inputHash) return view(active)
+        if (active.inputHash === inputHash) return (await view(active))
         throw new PrevisError('该分镜已有宫格任务，请等待或取消后再提交', 409)
       }
       // 批次（代际）：整组生成开新批；微调跟随基准候选（跨 panel 的基准不继承），
       // 无基准的微调跟随当前采用结果；都没有（含历史 batch_no=0）才开新批
-      const batchNo = (() => {
+      const batchNo = await (async () => {
         if (request.baseCandidateId) {
-          const base = tx.select({ batchNo: table.batchNo, panelId: table.panelId }).from(table)
-            .where(and(eq(table.versionId, versionId), eq(table.id, request.baseCandidateId))).get()
+          const base = (await tx.select({ batchNo: table.batchNo, panelId: table.panelId }).from(table)
+            .where(and(eq(table.versionId, versionId), eq(table.id, request.baseCandidateId))).get())
           if (base && base.panelId === panelId && base.batchNo) return base.batchNo
         }
         if (request.mode !== 'generate') {
-          const adopted = tx.select({ batchNo: table.batchNo }).from(table)
-            .where(and(eq(table.versionId, versionId), eq(table.panelId, panelId), eq(table.status, 'adopted'))).get()
+          const adopted = (await tx.select({ batchNo: table.batchNo }).from(table)
+            .where(and(eq(table.versionId, versionId), eq(table.panelId, panelId), eq(table.status, 'adopted'))).get())
           if (adopted?.batchNo) return adopted.batchNo
         }
-        const latest = tx.select({ batchNo: table.batchNo }).from(table)
+        const latest = (await tx.select({ batchNo: table.batchNo }).from(table)
           .where(and(eq(table.versionId, versionId), eq(table.panelId, panelId)))
-          .orderBy(desc(table.batchNo)).limit(1).get()
+          .orderBy(desc(table.batchNo)).limit(1).get())
         return (latest?.batchNo || 0) + 1
       })()
-      const inserted = tx
-        .insert(table)
-        .values({
-          versionId,
-          panelId,
-          mode: request.mode,
-          inputHash,
-          batchNo,
-          snapshotJson: JSON.stringify(s),
-          createdAt: now(),
-          updatedAt: now(),
-        })
-        .returning()
-        .get()
-      return view(inserted)
-    }),
+      const insertedId = getInsertId(await tx.insert(table).values({
+        versionId,
+        panelId,
+        mode: request.mode,
+        inputHash,
+        batchNo,
+        snapshotJson: JSON.stringify(s),
+        createdAt: now(),
+        updatedAt: now(),
+      }).run())
+      const inserted = (await tx.select().from(table).where(eq(table.id, insertedId)).get())!
+      return (await view(inserted))
+    })),
   )
   return { items }
 }
@@ -507,7 +503,7 @@ async function processResult(row: Row, url: string) {
     .png()
     .toBuffer()
   const rawMetadata = await sharp(buffer).metadata()
-  db.update(table)
+  await db.update(table)
     .set({ rawUrl: raw.url, width: rawMetadata.width, height: rawMetadata.height })
     .where(eq(table.id, row.id))
     .run()
@@ -538,7 +534,7 @@ async function processResult(row: Row, url: string) {
   width = metadata.width!
   height = metadata.height!
   const previewUrl = await saveArtifact(preview, `candidate-${row.id}`)
-  db.update(table)
+  await db.update(table)
     .set({
       status: 'ready', rawUrl: raw.url, previewUrl, width, height,
       sourceWidth: cropped?.width ?? null, sourceHeight: cropped?.height ?? null,
@@ -556,12 +552,12 @@ async function processResult(row: Row, url: string) {
  * 并记录原因，用户仍可在「生成记录」中打开候选手动采用。
  */
 async function autoAdoptGridCandidate(candidateId: number) {
-  const row = db.select().from(table).where(eq(table.id, candidateId)).get()
+  const row = (await db.select().from(table).where(eq(table.id, candidateId)).get())
   if (!row || row.mode !== 'generate' || row.status !== 'ready') return
   try {
     await adoptGridCandidate(row.versionId, row.id, snapshot(row).revision)
   } catch (error) {
-    db.update(table)
+    await db.update(table)
       .set({ error: `已生成，自动采用失败：${(error as Error).message}。请在生成记录中打开并手动采用。`, updatedAt: now() })
       .where(and(eq(table.id, row.id), eq(table.status, 'ready')))
       .run()
@@ -572,13 +568,13 @@ export async function tickGridCandidates() {
   if (ticking) return
   ticking = true
   try {
-    const rows = db
+    const rows = (await db
       .select()
       .from(table)
       .where(inArray(table.status, activeStatuses))
       .orderBy(table.id)
       .limit(20)
-      .all()
+      .all())
     for (let row of rows)
       try {
         const s = snapshot(row)
@@ -588,11 +584,11 @@ export async function tickGridCandidates() {
           const current = await getConfigById(s.configId)
           if (!current || hashContent(current) !== s.configHash)
             throw new Error('图片配置已变化，请核对后重新提交')
-          const existing = db.select().from(schema.sysTask).where(eq(schema.sysTask.previsItemKey, `grid-${row.id}`)).get()
+          const existing = (await db.select().from(schema.sysTask).where(eq(schema.sysTask.previsItemKey, `grid-${row.id}`)).get())
           const taskId = existing?.id || await generateImage({
             previs: { versionId: row.versionId, itemKey: `grid-${row.id}` },
             storyboardId: row.panelId,
-            dramaId: dramaIdOfVersion(row.versionId),
+            dramaId: (await dramaIdOfVersion(row.versionId)),
             prompt: s.prompt,
             model: s.model,
             size: s.size,
@@ -601,20 +597,20 @@ export async function tickGridCandidates() {
             frozenConfigHash: s.configHash,
             frozenReferences: [...(s.base ? [s.base] : []), ...s.references],
           })
-          db.update(table).set({ taskId }).where(eq(table.id, row.id)).run()
+          await db.update(table).set({ taskId }).where(eq(table.id, row.id)).run()
           row = { ...row, taskId }
         }
         let task = row.taskId
-          ? db.select().from(schema.sysTask).where(eq(schema.sysTask.id, row.taskId)).get()
-          : db
+          ? (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, row.taskId)).get())
+          : (await db
               .select()
               .from(schema.sysTask)
               .where(eq(schema.sysTask.previsItemKey, `grid-${row.id}`))
-              .get()
+              .get())
         if (!task) throw new Error('任务提交状态不明，请核对服务商记录后显式重新提交，避免重复扣费')
-        if (!row.taskId) db.update(table).set({ taskId: task.id }).where(eq(table.id, row.id)).run()
-        if (!activeStatuses.includes(candidateRow(row.versionId, row.id).status)) {
-          cancelUnsubmittedPrevisTask(task.id)
+        if (!row.taskId) await db.update(table).set({ taskId: task.id }).where(eq(table.id, row.id)).run()
+        if (!activeStatuses.includes((await candidateRow(row.versionId, row.id)).status)) {
+          ;await cancelUnsubmittedPrevisTask(task.id)
           continue
         }
         if (task.status === 'pending') await startQueuedPrevisTask(task.id)
@@ -625,7 +621,7 @@ export async function tickGridCandidates() {
         } else if (['failed', 'cancelled'].includes(task.status || ''))
           throw new Error(task.errorMsg || '图片任务失败或已取消')
       } catch (error) {
-        db.update(table)
+        await db.update(table)
           .set({ status: 'failed', error: (error as Error).message, updatedAt: now() })
           .where(and(eq(table.id, row.id), inArray(table.status, activeStatuses)))
           .run()
@@ -635,45 +631,45 @@ export async function tickGridCandidates() {
   }
 }
 export async function retryGridProcessing(versionId: number, id: number) {
-  const row = candidateRow(versionId, id),
-    task = row.taskId ? db.select().from(schema.sysTask).where(eq(schema.sysTask.id, row.taskId)).get() : null
+  const row = (await candidateRow(versionId, id)),
+    task = row.taskId ? (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, row.taskId)).get()) : null
   if (row.status !== 'failed' || !task || !(task.localPath || task.resultUrl))
     throw new PrevisError('没有可重新处理的已完成图片；需要重新提交生成')
   await processResult(row, task.localPath || task.resultUrl!)
-  db.update(schema.sysTask)
+  await db.update(schema.sysTask)
     .set({ status: 'completed', errorMsg: null, updatedAt: now(), completedAt: now() })
     .where(eq(schema.sysTask.id, task.id))
     .run()
-  const job = getQueueJob('sys_task', task.id)
-  if (job?.status === 'failed' && job.upstreamDone) completeRecoveredQueueJob(job.id)
-  return view(candidateRow(versionId, id))
+  const job = await getQueueJob('sys_task', task.id)
+  if (job?.status === 'failed' && job.upstreamDone) await completeRecoveredQueueJob(job.id)
+  return (await view((await candidateRow(versionId, id))))
 }
 export async function uploadGridCandidate(versionId: number, revision: number, panelId: number, url: string) {
-  const row = requireEditable(versionId, revision),
+  const row = (await requireEditable(versionId, revision)),
     t = normalizeTimeline(JSON.parse(row.timelineJson)),
     p = t.panels.find((p) => p.id === panelId)
   if (!p) throw new PrevisError('分镜不属于当前版本')
-  assertNoLegacyConflict(versionId, panelId)
-  if (hasGridTask(versionId, [panelId])) throw new PrevisError('请先完成或取消宫格任务', 409)
-  const ep = db.select().from(schema.episodes).where(eq(schema.episodes.id, row.episodeId)).get()!
-  const drama = db.select().from(schema.dramas).where(eq(schema.dramas.id, ep.dramaId)).get()
+  await assertNoLegacyConflict(versionId, panelId)
+  if ((await hasGridTask(versionId, [panelId]))) throw new PrevisError('请先完成或取消宫格任务', 409)
+  const ep = (await db.select().from(schema.episodes).where(eq(schema.episodes.id, row.episodeId)).get())!
+  const drama = (await db.select().from(schema.dramas).where(eq(schema.dramas.id, ep.dramaId)).get())
   const grid = generationGrid(orderedFrames(p).map((f) => f.id!), drama?.aspectRatio || '16:9')
   if (p.frames.some((f) => f.locked)) throw new PrevisError('画面已锁定', 409)
   const ratio = (drama?.aspectRatio || '16:9').split(':').map(Number)
   const base = await freezeReferenceMedia(url),
     buffer = await readReferenceMedia(base.url)
   const decoded = await splitGrid(buffer, grid, ratio[0] / ratio[1])
-  requireEditable(versionId, revision)
+  await requireEditable(versionId, revision)
   // 上传替换 = 一次新的整组生成，开新批
-  const latestBatch = db.select({ batchNo: table.batchNo }).from(table)
+  const latestBatch = (await db.select({ batchNo: table.batchNo }).from(table)
     .where(and(eq(table.versionId, versionId), eq(table.panelId, panelId)))
-    .orderBy(desc(table.batchNo)).limit(1).get()
+    .orderBy(desc(table.batchNo)).limit(1).get())
   const currentSources = await Promise.all(
     p.frames
       .filter((f) => f.url)
       .map(async (f) => ({ frameId: f.id!, sourceUrl: f.url, frozen: await freezeReferenceMedia(f.url) })),
   )
-  requireEditable(versionId, revision)
+  await requireEditable(versionId, revision)
   const s: GridSnapshot = {
     revision,
     panel: p,
@@ -693,47 +689,44 @@ export async function uploadGridCandidate(versionId: number, revision: number, p
     currentSources,
     instructions: {},
   }
-  const inserted = db
-    .insert(table)
-    .values({
-      versionId,
-      panelId,
-      mode: 'generate',
-      status: 'ready',
-      inputHash: hashContent(s),
-      batchNo: (latestBatch?.batchNo || 0) + 1,
-      snapshotJson: JSON.stringify(s),
-      rawUrl: base.url,
-      previewUrl: base.url,
-      width: decoded.width,
-      height: decoded.height,
-      sourceWidth: decoded.sourceWidth ?? null,
-      sourceHeight: decoded.sourceHeight ?? null,
-      createdAt: now(),
-      updatedAt: now(),
-    })
-    .returning()
-    .get()
+  const insertedId = getInsertId(await db.insert(table).values({
+    versionId,
+    panelId,
+    mode: 'generate',
+    status: 'ready',
+    inputHash: hashContent(s),
+    batchNo: (latestBatch?.batchNo || 0) + 1,
+    snapshotJson: JSON.stringify(s),
+    rawUrl: base.url,
+    previewUrl: base.url,
+    width: decoded.width,
+    height: decoded.height,
+    sourceWidth: decoded.sourceWidth ?? null,
+    sourceHeight: decoded.sourceHeight ?? null,
+    createdAt: now(),
+    updatedAt: now(),
+  }).run())
+  const inserted = (await db.select().from(table).where(eq(table.id, insertedId)).get())!
   // 上传替换同样免审核：就绪即自动切分写入画面
   await autoAdoptGridCandidate(inserted.id)
-  return view(candidateRow(versionId, inserted.id))
+  return (await view((await candidateRow(versionId, inserted.id))))
 }
-export function discardGridCandidate(versionId: number, id: number) {
-  const row = candidateRow(versionId, id)
+export async function discardGridCandidate(versionId: number, id: number) {
+  const row = (await candidateRow(versionId, id))
   if (row.status === 'adopted') throw new PrevisError('已采用结果请通过画面历史回退')
-  db.transaction((tx) => {
-    tx.update(table).set({ status: 'discarded', updatedAt: now() }).where(eq(table.id, id)).run()
-    if (row.taskId) cancelUnsubmittedPrevisTask(row.taskId)
+  await db.transaction(async (tx) => {
+    await tx.update(table).set({ status: 'discarded', updatedAt: now() }).where(eq(table.id, id)).run()
+    if (row.taskId) await cancelUnsubmittedPrevisTask(row.taskId)
   })
-  return view(candidateRow(versionId, id))
+  return (await view((await candidateRow(versionId, id))))
 }
 export async function adoptGridCandidate(versionId: number, id: number, revision: number) {
-  const row = candidateRow(versionId, id),
+  const row = (await candidateRow(versionId, id)),
     s = snapshot(row)
   if (row.status !== 'ready' || !row.previewUrl) throw new PrevisError('候选画面尚未就绪或已处理', 409)
-  requireEditable(versionId, revision)
-  assertNoLegacyConflict(versionId, row.panelId)
-  if (hasGridTask(versionId, [row.panelId]))
+  await requireEditable(versionId, revision)
+  await assertNoLegacyConflict(versionId, row.panelId)
+  if ((await hasGridTask(versionId, [row.panelId])))
     throw new PrevisError('该分镜仍有宫格任务，请完成或取消后采用', 409)
   // Output files are immutable, fully decode/stage before entering the synchronous transaction.
   const buffer = await readReferenceMedia(row.previewUrl)
@@ -751,7 +744,7 @@ export async function adoptGridCandidate(versionId: number, id: number, revision
   let ancestor = row
   while (snapshot(ancestor).baseCandidateId) {
     if (lineage.length >= 100) throw new PrevisError('候选历史链过长，请采用当前结果后继续微调')
-    ancestor = candidateRow(versionId, snapshot(ancestor).baseCandidateId!)
+    ancestor = (await candidateRow(versionId, snapshot(ancestor).baseCandidateId!))
     if (lineage.some((c) => c.id === ancestor.id)) throw new PrevisError('候选来源链无效')
     lineage.unshift(ancestor)
   }
@@ -782,18 +775,18 @@ export async function adoptGridCandidate(versionId: number, id: number, revision
       replacements.set(target, history)
     }
   }
-  db.transaction((tx) => {
-    assertNoLegacyConflict(versionId, row.panelId)
-    if (hasGridTask(versionId, [row.panelId]))
+  ;(await db.transaction(async (tx) => {
+    ;await assertNoLegacyConflict(versionId, row.panelId)
+    if ((await hasGridTask(versionId, [row.panelId])))
       throw new PrevisError('该分镜仍有宫格任务，请完成或取消后采用', 409)
-    const latest = requireEditable(versionId, revision)
-    const episode = tx.select().from(schema.episodes).where(eq(schema.episodes.id, latest.episodeId)).get()!
-    const drama = tx.select().from(schema.dramas).where(eq(schema.dramas.id, episode.dramaId)).get()
+    const latest = (await requireEditable(versionId, revision))
+    const episode = (await tx.select().from(schema.episodes).where(eq(schema.episodes.id, latest.episodeId)).get())!
+    const drama = (await tx.select().from(schema.dramas).where(eq(schema.dramas.id, episode.dramaId)).get())
     if ((drama?.aspectRatio || '16:9') !== s.projectAspectRatio)
       throw new PrevisError('项目画幅比例已变化，请重新生成', 409)
     const t: Timeline = normalizeTimeline(JSON.parse(latest.timelineJson)),
       p = t.panels.find((p) => p.id === row.panelId)
-    if (candidateRow(versionId, id).status !== 'ready') throw new PrevisError('候选已经处理，请刷新', 409)
+    if ((await candidateRow(versionId, id)).status !== 'ready') throw new PrevisError('候选已经处理，请刷新', 409)
     // 画面规划结构（帧 id 及顺序）必须与候选创建时一致，否则切格映射错位。
     // 比较序列而非 panelHash：旧快照的哈希是旧公式算的，逐位比较会让历史候选全部失配。
     if (!p || !sameFrameStructure(p, s))
@@ -818,7 +811,7 @@ export async function adoptGridCandidate(versionId: number, id: number, revision
       f.source = replacement.source
     }
     p.coverFrameId ||= p.frames[0]?.id
-    tx.update(schema.animaticVersions)
+    await tx.update(schema.animaticVersions)
       .set({
         timelineJson: JSON.stringify(t),
         revision: revision + 1,
@@ -829,16 +822,16 @@ export async function adoptGridCandidate(versionId: number, id: number, revision
       .where(and(eq(schema.animaticVersions.id, versionId), eq(schema.animaticVersions.revision, revision)))
       .run()
     // 同一分镜同一时间只允许一个采用结果：旧采用记录回退为待采用，便于再次切换
-    tx.update(table)
+    await tx.update(table)
       .set({ status: 'ready', updatedAt: now() })
       .where(and(eq(table.versionId, versionId), eq(table.panelId, row.panelId), eq(table.status, 'adopted'), ne(table.id, id)))
       .run()
-    tx.update(table).set({ status: 'adopted', updatedAt: now() }).where(eq(table.id, id)).run()
-    mirrorCurrent(versionId, t)
-  })
-  scheduleContactSheets(versionId, [row.panelId])
-  scheduleContinuityReviews(versionId, [row.panelId])
-  return getVersion(versionId)
+    await tx.update(table).set({ status: 'adopted', updatedAt: now() }).where(eq(table.id, id)).run()
+    await mirrorCurrent(versionId, t)
+  }))
+  await scheduleContactSheets(versionId, [row.panelId])
+  await scheduleContinuityReviews(versionId, [row.panelId])
+  return (await getVersion(versionId))
 }
 export async function startGridWorker() {
   await tickGridCandidates()

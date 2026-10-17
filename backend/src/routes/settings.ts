@@ -9,16 +9,16 @@ import { queueStats } from '../services/task-queue.js'
 
 const app = new Hono()
 
-app.get('/task-queue', c => success(c, { ...readProductionSettings(), stats: queueStats() }))
+app.get('/task-queue', async c => success(c, { ...(await readProductionSettings()), stats: (await queueStats()) }))
 app.put('/task-queue', async c => {
-  try { return success(c, { ...saveProductionSettings(await c.req.json()), stats: queueStats() }) }
+  try { return success(c, { ...(await saveProductionSettings(await c.req.json())), stats: (await queueStats()) }) }
   catch (error: any) {
     return c.json({ code: error instanceof QueueSettingsError ? error.status : 400, message: error.message || '任务设置无效' }, error instanceof QueueSettingsError && error.status === 409 ? 409 : 400)
   }
 })
-app.get('/evaluation-tasks', c => success(c, { ...readEvaluationSettings(), globalTotal: readProductionSettings().total, stats: queueStats() }))
+app.get('/evaluation-tasks', async c => success(c, { ...(await readEvaluationSettings()), globalTotal: (await readProductionSettings()).total, stats: (await queueStats()) }))
 app.put('/evaluation-tasks', async c => {
-  try { return success(c, { ...saveEvaluationSettings(await c.req.json()), globalTotal: readProductionSettings().total, stats: queueStats() }) }
+  try { return success(c, { ...(await saveEvaluationSettings(await c.req.json())), globalTotal: (await readProductionSettings()).total, stats: (await queueStats()) }) }
   catch (error: any) {
     return c.json({ code: error instanceof QueueSettingsError ? error.status : 400, message: error.message || '评测设置无效' }, error instanceof QueueSettingsError && error.status === 409 ? 409 : 400)
   }

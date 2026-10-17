@@ -61,9 +61,9 @@ async function saveMediaUpload(
 }
 
 // POST /upload/video — 参考视频上传（Seedance 多模态参考用）
-app.post('/video', async (c) => saveMediaUpload(c, 'video', VIDEO_EXT, VIDEO_MIME, VIDEO_MAX))
+app.post('/video', async (c) => (await saveMediaUpload(c, 'video', VIDEO_EXT, VIDEO_MIME, VIDEO_MAX)))
 
 // POST /upload/audio — 参考音频上传（Seedance 多模态参考用）
-app.post('/audio', async (c) => saveMediaUpload(c, 'audio', AUDIO_EXT, AUDIO_MIME, AUDIO_MAX))
+app.post('/audio', async (c) => (await saveMediaUpload(c, 'audio', AUDIO_EXT, AUDIO_MIME, AUDIO_MAX)))
 
 export default app

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { createServer } from 'node:http'
 import sharp from 'sharp'
-import { eq } from 'drizzle-orm'
+import {eq, sql} from 'drizzle-orm'
 import { defaultStrategy, makeFrame, type Timeline } from '../src/services/previs-domain.js'
 const root = mkdtempSync(path.join(tmpdir(), 'grid-candidates-'))
 process.env.SQLITE_PATH = path.join(root, 'test.sqlite3')
@@ -30,10 +30,23 @@ const server = createServer(async (req, res) => {
 await new Promise<void>((resolve) => server.once('listening', resolve))
 after(() => server.close())
 const { db, schema } = await import('../src/db/index.js')
+
+// 还原后的 db 是 drizzle sqlite-proxy 异步封装，不再暴露 better-sqlite3 的 $client；
+// 测试里的裸 SQL 改为统一的 raw 执行入口（? 占位按字面量内联，仅测试使用）。
+const lit = (v: any) => (typeof v === 'number' ? String(v) : `'${String(v).replace(/'/g, "''")}'`)
+const build = (text: string, args: any[]) => { let out = text; for (const a of args) out = out.replace('?', lit(a)); return sql.raw(out) }
+const rawRun = async (text: string, ...args: any[]) => {
+  // 多语句按分号拆分执行（CREATE TRIGGER 这类含 BEGIN...END 的整段执行）
+  if (/\bbegin\b/i.test(text) && /\bend\b/i.test(text)) { await db.run(build(text, args)); return }
+  for (const part of text.split(';')) { if (part.trim()) await db.run(build(part.trim(), args)) }
+}
+const rawAll = async (text: string, ...args: any[]) => (await db.all(build(text, args))) as any[]
+const rawGet = async (text: string, ...args: any[]) => (await db.get(build(text, args))) as any
+
 const grid = await import('../src/services/previs-grid.js')
 const { getVersion, saveTimeline } = await import('../src/services/previs.js')
 const configId = Number(
-  db
+  (await db
     .insert(schema.aiServiceConfigs)
     .values({
       name: 'test',
@@ -46,9 +59,9 @@ const configId = Number(
       createdAt: 'now',
       updatedAt: 'now',
     })
-    .run().lastInsertRowid,
+    .run()).lastInsertRowid,
 )
-db.insert(schema.dramas)
+await db.insert(schema.dramas)
   .values({
     id: 1,
     title: 'test',
@@ -57,7 +70,7 @@ db.insert(schema.dramas)
     updatedAt: 'now',
   })
   .run()
-db.insert(schema.episodes)
+await db.insert(schema.episodes)
   .values({
     id: 1,
     dramaId: 1,
@@ -99,7 +112,7 @@ const timeline = {
   strategy: defaultStrategy,
   acknowledgements: {},
 } as Timeline
-db.insert(schema.storyboards)
+await db.insert(schema.storyboards)
   .values({
     id: 1,
     dramaId: 1,
@@ -112,7 +125,7 @@ db.insert(schema.storyboards)
   })
   .run()
 const versionId = Number(
-  db
+  (await db
     .insert(schema.animaticVersions)
     .values({
       episodeId: 1,
@@ -121,12 +134,12 @@ const versionId = Number(
       createdAt: 'now',
       updatedAt: 'now',
     })
-    .run().lastInsertRowid,
+    .run()).lastInsertRowid,
 )
 const run = async (id: number) => {
   for (let i = 0; i < 100; i++) {
     await grid.tickGridCandidates()
-    const c = grid.listGridCandidates(versionId).find((x) => x.id === id)!
+    const c = (await grid.listGridCandidates(versionId)).find((x) => x.id === id)!
     if (['ready', 'failed', 'adopted'].includes(c.status)) return c
     await new Promise((r) => setTimeout(r, 25))
   }
@@ -149,14 +162,14 @@ test('joint generation submits once, reads never enqueue, and adopts locally wit
   assert.equal(done.status, 'adopted', done.error || '')
   assert.equal(calls, 1)
   assert.ok(imagesSent >= 1)
-  for (let i = 0; i < 10; i++) grid.listGridCandidates(versionId)
+  for (let i = 0; i < 10; i++) await grid.listGridCandidates(versionId)
   assert.equal(calls, 1)
-  const adopted = getVersion(versionId)
+  const adopted = await getVersion(versionId)
   assert.equal(adopted.revision, 2)
   assert.ok(adopted.timeline.panels[0].frames.every((f) => f.url))
   assert.equal(calls, 1)
   // 宫格生成要进任务面板：sys_task 必须带上分镜与剧集归属，完成后可展示原始宫格图
-  const task = db
+  const task = await db
     .select()
     .from(schema.sysTask)
     .where(eq(schema.sysTask.previsItemKey, `grid-${a.items[0].id}`))
@@ -166,7 +179,7 @@ test('joint generation submits once, reads never enqueue, and adopts locally wit
   assert.ok(task.localPath, '完成任务保留返回的原始宫格图')
 })
 test('grid edit targets alone get replaced; frame edit after it uses latest source; stale candidate rejected atomically', async () => {
-  const first = getVersion(versionId),
+  const first = await getVersion(versionId),
     original = structuredClone(first.timeline.panels[0].frames)
   const a = await grid.startGridCandidates(versionId, {
     revision: first.revision,
@@ -209,14 +222,14 @@ test('grid edit targets alone get replaced; frame edit after it uses latest sour
   const changed = structuredClone(edited.timeline)
   // 候选失效只看画面规划结构（帧 id 及顺序）：重新拆分/规划会换 id；改 prompt 等内容不影响采用
   changed.panels[0].frames[2].id = 'f2-replanned'
-  saveTimeline(versionId, edited.revision, changed)
-  await assert.rejects(grid.adoptGridCandidate(versionId, fine.id, edited.revision + 1), /结构已变化/)
-  assert.equal(getVersion(versionId).timeline.panels[0].frames[0].url, original[0].url)
+  await saveTimeline(versionId, edited.revision, changed)
+  await assert.rejects(async () => grid.adoptGridCandidate(versionId, fine.id, edited.revision + 1), /结构已变化/)
+  assert.equal((await getVersion(versionId)).timeline.panels[0].frames[0].url, original[0].url)
   assert.equal(calls, 3)
 })
 test('all-panel preflight failure does not create any task, frame lock blocks adopt', async () => {
-  const current = getVersion(versionId),
-    before = db.select().from(schema.sysTask).all().length
+  const current = await getVersion(versionId),
+    before = (await db.select().from(schema.sysTask).all()).length
   await assert.rejects(
     grid.startGridCandidates(versionId, {
       revision: current.revision,
@@ -228,7 +241,7 @@ test('all-panel preflight failure does not create any task, frame lock blocks ad
     }),
     /分镜/,
   )
-  assert.equal(db.select().from(schema.sysTask).all().length, before)
+  assert.equal((await db.select().from(schema.sysTask).all()).length, before)
   const a = await grid.startGridCandidates(versionId, {
     revision: current.revision,
     panelIds: [1],
@@ -242,17 +255,17 @@ test('all-panel preflight failure does not create any task, frame lock blocks ad
   const ready = await run(a.items[0].id)
   const t = structuredClone(current.timeline)
   t.panels[0].frames[0].locked = true
-  db.update(schema.animaticVersions)
+  await db.update(schema.animaticVersions)
     .set({ timelineJson: JSON.stringify(t) })
     .where(eq(schema.animaticVersions.id, versionId))
     .run()
   await assert.rejects(grid.adoptGridCandidate(versionId, ready.id, current.revision), /锁定|变化/)
 })
 test('cancelling a queued candidate prevents submission; upload replaces every tile without review', async () => {
-  const current = getVersion(versionId),
+  const current = await getVersion(versionId),
     t = structuredClone(current.timeline)
   t.panels[0].frames[0].locked = false
-  db.update(schema.animaticVersions)
+  await db.update(schema.animaticVersions)
     .set({ timelineJson: JSON.stringify(t) })
     .where(eq(schema.animaticVersions.id, versionId))
     .run()
@@ -265,13 +278,13 @@ test('cancelling a queued candidate prevents submission; upload replaces every t
     mode: 'generate',
     resolution: '1K',
   })
-  grid.discardGridCandidate(versionId, pending.items[0].id)
+  await grid.discardGridCandidate(versionId, pending.items[0].id)
   await grid.tickGridCandidates()
   assert.equal(calls, before)
   // 上传替换与生成一致：就绪即自动切分，不经过人工采用
   const upload = await grid.uploadGridCandidate(versionId, current.revision, 1, '/static/asset.png')
   assert.equal(upload.status, 'adopted', upload.error || '')
-  const uploaded = getVersion(versionId)
+  const uploaded = await getVersion(versionId)
   assert.equal(uploaded.revision, current.revision + 1)
   assert.ok(uploaded.timeline.panels[0].frames.every((f) => f.url))
   const edit = await grid.startGridCandidates(versionId, {
@@ -297,7 +310,7 @@ test('cancelling a queued candidate prevents submission; upload replaces every t
   assert.equal(calls, before + 1)
 })
 test('single refinement adopted before whole-grid edit remains in the next frozen canvas, and local history restore is free', async () => {
-  const v = getVersion(versionId)
+  const v = await getVersion(versionId)
   const single = await grid.startGridCandidates(versionId, {
     revision: v.revision,
     panelIds: [1],
@@ -321,7 +334,7 @@ test('single refinement adopted before whole-grid edit remains in the next froze
     targetFrameIds: ['f1'],
     instruction: 'raise arm',
   })
-  const record = db
+  const record = await db
     .select()
     .from(schema.gridCandidates)
     .where(eq(schema.gridCandidates.id, whole.items[0].id))
@@ -332,7 +345,7 @@ test('single refinement adopted before whole-grid edit remains in the next froze
   const before = calls,
     restored = structuredClone(next.timeline)
   // Metadata source synchronization is outside this fixture; restore under a historical editable version.
-  db.insert(schema.animaticVersions)
+  await db.insert(schema.animaticVersions)
     .values({
       episodeId: 1,
       versionNo: 2,
@@ -342,7 +355,7 @@ test('single refinement adopted before whole-grid edit remains in the next froze
     })
     .run()
   restored.panels[0].frames[0].url = v.timeline.panels[0].frames[0].url
-  const result = saveTimeline(versionId, next.revision, restored)
+  const result = await saveTimeline(versionId, next.revision, restored)
   assert.equal(
     result.timeline.panels[0].frames[0].source?.candidateId,
     v.timeline.panels[0].frames[0].source?.candidateId,
@@ -364,18 +377,18 @@ test('strict transport retains eight references including equal bytes, refuses c
   )
 })
 test('partially populated legacy panel can refine its ready frame and an unlocked-only save works', async () => {
-  const current = getVersion(versionId),
+  const current = await getVersion(versionId),
     t = structuredClone(current.timeline)
   t.panels[0].frames[0].locked = true
   t.panels[0].frames[2].url = ''
   t.panels[0].frames[3].url = '/static/unreadable.png'
-  db.update(schema.animaticVersions)
+  await db.update(schema.animaticVersions)
     .set({ timelineJson: JSON.stringify(t) })
     .where(eq(schema.animaticVersions.id, versionId))
     .run()
   const unlocking = structuredClone(t)
   unlocking.panels[0].frames[0].locked = false
-  const unlocked = saveTimeline(versionId, current.revision, unlocking)
+  const unlocked = await saveTimeline(versionId, current.revision, unlocking)
   assert.equal(unlocked.timeline.panels[0].frames[0].locked, false)
   const created = await grid.startGridCandidates(versionId, {
     revision: unlocked.revision,
@@ -390,7 +403,7 @@ test('partially populated legacy panel can refine its ready frame and an unlocke
   assert.equal((await run(created.items[0].id)).status, 'ready')
 })
 test('invalid geometry retains the returned image and retries processing without a new paid call', async () => {
-  const v = getVersion(versionId),
+  const v = await getVersion(versionId),
     created = await grid.startGridCandidates(versionId, {
       revision: v.revision,
       panelIds: [1],
@@ -402,7 +415,7 @@ test('invalid geometry retains the returned image and retries processing without
       instruction: 'smile',
     })
   await run(created.items[0].id)
-  const c = db
+  const c = await db
     .select()
     .from(schema.gridCandidates)
     .where(eq(schema.gridCandidates.id, created.items[0].id))
@@ -413,22 +426,22 @@ test('invalid geometry retains the returned image and retries processing without
     .png()
     .toBuffer()
   writeFileSync(path.join(root, 'static', 'wrong.png'), square)
-  db.update(schema.gridCandidates)
+  await db.update(schema.gridCandidates)
     .set({ status: 'processing', rawUrl: null, previewUrl: null })
     .where(eq(schema.gridCandidates.id, c.id))
     .run()
-  db.update(schema.sysTask)
+  await db.update(schema.sysTask)
     .set({ localPath: '/static/wrong.png', status: 'completed' })
     .where(eq(schema.sysTask.id, c.taskId!))
     .run()
   await grid.tickGridCandidates()
-  const failed = grid.listGridCandidates(versionId).find((x) => x.id === c.id)!
+  const failed = (await grid.listGridCandidates(versionId)).find((x) => x.id === c.id)!
   assert.equal(failed.status, 'failed')
   assert.ok(failed.rawUrl)
   assert.match(failed.error || '', /比例/)
   const before = calls
   // Simulate completed provider response with failed first download; local retry uses its persisted pointer.
-  db.update(schema.sysTask)
+  await db.update(schema.sysTask)
     .set({ localPath: null, resultUrl: '/static/asset.png', status: 'failed' })
     .where(eq(schema.sysTask.id, c.taskId!))
     .run()
@@ -437,14 +450,14 @@ test('invalid geometry retains the returned image and retries processing without
   assert.equal(calls, before)
 })
 test('missing mandatory identity refuses every image mode before enqueue, including a panel with other references', async () => {
-  const v = getVersion(versionId),
+  const v = await getVersion(versionId),
     t = structuredClone(v.timeline)
   t.panels[0].characterIds = [999]
-  db.update(schema.animaticVersions)
+  await db.update(schema.animaticVersions)
     .set({ timelineJson: JSON.stringify(t) })
     .where(eq(schema.animaticVersions.id, versionId))
     .run()
-  const before = db.select().from(schema.gridCandidates).all().length
+  const before = (await db.select().from(schema.gridCandidates).all()).length
   for (const mode of ['generate', 'frame_edit'] as const)
     await assert.rejects(
       grid.startGridCandidates(versionId, {
@@ -459,20 +472,20 @@ test('missing mandatory identity refuses every image mode before enqueue, includ
       }),
       /人物.*参考图片/,
     )
-  assert.equal(db.select().from(schema.gridCandidates).all().length, before)
-  db.update(schema.animaticVersions)
+  assert.equal((await db.select().from(schema.gridCandidates).all()).length, before)
+  await db.update(schema.animaticVersions)
     .set({ timelineJson: JSON.stringify(v.timeline) })
     .where(eq(schema.animaticVersions.id, versionId))
     .run()
 })
 test('regeneration freezes existing source bytes and automatic adoption refuses in-place replacement', async () => {
-  const v = getVersion(versionId),
+  const v = await getVersion(versionId),
     t = structuredClone(v.timeline)
   t.panels[0].frames.forEach((f) => {
     f.url = '/static/asset.png'
     f.locked = false
   })
-  db.update(schema.animaticVersions)
+  await db.update(schema.animaticVersions)
     .set({ timelineJson: JSON.stringify(t) })
     .where(eq(schema.animaticVersions.id, versionId))
     .run()
@@ -496,19 +509,19 @@ test('regeneration freezes existing source bytes and automatic adoption refuses 
   const blocked = await run(a.items[0].id)
   assert.equal(blocked.status, 'ready', blocked.error || '')
   assert.match(blocked.error || '', /文件已变化/)
-  assert.equal(getVersion(versionId).revision, v.revision, '采用失败不应推进版本')
+  assert.equal((await getVersion(versionId)).revision, v.revision, '采用失败不应推进版本')
   writeFileSync(path.join(root, 'static', 'asset.png'), image)
-  const adopted = await grid.adoptGridCandidate(versionId, blocked.id, getVersion(versionId).revision)
+  const adopted = await grid.adoptGridCandidate(versionId, blocked.id, (await getVersion(versionId)).revision)
   assert.ok(adopted.timeline.panels[0].frames.every((f) => f.url && f.url !== '/static/asset.png'))
 })
 test('restart resumes a known synchronous result without a supplier id or a new model call', async () => {
   const { recoverPrevisTasks } = await import('../src/services/generation.js')
-  const row = db
+  const row = (await db
     .select()
     .from(schema.sysTask)
-    .all()
+    .all())
     .find((t) => t.previsItemKey?.startsWith('grid-'))!
-  db.update(schema.sysTask)
+  await db.update(schema.sysTask)
     .set({
       status: 'processing',
       localPath: null,
@@ -519,76 +532,76 @@ test('restart resumes a known synchronous result without a supplier id or a new 
     .run()
   const before = calls
   // A restart preserves both the business result and the queue reservation.
-  db.$client.prepare("UPDATE task_queue_jobs SET status='processing',phase='saving',submitted=1,upstream_done=1 WHERE owner_type='sys_task' AND owner_id=?").run(row.id)
+  await rawRun("UPDATE task_queue_jobs SET status='processing',phase='saving',submitted=1,upstream_done=1 WHERE owner_type='sys_task' AND owner_id=?", row.id)
   await recoverPrevisTasks()
   const { recoverTaskQueue } = await import('../src/services/task-queue.js')
   await recoverTaskQueue()
-  for (let i = 0; i < 200 && db.select().from(schema.sysTask).where(eq(schema.sysTask.id, row.id)).get()!.status !== 'completed'; i++)
+  for (let i = 0; i < 200 && (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, row.id)).get()!).status !== 'completed'; i++)
     await new Promise(resolve => setTimeout(resolve, 5))
-  const recovered = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, row.id)).get()!
+  const recovered = await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, row.id)).get()!
   assert.equal(recovered.status, 'completed')
   assert.ok(recovered.localPath)
   assert.equal(calls, before)
 })
 
-test('legacy nullable task ids round-trip and locked frames cannot be deleted', () => {
-  const v = getVersion(versionId),
+test('legacy nullable task ids round-trip and locked frames cannot be deleted', async () => {
+  const v = await getVersion(versionId),
     timeline: any = structuredClone(v.timeline)
   timeline.panels[0].frames[0].taskId = null
   timeline.panels[0].frames[0].history[0].taskId = null
-  db.update(schema.animaticVersions)
+  await db.update(schema.animaticVersions)
     .set({ timelineJson: JSON.stringify(timeline) })
     .where(eq(schema.animaticVersions.id, versionId))
     .run()
-  const normalized = getVersion(versionId)
+  const normalized = await getVersion(versionId)
   assert.equal(normalized.timeline.panels[0].frames[0].taskId, undefined)
   assert.equal(normalized.timeline.panels[0].frames[0].history![0].taskId, undefined)
-  assert.doesNotThrow(() => saveTimeline(versionId, normalized.revision, normalized.timeline))
-  const current = getVersion(versionId),
+  await assert.doesNotReject(async () => saveTimeline(versionId, normalized.revision, normalized.timeline))
+  const current = await getVersion(versionId),
     locked = structuredClone(current.timeline)
   locked.panels[0].frames[0].locked = true
-  db.update(schema.animaticVersions)
+  await db.update(schema.animaticVersions)
     .set({ timelineJson: JSON.stringify(locked) })
     .where(eq(schema.animaticVersions.id, versionId))
     .run()
   const deleted = structuredClone(locked)
   deleted.panels[0].frames.shift()
-  assert.throws(() => saveTimeline(versionId, current.revision, deleted), /锁定/)
-  assert.equal(getVersion(versionId).timeline.panels[0].frames.length, locked.panels[0].frames.length)
+  await assert.rejects(async () => saveTimeline(versionId, current.revision, deleted), /锁定/)
+  assert.equal((await getVersion(versionId)).timeline.panels[0].frames.length, locked.panels[0].frames.length)
 })
 
 test('switching back to an earlier candidate stays adoptable after a later adoption rewrote frame urls', async () => {
   // 复现 2026-10-13 事故：采用候选 B 后帧 url/history 被改写，旧「整面板哈希」校验让候选 A 永久失配
   // （切换候选即 409「原图或画面规划已变化」）。新校验只比帧 id 结构，同结构候选可随时来回切换。
-  const unlock = getVersion(versionId),
+  const unlock = await getVersion(versionId),
     unlocked = structuredClone(unlock.timeline)
   for (const f of unlocked.panels[0].frames) f.locked = false
-  db.update(schema.animaticVersions)
+  await db.update(schema.animaticVersions)
     .set({ timelineJson: JSON.stringify(unlocked) })
     .where(eq(schema.animaticVersions.id, versionId))
     .run()
-  const current = getVersion(versionId)
+  const current = await getVersion(versionId)
   const payload = { revision: current.revision, panelIds: [1], configId, model: 'gpt-image-2', mode: 'generate' as const, resolution: '1K' as const }
   const a = await grid.startGridCandidates(versionId, payload)
   assert.equal((await run(a.items[0].id)).status, 'adopted')
-  const b = await grid.startGridCandidates(versionId, { ...payload, revision: getVersion(versionId).revision })
+  const b = await grid.startGridCandidates(versionId, { ...payload, revision: (await getVersion(versionId)).revision })
   assert.equal((await run(b.items[0].id)).status, 'adopted')
   // B 采用后 A 回退为 ready；此时画面 url 已是 B 的切格，A 的快照面板还是生成时的旧内容
-  const beforeSwitch = getVersion(versionId)
+  const beforeSwitch = await getVersion(versionId)
   const back = await grid.adoptGridCandidate(versionId, a.items[0].id, beforeSwitch.revision)
   assert.equal(back.revision, beforeSwitch.revision + 1)
-  const listed = grid.listGridCandidates(versionId)
+  const listed = await grid.listGridCandidates(versionId)
   assert.equal(listed.find((c) => c.id === a.items[0].id)!.status, 'adopted')
   assert.equal(listed.find((c) => c.id === b.items[0].id)!.status, 'ready')
   assert.ok(back.timeline.panels[0].frames.every((f) => f.url))
 })
 
 test('candidates are grouped into batches: each generation opens a new one, refinement and upload follow their anchor', async () => {
-  const current = getVersion(versionId)
+  const current = await getVersion(versionId)
   // 上一测试末尾锁定了画面，先解锁（上传/生成都要求未锁定）
   const unlocked = structuredClone(current.timeline)
   for (const f of unlocked.panels[0].frames) f.locked = false
-  db.update(schema.animaticVersions)
+  await db.update(schema.animaticVersions)
     .set({ timelineJson: JSON.stringify(unlocked) })
     .where(eq(schema.animaticVersions.id, versionId))
     .run()
@@ -596,16 +609,16 @@ test('candidates are grouped into batches: each generation opens a new one, refi
   const first = await grid.startGridCandidates(versionId, payload)
   const firstBatch = (await run(first.items[0].id)).batchNo
   assert.ok(firstBatch >= 1, `首批应有正式批次号，实际 ${firstBatch}`)
-  const second = await grid.startGridCandidates(versionId, { ...payload, revision: getVersion(versionId).revision })
+  const second = await grid.startGridCandidates(versionId, { ...payload, revision: (await getVersion(versionId)).revision })
   const secondBatch = (await run(second.items[0].id)).batchNo
   assert.equal(secondBatch, firstBatch + 1, '再次整组生成应开新批')
   // 无基准的 frame_edit 跟随当前采用结果（第二批）
   const refine = await grid.startGridCandidates(versionId, {
-    revision: getVersion(versionId).revision, panelIds: [1], configId, model: 'gpt-image-2',
+    revision: (await getVersion(versionId)).revision, panelIds: [1], configId, model: 'gpt-image-2',
     mode: 'frame_edit', resolution: '1K', targetFrameIds: ['f0'], instruction: 'smile',
   })
   assert.equal((await run(refine.items[0].id)).batchNo, secondBatch)
   // 上传替换 = 新的整组生成，开新批
-  const upload = await grid.uploadGridCandidate(versionId, getVersion(versionId).revision, 1, '/static/asset.png')
+  const upload = await grid.uploadGridCandidate(versionId, (await getVersion(versionId)).revision, 1, '/static/asset.png')
   assert.equal(upload.batchNo, secondBatch + 1)
 })

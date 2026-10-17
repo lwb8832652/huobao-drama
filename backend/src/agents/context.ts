@@ -14,7 +14,7 @@ export interface AgentRequestContextValues {
   language?: ContentLanguage
 }
 
-export function buildAgentRequestContext(values: AgentRequestContextValues): RequestContext<AgentRequestContextValues> {
+export async function buildAgentRequestContext(values: AgentRequestContextValues): Promise<RequestContext<AgentRequestContextValues>> {
   const rc = new RequestContext<AgentRequestContextValues>()
   rc.set('episodeId', values.episodeId)
   rc.set('dramaId', values.dramaId)
@@ -22,7 +22,7 @@ export function buildAgentRequestContext(values: AgentRequestContextValues): Req
   if (values.textConfigId) rc.set('textConfigId', values.textConfigId)
   // 语言在构建处统一解析：4 条链路（chat/提取/图片提示词/视频提示词）都经过这里，
   // 全局设置一处生效；显式传入 values.language 可按请求覆盖
-  rc.set('language', values.language ?? getContentLanguage())
+  rc.set('language', values.language ?? (await getContentLanguage()))
   return rc
 }
 

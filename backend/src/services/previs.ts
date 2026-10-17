@@ -7,7 +7,7 @@ import type { VideoReferenceInput } from './previs-video-reference-domain.js'
 import { videoReferenceMatchesSource } from './previs-video-reference.js'
 import { z } from 'zod'
 import { and, desc, eq, inArray, isNull } from 'drizzle-orm'
-import { db, schema } from '../db/index.js'
+import { db, getInsertId, schema } from '../db/index.js'
 import { now } from '../utils/response.js'
 import { FRAME_COUNT_MAX, frameCountChangeAllowed } from './previs-frame-contract.js'
 import {
@@ -179,13 +179,13 @@ export function sourceMetadata(p: Panel) {
     referenceImages: p.referenceImages, referenceLabels: p.referenceLabels,
   }
 }
-export function isCurrentVersion(versionId: number) {
-  const row = versionRow(versionId)
-  return listVersions(row.episodeId)[0]?.id === versionId
+export async function isCurrentVersion(versionId: number) {
+  const row = (await versionRow(versionId))
+  return (await listVersions(row.episodeId))[0]?.id === versionId
 }
 /** Mirror the current working version for legacy consumers (agents, asset selectors and exports). */
-export function mirrorCurrent(versionId: number, timeline: Timeline) {
-  if (!isCurrentVersion(versionId)) return
+export async function mirrorCurrent(versionId: number, timeline: Timeline) {
+  if (!(await isCurrentVersion(versionId))) return
   for (const p of timeline.panels) {
     const cover = p.frames.find(f => frameKey(f) === p.coverFrameId && f.url) || p.frames.find(f => f.url)
     const values: Record<string, unknown> = {
@@ -197,59 +197,59 @@ export function mirrorCurrent(versionId: number, timeline: Timeline) {
     }
     // A draft without a selected video must not erase the legacy/current export fallback.
     if (p.videoUrl) values.videoUrl = p.videoUrl
-    db.update(schema.storyboards).set(values).where(eq(schema.storyboards.id, p.id)).run()
-    db.delete(schema.storyboardCharacters).where(eq(schema.storyboardCharacters.storyboardId, p.id)).run()
-    for (const characterId of new Set(p.characterIds)) db.insert(schema.storyboardCharacters).values({ storyboardId: p.id, characterId }).run()
-    db.delete(schema.storyboardProps).where(eq(schema.storyboardProps.storyboardId, p.id)).run()
-    for (const propId of new Set(p.propIds)) db.insert(schema.storyboardProps).values({ storyboardId: p.id, propId }).run()
+    ;await db.update(schema.storyboards).set(values).where(eq(schema.storyboards.id, p.id)).run()
+    ;await db.delete(schema.storyboardCharacters).where(eq(schema.storyboardCharacters.storyboardId, p.id)).run()
+    for (const characterId of new Set(p.characterIds)) await db.insert(schema.storyboardCharacters).values({ storyboardId: p.id, characterId }).run()
+    ;await db.delete(schema.storyboardProps).where(eq(schema.storyboardProps.storyboardId, p.id)).run()
+    for (const propId of new Set(p.propIds)) await db.insert(schema.storyboardProps).values({ storyboardId: p.id, propId }).run()
   }
 }
 
-export function episodeForPrevis(episodeId: number) {
-  const ep = db.select().from(schema.episodes).where(eq(schema.episodes.id, episodeId)).get()
+export async function episodeForPrevis(episodeId: number) {
+  const ep = (await db.select().from(schema.episodes).where(eq(schema.episodes.id, episodeId)).get())
   if (!ep || ep.deletedAt) throw new PrevisError('剧集不存在', 404)
   return ep
 }
-export function versionRow(versionId: number) {
-  const row = db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, versionId)).get()
+export async function versionRow(versionId: number) {
+  const row = (await db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, versionId)).get())
   if (!row) throw new PrevisError('故事版版本不存在', 404)
-  episodeForPrevis(row.episodeId)
+  ;await episodeForPrevis(row.episodeId)
   return row
 }
-export function listVersions(episodeId: number) {
-  episodeForPrevis(episodeId)
-  return db.select({
+export async function listVersions(episodeId: number) {
+  ;await episodeForPrevis(episodeId)
+  return (await db.select({
     id: schema.animaticVersions.id, versionNo: schema.animaticVersions.versionNo,
     status: schema.animaticVersions.status, revision: schema.animaticVersions.revision,
     lockedAt: schema.animaticVersions.lockedAt, updatedAt: schema.animaticVersions.updatedAt,
   }).from(schema.animaticVersions).where(eq(schema.animaticVersions.episodeId, episodeId))
-    .orderBy(desc(schema.animaticVersions.versionNo)).all()
+    .orderBy(desc(schema.animaticVersions.versionNo)).all())
 }
-export function initialTimeline(episodeId: number): Timeline {
-  const rows = db.select().from(schema.storyboards).where(and(
+export async function initialTimeline(episodeId: number): Promise<Timeline> {
+  const rows = (await db.select().from(schema.storyboards).where(and(
     eq(schema.storyboards.episodeId, episodeId),
     isNull(schema.storyboards.deletedAt),
-  )).orderBy(schema.storyboards.storyboardNumber).all()
+  )).orderBy(schema.storyboards.storyboardNumber).all())
   const storyboardIds = rows.map(row => row.id)
   const characterLinks = storyboardIds.length
-    ? db.select().from(schema.storyboardCharacters)
-      .where(inArray(schema.storyboardCharacters.storyboardId, storyboardIds)).all()
+    ? (await db.select().from(schema.storyboardCharacters)
+      .where(inArray(schema.storyboardCharacters.storyboardId, storyboardIds)).all())
     : []
   const propLinks = storyboardIds.length
-    ? db.select().from(schema.storyboardProps)
-      .where(inArray(schema.storyboardProps.storyboardId, storyboardIds)).all()
+    ? (await db.select().from(schema.storyboardProps)
+      .where(inArray(schema.storyboardProps.storyboardId, storyboardIds)).all())
     : []
   const sceneIds = [...new Set(rows.flatMap(row => row.sceneId ? [row.sceneId] : []))]
   const characterIds = [...new Set(characterLinks.map(link => link.characterId))]
   const propIds = [...new Set(propLinks.map(link => link.propId))]
   const scenes = sceneIds.length
-    ? db.select().from(schema.scenes).where(and(inArray(schema.scenes.id, sceneIds), isNull(schema.scenes.deletedAt))).all()
+    ? (await db.select().from(schema.scenes).where(and(inArray(schema.scenes.id, sceneIds), isNull(schema.scenes.deletedAt))).all())
     : []
   const characters = characterIds.length
-    ? db.select().from(schema.characters).where(and(inArray(schema.characters.id, characterIds), isNull(schema.characters.deletedAt))).all()
+    ? (await db.select().from(schema.characters).where(and(inArray(schema.characters.id, characterIds), isNull(schema.characters.deletedAt))).all())
     : []
   const props = propIds.length
-    ? db.select().from(schema.props).where(and(inArray(schema.props.id, propIds), isNull(schema.props.deletedAt))).all()
+    ? (await db.select().from(schema.props).where(and(inArray(schema.props.id, propIds), isNull(schema.props.deletedAt))).all())
     : []
   const sceneById = new Map(scenes.map(scene => [scene.id, scene]))
   const characterById = new Map(characters.map(character => [character.id, character]))
@@ -315,13 +315,13 @@ export function initialTimeline(episodeId: number): Timeline {
   }
   return normalizeTimeline(t)
 }
-export function createVersion(episodeId: number, sourceId?: number): AnimaticVersion {
-  episodeForPrevis(episodeId)
-  const source = sourceId ? versionRow(sourceId) : null
+export async function createVersion(episodeId: number, sourceId?: number): Promise<AnimaticVersion> {
+  ;await episodeForPrevis(episodeId)
+  const source = sourceId ? (await versionRow(sourceId)) : null
   if (source && source.episodeId !== episodeId) throw new PrevisError('源版本不属于当前剧集')
-  const timeline = source ? normalizeTimeline(JSON.parse(source.timelineJson)) : initialTimeline(episodeId)
+  const timeline = source ? normalizeTimeline(JSON.parse(source.timelineJson)) : (await initialTimeline(episodeId))
   if (source) {
-    timeline.inheritedOutputs = resolveVideoOutputs(source.id, timeline)
+    timeline.inheritedOutputs = (await resolveVideoOutputs(source.id, timeline))
     for (const p of timeline.panels) {
       const output = timeline.inheritedOutputs.find(o => o.panelIds.length === 1 && o.panelIds[0] === p.id && !o.stale)
       if (output) p.videoUrl = output.url
@@ -330,29 +330,30 @@ export function createVersion(episodeId: number, sourceId?: number): AnimaticVer
   }
   // New drafts start with fresh acknowledgements; generated media remains available.
   timeline.acknowledgements = {}
-  const newId = db.transaction(tx => {
-    const last = tx.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.episodeId, episodeId))
-      .orderBy(desc(schema.animaticVersions.versionNo)).get()
-    const id = Number(tx.insert(schema.animaticVersions).values({
+  const newId = (await db.transaction(async tx => {
+    const last = (await tx.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.episodeId, episodeId))
+      .orderBy(desc(schema.animaticVersions.versionNo)).get())
+    const result = await tx.insert(schema.animaticVersions).values({
       episodeId, versionNo: (last?.versionNo || 0) + 1, timelineJson: JSON.stringify(timeline),
       createdAt: now(), updatedAt: now(),
-    }).run().lastInsertRowid)
-    mirrorCurrent(id, timeline)
+    }).run()
+    const id = getInsertId(result)
+    ;await mirrorCurrent(id, timeline)
     return id
-  })
-  return getVersion(newId)
+  }))
+  return (await getVersion(newId))
 }
-export function readBatches(versionId: number): BatchRun[] {
-  const batches = db.select().from(schema.batchRuns).where(eq(schema.batchRuns.versionId, versionId))
-    .orderBy(desc(schema.batchRuns.id)).all()
+export async function readBatches(versionId: number): Promise<BatchRun[]> {
+  const batches = (await db.select().from(schema.batchRuns).where(eq(schema.batchRuns.versionId, versionId))
+    .orderBy(desc(schema.batchRuns.id)).all())
   const batchIds = batches.map(batch => batch.id)
   const items = batchIds.length
-    ? db.select().from(schema.batchRunItems).where(inArray(schema.batchRunItems.batchId, batchIds))
-      .orderBy(schema.batchRunItems.id).all()
+    ? (await db.select().from(schema.batchRunItems).where(inArray(schema.batchRunItems.batchId, batchIds))
+      .orderBy(schema.batchRunItems.id).all())
     : []
   const taskIds = [...new Set(items.flatMap(item => item.taskId ? [item.taskId] : []))]
   const tasks = taskIds.length
-    ? db.select().from(schema.sysTask).where(inArray(schema.sysTask.id, taskIds)).all()
+    ? (await db.select().from(schema.sysTask).where(inArray(schema.sysTask.id, taskIds)).all())
     : []
   const taskById = new Map(tasks.map(task => [task.id, task]))
   const itemsByBatch = new Map<number, typeof items>()
@@ -361,81 +362,86 @@ export function readBatches(versionId: number): BatchRun[] {
     group.push(item)
     itemsByBatch.set(item.batchId, group)
   }
-  return batches.map(batch => ({
+  return Promise.all(batches.map(async batch => ({
     id: batch.id, versionId: batch.versionId, type: batch.type as 'image' | 'video', status: batch.status,
-    items: (itemsByBatch.get(batch.id) || []).map(item => {
+    items: await Promise.all((itemsByBatch.get(batch.id) || []).map(async item => {
       const task = item.taskId ? taskById.get(item.taskId) : null
       const request = JSON.parse(item.requestJson)
       return {
         id: item.id, groupId: item.groupId, panelId: item.panelId, frameType: item.frameType as any,
         status: item.status, taskId: item.taskId, error: item.error, frameId: request.frameId,
         localPath: task?.localPath, resultUrl: task?.resultUrl,
-        ...(item.taskId ? queueJobView('sys_task', item.taskId) : {}),
+        ...(item.taskId ? (await queueJobView('sys_task', item.taskId)) : {}),
         actualStrategy: request.actualStrategy, generationMode: request.generationMode,
         panelIds: request.panelIds, inputHash: request.inputHash, referenceInput: request.referenceInput, videoContinuity: request.videoContinuity, generationScope: request.generationScope,
       }
-    }),
-  }))
+    })),
+  })))
 }
-export function isBusy(versionId: number, batches = readBatches(versionId)) {
-  return batches.some(b => b.type === 'image' && b.items.some(i => ['pending', 'processing'].includes(i.status)))
-    || db.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.versionId, versionId)).all().some(c => ['pending', 'processing'].includes(c.status))
+export async function isBusy(versionId: number, batches?: BatchRun[]) {
+  const resolvedBatches = batches ?? await readBatches(versionId)
+  const candidates = await db.select().from(schema.gridCandidates)
+    .where(eq(schema.gridCandidates.versionId, versionId)).all()
+  return resolvedBatches.some(b => b.type === 'image' && b.items.some(i => ['pending', 'processing'].includes(i.status)))
+    || candidates.some(c => ['pending', 'processing'].includes(c.status))
 }
-export function getVersion(versionId: number): AnimaticVersion {
-  const row = versionRow(versionId)
+export async function getVersion(versionId: number): Promise<AnimaticVersion> {
+  const row = (await versionRow(versionId))
   const timeline = normalizeTimeline(JSON.parse(row.timelineJson))
-  const batches = readBatches(versionId)
+  const batches = (await readBatches(versionId))
   return { ...row, status: row.status as AnimaticVersion['status'], timeline, issues: checkContinuity(timeline),
-    isCurrent: isCurrentVersion(versionId), outputs: resolveVideoOutputs(versionId, timeline, batches),
-    busy: isBusy(versionId, batches), batches, contactSheets: readContactSheets(versionId) }
+    isCurrent: (await isCurrentVersion(versionId)), outputs: (await resolveVideoOutputs(versionId, timeline, batches)),
+    busy: (await isBusy(versionId, batches)), batches, contactSheets: (await readContactSheets(versionId)) }
 }
-function contactSheetAspectRatio(versionId: number) {
-  const episode = episodeForPrevis(versionRow(versionId).episodeId)
-  return db.select().from(schema.dramas).where(eq(schema.dramas.id, episode.dramaId)).get()?.aspectRatio || '16:9'
+async function contactSheetAspectRatio(versionId: number) {
+  const episode = (await episodeForPrevis((await versionRow(versionId)).episodeId))
+  return (await db.select().from(schema.dramas).where(eq(schema.dramas.id, episode.dramaId)).get())?.aspectRatio || '16:9'
 }
-export function resolveVideoOutputs(
+export async function resolveVideoOutputs(
   versionId: number,
-  timeline = getVersionTimeline(versionId),
-  batches = readBatches(versionId),
-): VideoOutput[] {
+  timeline?: Timeline,
+  batches?: BatchRun[],
+): Promise<VideoOutput[]> {
+  const resolvedTimeline = timeline ?? await getVersionTimeline(versionId)
+  const resolvedBatches = batches ?? await readBatches(versionId)
   const results: VideoOutput[] = []
   const claimed = new Set<number>()
   const trackedUrls = new Set<string>()
-  for (const batch of batches.filter(batch => batch.type === 'video')) for (const item of batch.items) {
+  for (const batch of resolvedBatches.filter(batch => batch.type === 'video')) for (const item of batch.items) {
     if (item.status !== 'completed' || !item.taskId) continue
-    const ids: number[] = item.panelIds || (item.panelId ? [item.panelId] : timeline.groups.find(g => g.id === item.groupId)?.panelIds || [])
-    if (!ids.length || ids.some(id => claimed.has(id) || !timeline.panels.some(p => p.id === id))) continue
+    const ids: number[] = item.panelIds || (item.panelId ? [item.panelId] : resolvedTimeline.groups.find(g => g.id === item.groupId)?.panelIds || [])
+    if (!ids.length || ids.some(id => claimed.has(id) || !resolvedTimeline.panels.some(p => p.id === id))) continue
     const url = item.localPath || item.resultUrl
     if (!url) continue
     trackedUrls.add(url)
-    const panels = ids.map(id => timeline.panels.find(p => p.id === id)!)
-    const sourceOrder = timelineSegments(timeline).map(segment => segment.panel.id).filter(id => ids.includes(id))
+    const panels = ids.map(id => resolvedTimeline.panels.find(p => p.id === id)!)
+    const sourceOrder = timelineSegments(resolvedTimeline).map(segment => segment.panel.id).filter(id => ids.includes(id))
     const orderChanged = item.generationScope === 'group' && sourceOrder.some((id, i) => id !== ids[i])
-    const inputTimeline = item.generationScope ? { ...timeline, strategy: { ...timeline.strategy, mode: item.generationScope } } : timeline
+    const inputTimeline = item.generationScope ? { ...resolvedTimeline, strategy: { ...resolvedTimeline.strategy, mode: item.generationScope } } : resolvedTimeline
     const stale = (!!item.inputHash && item.inputHash !== videoFingerprint(
       inputTimeline, panels, item.generationMode || 'storyboard_frames', item.referenceInput, item.videoContinuity,
-    )) || (!!item.videoContinuity && (!videoContinuityMatchesTimeline(item.videoContinuity, timeline, panels) || contactSheetAspectRatio(versionId) !== item.videoContinuity.aspectRatio)) || orderChanged || (!!item.referenceInput && !videoReferenceMatchesSource(versionId, item.referenceInput, panels))
+    )) || (!!item.videoContinuity && (!videoContinuityMatchesTimeline(item.videoContinuity, resolvedTimeline, panels) || (await contactSheetAspectRatio(versionId)) !== item.videoContinuity.aspectRatio)) || orderChanged || (!!item.referenceInput && !(await videoReferenceMatchesSource(versionId, item.referenceInput, panels)))
     results.push({
       key: `task-${item.taskId}`, panelIds: ids, url, taskId: item.taskId,
       generationMode: item.generationMode, generationScope: item.generationScope, referenceInput: item.referenceInput, videoContinuity: item.videoContinuity, stale,
     })
     if (!stale) ids.forEach(id => claimed.add(id))
   }
-  for (const output of timeline.inheritedOutputs || []) {
+  for (const output of resolvedTimeline.inheritedOutputs || []) {
     trackedUrls.add(output.url)
-    if (output.panelIds.some(id => claimed.has(id) || !timeline.panels.some(p => p.id === id))) continue
-    const order = timelineSegments(timeline).map(segment => segment.panel.id).filter(id => output.panelIds.includes(id))
-    const stale = output.stale || (!!output.videoContinuity && (!videoContinuityMatchesTimeline(output.videoContinuity, timeline, output.panelIds.map(id => timeline.panels.find(p => p.id === id)!)) || contactSheetAspectRatio(versionId) !== output.videoContinuity.aspectRatio)) || (output.generationScope === 'group' && order.some((id, i) => id !== output.panelIds[i])) || (!!output.referenceInput && !videoReferenceMatchesSource(versionId, output.referenceInput, output.panelIds.map(id => timeline.panels.find(p => p.id === id)!)))
+    if (output.panelIds.some(id => claimed.has(id) || !resolvedTimeline.panels.some(p => p.id === id))) continue
+    const order = timelineSegments(resolvedTimeline).map(segment => segment.panel.id).filter(id => output.panelIds.includes(id))
+    const stale = output.stale || (!!output.videoContinuity && (!videoContinuityMatchesTimeline(output.videoContinuity, resolvedTimeline, output.panelIds.map(id => resolvedTimeline.panels.find(p => p.id === id)!)) || (await contactSheetAspectRatio(versionId)) !== output.videoContinuity.aspectRatio)) || (output.generationScope === 'group' && order.some((id, i) => id !== output.panelIds[i])) || (!!output.referenceInput && !(await videoReferenceMatchesSource(versionId, output.referenceInput, output.panelIds.map(id => resolvedTimeline.panels.find(p => p.id === id)!))))
     results.push({ ...output, stale })
     if (!stale) output.panelIds.forEach(id => claimed.add(id))
   }
-  for (const p of timeline.panels) if (!claimed.has(p.id) && p.videoUrl && !trackedUrls.has(p.videoUrl)) {
+  for (const p of resolvedTimeline.panels) if (!claimed.has(p.id) && p.videoUrl && !trackedUrls.has(p.videoUrl)) {
     results.push({ key: `import-${p.id}`, panelIds: [p.id], url: p.videoUrl, stale: false })
   }
-  const order = timelineSegments(timeline).map(s => s.panel.id)
+  const order = timelineSegments(resolvedTimeline).map(s => s.panel.id)
   return results.sort((a, b) => order.indexOf(a.panelIds[0]) - order.indexOf(b.panelIds[0]))
 }
-function getVersionTimeline(versionId: number) { return normalizeTimeline(JSON.parse(versionRow(versionId).timelineJson)) }
+async function getVersionTimeline(versionId: number) { return normalizeTimeline(JSON.parse((await versionRow(versionId)).timelineJson)) }
 function sourceChanged(before: Timeline, source: Timeline) {
   const collectionChanged = source.panels.length !== before.panels.length
     || source.panels.some(panel => !before.panels.some(existing => existing.id === panel.id))
@@ -447,9 +453,9 @@ function sourceChanged(before: Timeline, source: Timeline) {
   return { collectionChanged, changed: collectionChanged || metadataChanged }
 }
 
-function framePlanSummary(versionId: number) {
-  const rows = db.select({ status: schema.framePlans.status })
-    .from(schema.framePlans).where(eq(schema.framePlans.versionId, versionId)).all()
+async function framePlanSummary(versionId: number) {
+  const rows = (await db.select({ status: schema.framePlans.status })
+    .from(schema.framePlans).where(eq(schema.framePlans.versionId, versionId)).all())
   const count = (status: string) => rows.filter(row => row.status === status).length
   return {
     pending: count('pending'), processing: count('processing'),
@@ -457,51 +463,51 @@ function framePlanSummary(versionId: number) {
   }
 }
 
-function versionState(
+async function versionState(
   row: typeof schema.animaticVersions.$inferSelect,
   timeline: Timeline,
   isCurrent: boolean,
 ) {
-  const batches = readBatches(row.id)
+  const batches = (await readBatches(row.id))
   return {
     id: row.id,
     revision: row.revision,
     status: row.status as AnimaticVersion['status'],
     isCurrent,
-    busy: isBusy(row.id, batches),
+    busy: (await isBusy(row.id, batches)),
     batches,
-    outputs: resolveVideoOutputs(row.id, timeline, batches),
-    framePlans: framePlanSummary(row.id),
-    contactSheets: readContactSheets(row.id),
+    outputs: (await resolveVideoOutputs(row.id, timeline, batches)),
+    framePlans: (await framePlanSummary(row.id)),
+    contactSheets: (await readContactSheets(row.id)),
   }
 }
 
-export function getVersionState(versionId: number) {
-  const row = versionRow(versionId)
-  return { ...versionState(row, normalizeTimeline(JSON.parse(row.timelineJson)), isCurrentVersion(versionId)), requiresRefresh: false }
+export async function getVersionState(versionId: number) {
+  const row = (await versionRow(versionId))
+  return { ...(await versionState(row, normalizeTimeline(JSON.parse(row.timelineJson)), (await isCurrentVersion(versionId)))), requiresRefresh: false }
 }
 
-export function getWorkspaceState(episodeId: number, versionId: number) {
-  const latest = listVersions(episodeId)[0]
+export async function getWorkspaceState(episodeId: number, versionId: number) {
+  const latest = (await listVersions(episodeId))[0]
   if (!latest || latest.id !== versionId) {
     return { id: latest?.id || null, revision: latest?.revision || null, requiresRefresh: true }
   }
-  const row = versionRow(latest.id)
+  const row = (await versionRow(latest.id))
   const timeline = normalizeTimeline(JSON.parse(row.timelineJson))
-  if (sourceChanged(timeline, initialTimeline(episodeId)).changed) {
+  if (sourceChanged(timeline, (await initialTimeline(episodeId))).changed) {
     return { id: row.id, revision: row.revision, requiresRefresh: true }
   }
-  return { ...versionState(row, timeline, true), requiresRefresh: false }
+  return { ...(await versionState(row, timeline, true)), requiresRefresh: false }
 }
 
 /** Only the latest version follows outside edits. Viewing a historical version never activates it. */
-export function getWorkspace(episodeId: number): AnimaticVersion {
-  const latest = listVersions(episodeId)[0]
-  if (!latest) return createVersion(episodeId)
-  const row = versionRow(latest.id), before = getVersionTimeline(row.id)
-  const source = initialTimeline(episodeId)
+export async function getWorkspace(episodeId: number): Promise<AnimaticVersion> {
+  const latest = (await listVersions(episodeId))[0]
+  if (!latest) return (await createVersion(episodeId))
+  const row = (await versionRow(latest.id)), before = (await getVersionTimeline(row.id))
+  const source = (await initialTimeline(episodeId))
   const sourceState = sourceChanged(before, source)
-  if (!sourceState.changed) return getVersion(row.id)
+  if (!sourceState.changed) return (await getVersion(row.id))
   const next = structuredClone(before)
   next.panels = source.panels.map(p => {
     const old = before.panels.find(o => o.id === p.id)
@@ -523,29 +529,30 @@ export function getWorkspace(episodeId: number): AnimaticVersion {
   retimeBoundAudio(before, next)
   next.acknowledgements = {}
   if (row.status === 'locked' || sourceState.collectionChanged) {
-    const id = db.transaction(tx => {
-      const id = Number(tx.insert(schema.animaticVersions).values({
+    const id = (await db.transaction(async tx => {
+      const result = await tx.insert(schema.animaticVersions).values({
         episodeId, versionNo: row.versionNo + 1, timelineJson: JSON.stringify(next), createdAt: now(), updatedAt: now(),
-      }).run().lastInsertRowid)
-      mirrorCurrent(id, next)
+      }).run()
+      const id = getInsertId(result)
+      ;await mirrorCurrent(id, next)
       return id
-    })
-    return getVersion(id)
+    }))
+    return (await getVersion(id))
   }
-  db.update(schema.animaticVersions).set({ timelineJson: JSON.stringify(next), revision: row.revision + 1,
+  await db.update(schema.animaticVersions).set({ timelineJson: JSON.stringify(next), revision: row.revision + 1,
     status: 'draft', contentHash: null, updatedAt: now() }).where(eq(schema.animaticVersions.id, row.id)).run()
-  return getVersion(row.id)
+  return (await getVersion(row.id))
 }
-export function requireEditable(versionId: number, revision: number) {
-  const row = versionRow(versionId)
+export async function requireEditable(versionId: number, revision: number) {
+  const row = (await versionRow(versionId))
   if (!Number.isInteger(revision) || row.revision !== revision) throw new PrevisError('版本已更新，请先刷新；本地修改可复制后重新应用。', 409)
   if (row.status === 'locked') throw new PrevisError('锁定版本不可修改，请复制为新草稿', 409)
   return row
 }
-export function saveTimeline(versionId: number, revision: number, input: unknown) {
+export async function saveTimeline(versionId: number, revision: number, input: unknown) {
   const changedImages: number[] = []
-  db.transaction(tx => {
-    const row = requireEditable(versionId, revision)
+  await db.transaction(async tx => {
+    const row = (await requireEditable(versionId, revision))
     const original = normalizeTimeline(JSON.parse(row.timelineJson))
     const timeline = validateTimeline(input, original)
     for (const panel of timeline.panels) {
@@ -560,8 +567,8 @@ export function saveTimeline(versionId: number, revision: number, input: unknown
       ),
     }))
     // Metadata baselines are server-owned; keep optimistic concurrency across the two pages.
-    if (isCurrentVersion(versionId)) {
-      const source = initialTimeline(row.episodeId)
+    if ((await isCurrentVersion(versionId))) {
+      const source = (await initialTimeline(row.episodeId))
       if (source.panels.length !== original.panels.length || source.panels.some(p => {
         const old = original.panels.find(o => o.id === p.id)
         return !old || (old.sourceFingerprint && old.sourceFingerprint !== p.sourceFingerprint)
@@ -582,32 +589,32 @@ export function saveTimeline(versionId: number, revision: number, input: unknown
           .filter((h, i, all) => all.findIndex(v => v.url === h.url) === i).slice(-200)
       }
     }
-    mirrorCurrent(versionId, timeline)
-    if (isCurrentVersion(versionId)) {
+    ;await mirrorCurrent(versionId, timeline)
+    if ((await isCurrentVersion(versionId))) {
       // Track the metadata actually mirrored to legacy storyboards. Timeline-only
       // custom references must not look like an outside edit on the next poll.
-      const baselines = new Map(initialTimeline(row.episodeId).panels.map(panel => [panel.id, panel.sourceFingerprint]))
+      const baselines = new Map((await initialTimeline(row.episodeId)).panels.map(panel => [panel.id, panel.sourceFingerprint]))
       for (const panel of timeline.panels) panel.sourceFingerprint = baselines.get(panel.id) || panel.sourceFingerprint
     }
-    tx.update(schema.animaticVersions).set({
+    await tx.update(schema.animaticVersions).set({
       timelineJson: JSON.stringify(timeline), revision: revision + 1, status: 'draft', contentHash: null, updatedAt: now(),
     }).where(and(eq(schema.animaticVersions.id, versionId), eq(schema.animaticVersions.revision, revision))).run()
   })
-  scheduleContactSheets(versionId)
-  if (changedImages.length) scheduleContinuityReviews(versionId, changedImages)
-  return getVersion(versionId)
+  ;await scheduleContactSheets(versionId)
+  if (changedImages.length) await scheduleContinuityReviews(versionId, changedImages)
+  return (await getVersion(versionId))
 }
-export function checkOrLock(versionId: number, revision: number, lock: boolean) {
-  db.transaction(tx => {
-    const row = requireEditable(versionId, revision)
-    if (lock && isBusy(versionId)) throw new PrevisError('画面正在生成，请等待完成后再锁定', 409)
+export async function checkOrLock(versionId: number, revision: number, lock: boolean) {
+  ;await db.transaction(async tx => {
+    const row = (await requireEditable(versionId, revision))
+    if (lock && (await isBusy(versionId))) throw new PrevisError('画面正在生成，请等待完成后再锁定', 409)
     const t = validateTimeline(JSON.parse(row.timelineJson))
     const issues = checkContinuity(t)
     if (lock && issues.some(i => i.severity === 'fail')) throw new PrevisError('请修复时间线中的阻断问题后再锁定', 409)
-    tx.update(schema.animaticVersions).set({
+    ;await tx.update(schema.animaticVersions).set({
       status: lock ? 'locked' : issues.some(i => i.severity === 'fail') ? 'draft' : 'ready',
       timelineJson: JSON.stringify(t), revision: revision + 1, contentHash: hashContent(t), lockedAt: lock ? now() : null, updatedAt: now(),
     }).where(eq(schema.animaticVersions.id, versionId)).run()
   })
-  return getVersion(versionId)
+  return (await getVersion(versionId))
 }

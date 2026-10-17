@@ -249,47 +249,47 @@ async function createTask(
   params: Record<string, unknown>,
 ): Promise<number> {
   const ts = now()
-  const id = db.transaction(tx => {
-    const res = tx.insert(schema.sysTask).values({
+  const id = (await db.transaction(async tx => {
+    const res = (await tx.insert(schema.sysTask).values({
       type, ...fields, provider: config.provider, params: JSON.stringify(params),
       status: 'pending', createdAt: ts, updatedAt: ts,
-    }).run()
+    }).run())
     const id = getInsertId(res)
-    const record = tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()!
-    enqueueGenerationTask(record, { ready: !fields.previsItemKey })
+    const record = (await tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get())!
+    ;await enqueueGenerationTask(record, { ready: !fields.previsItemKey })
     return id
-  })
+  }))
   return id
 }
 
 /** Previs parents link their child before opening the queue submission gate. */
 export async function startQueuedPrevisTask(id: number) {
-  const record = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
+  const record = (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get())
   if (!record?.previsItemKey || record.status !== 'pending') return
-  let job = getQueueJob('sys_task', id)
+  let job = (await getQueueJob('sys_task', id))
   if (!job) {
-    enqueueGenerationTask(record, { ready: false })
-    job = getQueueJob('sys_task', id)!
+    ;await enqueueGenerationTask(record, { ready: false })
+    job = (await getQueueJob('sys_task', id))!
   }
-  if (!previsParentReady(record)) return
+  if (!(await previsParentReady(record))) return
   try {
     await validateQueuedConfig(record)
     validateTaskSnapshot(record, job)
-    activateQueueJob('sys_task', id)
+    await activateQueueJob('sys_task', id)
     await tickTaskQueue()
   } catch (error) {
     const message = (error as Error).message
     await failTask(id, message)
-    finishQueueJob(job.id, { status: 'failed', error: message })
+    await finishQueueJob(job.id, { status: 'failed', error: message })
   }
 }
 
 /** Legacy task migration only; the global queue owns all restart recovery. */
 export async function recoverPrevisTasks() {
-  const tasks = db.select().from(schema.sysTask)
-    .where(inArray(schema.sysTask.status, ['pending', 'processing'])).all()
+  const tasks = (await db.select().from(schema.sysTask)
+    .where(inArray(schema.sysTask.status, ['pending', 'processing'])).all())
   for (const task of tasks) {
-    if (getQueueJob('sys_task', task.id)) continue
+    if ((await getQueueJob('sys_task', task.id))) continue
     const params = parseTaskParams(task.params)
     // Existing accepted tasks keep their original tracking, even if the config is no longer usable.
     if (!params.configId && task.status === 'pending') {
@@ -297,11 +297,11 @@ export async function recoverPrevisTasks() {
       if (selected.config && selected.configId) {
         params.configId = selected.configId
         params.frozenConfigHash = hashContent(selected.config)
-        db.update(schema.sysTask).set({ params: JSON.stringify(params) }).where(eq(schema.sysTask.id, task.id)).run()
+        ;await db.update(schema.sysTask).set({ params: JSON.stringify(params) }).where(eq(schema.sysTask.id, task.id)).run()
         task.params = JSON.stringify(params)
       }
     }
-    enqueueGenerationTask(task, { ready: !task.previsItemKey || previsParentReady(task), legacy: true })
+    ;await enqueueGenerationTask(task, { ready: !task.previsItemKey || (await previsParentReady(task)), legacy: true })
   }
 }
 
@@ -313,10 +313,10 @@ function generationSnapshot(task: SysTaskRecord) {
     characterId: task.characterId, propId: task.propId, params }
 }
 
-function enqueueGenerationTask(task: SysTaskRecord, options: { ready: boolean; legacy?: boolean }) {
+async function enqueueGenerationTask(task: SysTaskRecord, options: { ready: boolean; legacy?: boolean }) {
   const snapshot = generationSnapshot(task), params = snapshot.params
-  return enqueueQueueJob({ ownerType: 'sys_task', ownerId: task.id, kind: task.type as TaskType,
-    projectId: generationProjectId(task), configId: params.configId || undefined,
+  return (await enqueueQueueJob({ ownerType: 'sys_task', ownerId: task.id, kind: task.type as TaskType,
+    projectId: (await generationProjectId(task)), configId: params.configId || undefined,
     inputHash: hashContent(snapshot), snapshotJson: JSON.stringify(snapshot),
     source: task.previsItemKey ? 'previs' : 'generation', ready: options.ready,
     ...(options.legacy ? { initialStatus: task.status === 'processing' ? 'processing' as const : 'pending' as const,
@@ -325,49 +325,49 @@ function enqueueGenerationTask(task: SysTaskRecord, options: { ready: boolean; l
       // without a queue record must be treated as accepted/ambiguous, never resubmitted.
       submitted: task.status === 'processing' || !!(params.submissionStarted || task.taskId || task.resultUrl || task.localPath),
       externalTaskId: task.taskId, upstreamDone: !!(task.resultUrl || task.localPath) } : {}),
-  })
+  }))
 }
 
-function generationProjectId(task: SysTaskRecord): number | undefined {
+async function generationProjectId(task: SysTaskRecord): Promise<number | undefined> {
   if (task.dramaId) return task.dramaId
-  if (task.characterId) return db.select().from(schema.characters).where(eq(schema.characters.id, task.characterId)).get()?.dramaId
-  if (task.sceneId) return db.select().from(schema.scenes).where(eq(schema.scenes.id, task.sceneId)).get()?.dramaId
-  if (task.propId) return db.select().from(schema.props).where(eq(schema.props.id, task.propId)).get()?.dramaId
-  const storyboard = task.storyboardId ? db.select().from(schema.storyboards).where(eq(schema.storyboards.id, task.storyboardId)).get() : null
-  const version = task.animaticVersionId ? db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, task.animaticVersionId)).get() : null
+  if (task.characterId) return (await db.select().from(schema.characters).where(eq(schema.characters.id, task.characterId)).get())?.dramaId
+  if (task.sceneId) return (await db.select().from(schema.scenes).where(eq(schema.scenes.id, task.sceneId)).get())?.dramaId
+  if (task.propId) return (await db.select().from(schema.props).where(eq(schema.props.id, task.propId)).get())?.dramaId
+  const storyboard = task.storyboardId ? (await db.select().from(schema.storyboards).where(eq(schema.storyboards.id, task.storyboardId)).get()) : null
+  const version = task.animaticVersionId ? (await db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, task.animaticVersionId)).get()) : null
   const episodeId = storyboard?.episodeId || version?.episodeId
-  return episodeId ? db.select().from(schema.episodes).where(eq(schema.episodes.id, episodeId)).get()?.dramaId : undefined
+  return episodeId ? (await db.select().from(schema.episodes).where(eq(schema.episodes.id, episodeId)).get())?.dramaId : undefined
 }
 
-function retryPrevisParent(task: SysTaskRecord) {
+async function retryPrevisParent(task: SysTaskRecord) {
   if (!task.previsItemKey) return
-  const version = task.animaticVersionId ? db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, task.animaticVersionId)).get() : null
+  const version = task.animaticVersionId ? (await db.select().from(schema.animaticVersions).where(eq(schema.animaticVersions.id, task.animaticVersionId)).get()) : null
   if (!version || (task.type === 'image' && version.status === 'locked')) throw new Error('故事版已锁定或不存在，无法重试生成')
   const gridId = /^grid-(\d+)$/.exec(task.previsItemKey), batchKey = /^(\d+):(\d+)$/.exec(task.previsItemKey)
   if (gridId) {
-    const parent = db.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, Number(gridId[1]))).get()
+    const parent = (await db.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, Number(gridId[1]))).get())
     if (!parent || parent.taskId !== task.id || parent.status === 'discarded') throw new Error('宫格生成已取消，无法重试')
-    db.update(schema.gridCandidates).set({ status: 'pending', error: null, updatedAt: now() }).where(eq(schema.gridCandidates.id, parent.id)).run()
+    ;await db.update(schema.gridCandidates).set({ status: 'pending', error: null, updatedAt: now() }).where(eq(schema.gridCandidates.id, parent.id)).run()
   }
   if (batchKey) {
-    const item = db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, Number(batchKey[1]))).get()
-    const batch = item ? db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, item.batchId)).get() : null
+    const item = (await db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, Number(batchKey[1]))).get())
+    const batch = item ? (await db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, item.batchId)).get()) : null
     if (!item || item.taskId !== task.id || item.attempt !== Number(batchKey[2]) || !batch || batch.status === 'cancelled') throw new Error('批次任务已取消或已替换，无法重试')
     if (task.type === 'image') {
       const request = JSON.parse(item.requestJson), timeline = normalizeTimeline(JSON.parse(version.timelineJson))
       const frame = timeline.panels.find(panel => panel.id === item.panelId)?.frames.find(frame => request.frameId ? frameKey(frame) === request.frameId : frame.type === item.frameType)
       if (frame?.locked) throw new Error('画面已锁定，请解除画面锁定后再重试')
     }
-    db.update(schema.batchRunItems).set({ status: 'pending', error: null }).where(eq(schema.batchRunItems.id, item.id)).run()
-    db.update(schema.batchRuns).set({ status: 'pending' }).where(eq(schema.batchRuns.id, batch.id)).run()
+    ;await db.update(schema.batchRunItems).set({ status: 'pending', error: null }).where(eq(schema.batchRunItems.id, item.id)).run()
+    ;await db.update(schema.batchRuns).set({ status: 'pending' }).where(eq(schema.batchRuns.id, batch.id)).run()
   }
 }
 
-function cancelPrevisParent(task: SysTaskRecord) {
+async function cancelPrevisParent(task: SysTaskRecord) {
   const gridId = /^grid-(\d+)$/.exec(task.previsItemKey || ''), batchKey = /^(\d+):(\d+)$/.exec(task.previsItemKey || '')
-  if (gridId) db.update(schema.gridCandidates).set({ status: 'discarded', updatedAt: now() })
+  if (gridId) await db.update(schema.gridCandidates).set({ status: 'discarded', updatedAt: now() })
     .where(and(eq(schema.gridCandidates.id, Number(gridId[1])), inArray(schema.gridCandidates.status, ['pending', 'processing']))).run()
-  if (batchKey) db.update(schema.batchRunItems).set({ status: 'cancelled' })
+  if (batchKey) await db.update(schema.batchRunItems).set({ status: 'cancelled' })
     .where(and(eq(schema.batchRunItems.id, Number(batchKey[1])), eq(schema.batchRunItems.taskId, task.id), eq(schema.batchRunItems.attempt, Number(batchKey[2])))).run()
 }
 
@@ -385,17 +385,17 @@ async function validateQueuedConfig(task: SysTaskRecord): Promise<AIConfig> {
   return config
 }
 
-function previsParentReady(task: SysTaskRecord): boolean {
+async function previsParentReady(task: SysTaskRecord): Promise<boolean> {
   const key = task.previsItemKey
   if (!key) return true
   const gridId = /^grid-(\d+)$/.exec(key), batchKey = /^(\d+):(\d+)$/.exec(key)
   if (gridId) {
-    const parent = db.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, Number(gridId[1]))).get()
+    const parent = (await db.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, Number(gridId[1]))).get())
     return !!parent && parent.taskId === task.id && ['pending', 'processing'].includes(parent.status || '')
   }
   if (batchKey) {
-    const item = db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, Number(batchKey[1]))).get()
-    const batch = item ? db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, item.batchId)).get() : null
+    const item = (await db.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, Number(batchKey[1]))).get())
+    const batch = item ? (await db.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, item.batchId)).get()) : null
     return !!item && item.taskId === task.id && ['pending', 'processing'].includes(item.status || '')
       && item.attempt === Number(batchKey[2]) && !!batch && batch.status !== 'cancelled'
   }
@@ -412,42 +412,43 @@ function parseTaskParams(raw: string | null | undefined): Record<string, any> {
 }
 
 /** Cancels queued/reference preparation work, but retains submitted task tracking. */
-export function cancelUnsubmittedPrevisTask(id: number) {
-  const record = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
+export async function cancelUnsubmittedPrevisTask(id: number) {
+  const record = (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get())
   if (!record?.previsItemKey || !['pending', 'processing'].includes(record.status || '')) return
-  const job = getQueueJob('sys_task', id)
-  if (job && !job.submitted) { cancelQueueJob(job.id); return }
-  return db.transaction(tx => {
-    const task = tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
+  const job = (await getQueueJob('sys_task', id))
+  if (job && !job.submitted) { (await cancelQueueJob(job.id)); return }
+  return (await db.transaction(async tx => {
+    const task = (await tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get())
     if (!task?.previsItemKey || !['pending', 'processing'].includes(task.status || '')
       || parseTaskParams(task.params).submissionStarted || task.taskId || task.resultUrl || task.localPath) return
-    tx.update(schema.sysTask).set({ status: 'cancelled', updatedAt: now() })
+    await tx.update(schema.sysTask).set({ status: 'cancelled', updatedAt: now() })
       .where(eq(schema.sysTask.id, id)).run()
-  })
+  }))
 }
 
 // This synchronous boundary runs immediately before fetch: discard during async
 // image reads prevents submission; once started, tracking continues until completion.
-function beginPrevisSubmission(id: number): boolean {
-  return db.transaction(tx => {
-    const task = tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
+async function beginPrevisSubmission(id: number): Promise<boolean> {
+  return (await db.transaction(async tx => {
+    const task = (await tx.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get())
     if (!task || task.status !== 'processing') return false
     const gridId = /^grid-(\d+)$/.exec(task.previsItemKey || '')
     const batchKey = /^(\d+):(\d+)$/.exec(task.previsItemKey || '')
-    const item = batchKey ? tx.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, Number(batchKey[1]))).get() : null
-    const batch = item ? tx.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, item.batchId)).get() : null
-    const cancelledGrid = gridId && tx.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, Number(gridId[1]))).get()?.status !== 'processing'
+    const item = batchKey ? (await tx.select().from(schema.batchRunItems).where(eq(schema.batchRunItems.id, Number(batchKey[1]))).get()) : null
+    const batch = item ? (await tx.select().from(schema.batchRuns).where(eq(schema.batchRuns.id, item.batchId)).get()) : null
+    const grid = gridId ? await tx.select().from(schema.gridCandidates).where(eq(schema.gridCandidates.id, Number(gridId[1]))).get() : null
+    const cancelledGrid = gridId && grid?.status !== 'processing'
     const cancelledBatch = batchKey && (!item || item.status !== 'processing' || item.attempt !== Number(batchKey[2]) || !batch || batch.status === 'cancelled')
     if (cancelledGrid || cancelledBatch) {
-      tx.update(schema.sysTask).set({ status: 'cancelled', updatedAt: now() }).where(eq(schema.sysTask.id, id)).run()
+      await tx.update(schema.sysTask).set({ status: 'cancelled', updatedAt: now() }).where(eq(schema.sysTask.id, id)).run()
       return false
     }
-    tx.update(schema.sysTask).set({ params: JSON.stringify({ ...parseTaskParams(task.params), submissionStarted: true }), updatedAt: now() })
+    await tx.update(schema.sysTask).set({ params: JSON.stringify({ ...parseTaskParams(task.params), submissionStarted: true }), updatedAt: now() })
       .where(eq(schema.sysTask.id, id)).run()
-    const job = getQueueJob('sys_task', id)
-    if (job) updateQueueJob(job.id, { phase: 'submitting', submitted: true })
+    const job = (await getQueueJob('sys_task', id))
+    if (job) (await updateQueueJob(job.id, { phase: 'submitting', submitted: true }))
     return true
-  })
+  }))
 }
 
 async function processTask(id: number, config: AIConfig) {
@@ -550,7 +551,7 @@ async function processTask(id: number, config: AIConfig) {
           if (await referenceFileDigest(ref.url) !== ref.digest) throw new Error('冻结的参考媒体已变化，停止提交')
         }
       }
-      if (!beginPrevisSubmission(id)) return null
+      if (!(await beginPrevisSubmission(id))) return null
       const response = await fetch(url, {
         method, headers,
         body: isMultipart ? (body as FormData) : JSON.stringify(body),
@@ -561,16 +562,16 @@ async function processTask(id: number, config: AIConfig) {
         const error = Object.assign(new Error(message), { status: response.status, responseHeaders: response.headers })
         // Gateways and server errors may occur after an upstream accepted the paid job.
         if (![400, 401, 403, 404, 405, 413, 415, 422, 429].includes(response.status)) throw error
-        const job = getQueueJob('sys_task', id)
-        const current = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()!
-        db.update(schema.sysTask).set({ params: JSON.stringify({ ...parseTaskParams(current.params), submissionStarted: false, submissionRejected: true }) }).where(eq(schema.sysTask.id, id)).run()
-        if (job) updateQueueJob(job.id, { submitted: false, phase: 'rejected' })
+        const job = (await getQueueJob('sys_task', id))
+        const current = (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get())!
+        ;await db.update(schema.sysTask).set({ params: JSON.stringify({ ...parseTaskParams(current.params), submissionStarted: false, submissionRejected: true }) }).where(eq(schema.sysTask.id, id)).run()
+        if (job) (await updateQueueJob(job.id, { submitted: false, phase: 'rejected' }))
         throw error
       }
       return response
-    }, (_error, retry, delayMs) => {
-      const job = getQueueJob('sys_task', id)
-      if (job) updateQueueJob(job.id, { phase: 'retry_wait' })
+    }, async (_error, retry, delayMs) => {
+      const job = (await getQueueJob('sys_task', id))
+      if (job) (await updateQueueJob(job.id, { phase: 'retry_wait' }))
       logTaskWarn(label, 'rate-limit-retry', { id, retry, delayMs })
     })
     if (!resp) return
@@ -615,8 +616,8 @@ async function processTask(id: number, config: AIConfig) {
     await markPolling(id, taskId)
     await pollTask(record, config, taskId!)
   } catch (err: any) {
-    const task = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get()
-    const job = getQueueJob('sys_task', id)
+    const task = (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id)).get())
+    const job = (await getQueueJob('sys_task', id))
     if (task?.status !== 'cancelled') {
       if (job?.submitted && !job.upstreamDone) await needsConfirmation(id, err.message)
       else await failTask(id, err.message)
@@ -629,8 +630,8 @@ async function markPolling(id: number, taskId: string | undefined) {
   await db.update(schema.sysTask)
     .set({ taskId, status: 'processing', updatedAt: now() })
     .where(eq(schema.sysTask.id, id))
-  const job = getQueueJob('sys_task', id)
-  if (job) updateQueueJob(job.id, { externalTaskId: taskId, phase: 'polling', submitted: true })
+  const job = (await getQueueJob('sys_task', id))
+  if (job) (await updateQueueJob(job.id, { externalTaskId: taskId, phase: 'polling', submitted: true }))
   logTaskProgress('SysTask', 'poll-start', { id, taskId })
 }
 
@@ -645,28 +646,28 @@ type SysTaskRecord = typeof schema.sysTask.$inferSelect
 
 async function needsConfirmation(id: number, message: string) {
   const error = `提交结果待确认，请核对服务商记录，避免重复扣费：${message}`
-  db.update(schema.sysTask).set({ status: 'processing', errorMsg: error, updatedAt: now() }).where(eq(schema.sysTask.id, id)).run()
-  const job = getQueueJob('sys_task', id)
-  if (job) updateQueueJob(job.id, { phase: 'needs_confirmation', error })
+  ;await db.update(schema.sysTask).set({ status: 'processing', errorMsg: error, updatedAt: now() }).where(eq(schema.sysTask.id, id)).run()
+  const job = (await getQueueJob('sys_task', id))
+  if (job) (await updateQueueJob(job.id, { phase: 'needs_confirmation', error }))
 }
 
-function upstreamDone(id: number) {
-  const job = getQueueJob('sys_task', id)
-  if (job) updateQueueJob(job.id, { upstreamDone: true, phase: 'saving' })
+async function upstreamDone(id: number) {
+  const job = (await getQueueJob('sys_task', id))
+  if (job) (await updateQueueJob(job.id, { upstreamDone: true, phase: 'saving' }))
 }
 
 async function executeGenerationJob(job: QueueJob) {
   try {
-    const task = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, job.ownerId)).get()
+    const task = (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, job.ownerId)).get())
     if (!task) return { status: 'failed' as const, error: '生成任务不存在' }
     if (task.status === 'completed') return { status: 'completed' as const }
     validateTaskSnapshot(task, job)
-    if (!job.submitted && task.previsItemKey && !previsParentReady(task)) throw new Error('预演任务父项已取消或已变化')
-    db.update(schema.sysTask).set({ status: 'processing', errorMsg: null, updatedAt: now() }).where(eq(schema.sysTask.id, task.id)).run()
+    if (!job.submitted && task.previsItemKey && !(await previsParentReady(task))) throw new Error('预演任务父项已取消或已变化')
+    ;await db.update(schema.sysTask).set({ status: 'processing', errorMsg: null, updatedAt: now() }).where(eq(schema.sysTask.id, task.id)).run()
     if (!job.submitted && task.previsItemKey) {
       const grid = /^grid-(\d+)$/.exec(task.previsItemKey), batch = /^(\d+):(\d+)$/.exec(task.previsItemKey)
-      if (grid) db.update(schema.gridCandidates).set({ status: 'processing', updatedAt: now() }).where(eq(schema.gridCandidates.id, Number(grid[1]))).run()
-      if (batch) db.update(schema.batchRunItems).set({ status: 'processing' }).where(eq(schema.batchRunItems.id, Number(batch[1]))).run()
+      if (grid) await db.update(schema.gridCandidates).set({ status: 'processing', updatedAt: now() }).where(eq(schema.gridCandidates.id, Number(grid[1]))).run()
+      if (batch) await db.update(schema.batchRunItems).set({ status: 'processing' }).where(eq(schema.batchRunItems.id, Number(batch[1]))).run()
     }
     if (task.localPath) {
       if (task.type === 'image') {
@@ -679,7 +680,7 @@ async function executeGenerationJob(job: QueueJob) {
         await writeBackVideoAssets(task, task.localPath, parseTaskParams(task.params).duration)
       }
       upstreamDone(task.id)
-      db.update(schema.sysTask).set({ status: 'completed', completedAt: now(), updatedAt: now() }).where(eq(schema.sysTask.id, task.id)).run()
+      ;await db.update(schema.sysTask).set({ status: 'completed', completedAt: now(), updatedAt: now() }).where(eq(schema.sysTask.id, task.id)).run()
     } else if (task.resultUrl) {
       const data = /^data:([^;]+);base64,(.+)$/s.exec(task.resultUrl)
       if (task.type === 'image' && data) await handleImageCompleteBase64(task, data[2], data[1])
@@ -695,12 +696,12 @@ async function executeGenerationJob(job: QueueJob) {
       await processTask(task.id, config)
     }
   } catch (error) {
-    const current = getQueueJob('sys_task', job.ownerId)
+    const current = (await getQueueJob('sys_task', job.ownerId))
     if (current?.submitted && !current.upstreamDone) await needsConfirmation(job.ownerId, (error as Error).message)
     else await failTask(job.ownerId, (error as Error).message)
   }
-  const task = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, job.ownerId)).get()
-  const current = getQueueJob('sys_task', job.ownerId)
+  const task = (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, job.ownerId)).get())
+  const current = (await getQueueJob('sys_task', job.ownerId))
   return { status: task?.status === 'completed' ? 'completed' as const
     : current?.phase === 'needs_confirmation' ? 'needs_confirmation' as const : 'failed' as const,
     error: task?.errorMsg || undefined }
@@ -709,30 +710,30 @@ async function executeGenerationJob(job: QueueJob) {
 registerQueueExecutor('sys_task', {
   execute: executeGenerationJob,
   recover: executeGenerationJob,
-  onRequeue(job) {
-    db.update(schema.sysTask).set({ status: 'pending', errorMsg: null, updatedAt: now() })
+  async onRequeue(job) {
+    await db.update(schema.sysTask).set({ status: 'pending', errorMsg: null, updatedAt: now() })
       .where(and(eq(schema.sysTask.id, job.ownerId), eq(schema.sysTask.status, 'processing'))).run()
   },
-  onCancel(job) {
-    const task = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, job.ownerId)).get()
-    if (task) cancelPrevisParent(task)
-    db.update(schema.sysTask).set({ status: 'cancelled', updatedAt: now() }).where(eq(schema.sysTask.id, job.ownerId)).run()
+  async onCancel(job) {
+    const task = (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, job.ownerId)).get())
+    if (task) await cancelPrevisParent(task)
+    ;await db.update(schema.sysTask).set({ status: 'cancelled', updatedAt: now() }).where(eq(schema.sysTask.id, job.ownerId)).run()
   },
-  onReconcile(job) {
-    db.update(schema.sysTask).set({ status: 'failed', errorMsg: '已人工确认上游任务结束，可根据需要重新提交', updatedAt: now() })
+  async onReconcile(job) {
+    await db.update(schema.sysTask).set({ status: 'failed', errorMsg: '已人工确认上游任务结束，可根据需要重新提交', updatedAt: now() })
       .where(eq(schema.sysTask.id, job.ownerId)).run()
   },
-  onRetry(job) {
-    const task = db.select().from(schema.sysTask).where(eq(schema.sysTask.id, job.ownerId)).get()
+  async onRetry(job) {
+    const task = (await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, job.ownerId)).get())
     if (!task) return
-    retryPrevisParent(task)
+    ;await retryPrevisParent(task)
     const params = parseTaskParams(task.params)
     if (!task.resultUrl && !task.localPath) {
       delete params.submissionStarted
       delete params.submissionRejected
-      updateQueueJob(job.id, { submitted: false, externalTaskId: null, upstreamDone: false })
+      await updateQueueJob(job.id, { submitted: false, externalTaskId: null, upstreamDone: false })
     }
-    db.update(schema.sysTask).set({ status: 'pending', errorMsg: null, params: JSON.stringify(params),
+    await db.update(schema.sysTask).set({ status: 'pending', errorMsg: null, params: JSON.stringify(params),
       ...(!task.resultUrl && !task.localPath ? { taskId: null } : {}), updatedAt: now() }).where(eq(schema.sysTask.id, job.ownerId)).run()
   },
 })
@@ -799,13 +800,13 @@ async function pollTask(record: SysTaskRecord, config: AIConfig, taskId: string)
       }
       if (pollResp.status === 'failed') {
         // 上游明确失败（如内容审核拦截）属终态：立即落库，不重试不等待超时
-        const job = getQueueJob('sys_task', record.id)
-        if (job) updateQueueJob(job.id, { upstreamDone: true, phase: 'upstream_failed' })
+        const job = (await getQueueJob('sys_task', record.id))
+        if (job) (await updateQueueJob(job.id, { upstreamDone: true, phase: 'upstream_failed' }))
         await failTask(record.id, pollResp.error || 'Generation failed')
         return
       }
     } catch (err: any) {
-      if (getQueueJob('sys_task', record.id)?.upstreamDone) {
+      if ((await getQueueJob('sys_task', record.id))?.upstreamDone) {
         await failTask(record.id, `已保留模型结果，本地保存失败：${err.message}`)
         return
       }
@@ -982,7 +983,7 @@ async function normalizeVideoReferenceUrl(value: string | null | undefined): Pro
 async function normalizeVideoReferenceUrls(refs: string[] | null | undefined): Promise<string[]> {
   if (!Array.isArray(refs) || !refs.length) return []
   const normalized = await Promise.all(
-    Array.from(new Set(refs.map((item) => String(item || '').trim()).filter(Boolean))).map((item) => normalizeVideoReferenceUrl(item)),
+    Array.from(new Set(refs.map((item) => String(item || '').trim()).filter(Boolean))).map(async (item) => (await normalizeVideoReferenceUrl(item))),
   )
   return normalized.filter((item): item is string => !!item)
 }

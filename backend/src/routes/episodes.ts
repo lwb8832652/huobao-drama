@@ -253,8 +253,12 @@ app.get('/:id/generation-tasks', async (c) => {
     .slice(0, 20)
 
   return success(c, {
-    tasks: tasks.map(row => ({ ...toSnakeCase(row), ...queueJobView('sys_task', row.id) })),
-    merges: merges.map(row => ({ ...toSnakeCase(row), ...queueJobView('video_merge', row.id) })),
+    tasks: await Promise.all(
+      tasks.map(async row => ({ ...toSnakeCase(row), ...(await queueJobView('sys_task', row.id)) })),
+    ),
+    merges: await Promise.all(
+      merges.map(async row => ({ ...toSnakeCase(row), ...(await queueJobView('video_merge', row.id)) })),
+    ),
   })
 })
 

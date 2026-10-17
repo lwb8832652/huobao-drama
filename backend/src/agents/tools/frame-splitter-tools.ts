@@ -23,11 +23,11 @@ function requireIds(context: ToolContext): { episodeId: number; dramaId: number 
   return { episodeId, dramaId }
 }
 
-function assetsOf(table: 'characters' | 'props', ids: number[], dramaId: number) {
-  return ids.map(id => {
+async function assetsOf(table: 'characters' | 'props', ids: number[], dramaId: number) {
+  return Promise.all(ids.map(async id => {
     const item = table === 'characters'
-      ? db.select().from(schema.characters).where(eq(schema.characters.id, id)).get()
-      : db.select().from(schema.props).where(eq(schema.props.id, id)).get()
+      ? (await db.select().from(schema.characters).where(eq(schema.characters.id, id)).get())
+      : (await db.select().from(schema.props).where(eq(schema.props.id, id)).get())
     if (!item || item.dramaId !== dramaId || item.deletedAt) return { id, imageUrl: null, ready: false }
     return table === 'characters' ? {
       id: item.id, name: item.name, description: item.description,
@@ -39,22 +39,22 @@ function assetsOf(table: 'characters' | 'props', ids: number[], dramaId: number)
       prompt: (item as typeof schema.props.$inferSelect).prompt, finalPrompt: item.finalPrompt,
       imageUrl: item.imageUrl, ready: Boolean(item.imageUrl?.trim()),
     }
-  })
+  }))
 }
 
 /** Shared readonly context used by the agent and the plan's input fingerprint. */
 export async function readFramePlanningContext(versionId: number, panelIds: number[], episodeId: number, dramaId: number) {
-  const row = db.select().from(schema.animaticVersions)
-    .where(eq(schema.animaticVersions.id, versionId)).get()
+  const row = (await db.select().from(schema.animaticVersions)
+    .where(eq(schema.animaticVersions.id, versionId)).get())
   if (!row) return { error: 'Animatic version not found' }
   if (row.episodeId !== episodeId) return { error: 'Animatic version does not belong to current episode' }
-  const episode = db.select().from(schema.episodes).where(eq(schema.episodes.id, episodeId)).get()
+  const episode = (await db.select().from(schema.episodes).where(eq(schema.episodes.id, episodeId)).get())
   if (!episode || episode.deletedAt || episode.dramaId !== dramaId) return { error: 'Episode does not belong to current drama' }
 
   const timeline = normalizeTimeline(JSON.parse(row.timelineJson))
   const style = await getDramaStylePrompt(dramaId)
   const segments = timelineSegments(timeline)
-  function neighbor(panelId: number, delta: number) {
+  async function neighbor(panelId: number, delta: number) {
     const segment = segments[segments.findIndex(s => s.panel.id === panelId) + delta]
     if (!segment) return null
     const p = segment.panel, group = timeline.groups.find(g => g.id === segment.groupId)
@@ -63,15 +63,15 @@ export async function readFramePlanningContext(versionId: number, panelIds: numb
       productionPlan: p.productionPlan, imagePrompt: p.imagePrompt, atmosphere: p.atmosphere, scene: p.scene, sceneId: p.sceneId,
       shotType: p.shotType, angle: p.angle, movement: p.movement, entry: group?.entry, exit: group?.exit,
       boundaryFrame: delta < 0 ? ordered.at(-1) : ordered[0],
-      referenceManifest: resolvePanelGridReferences(p, dramaId),
-      characters: assetsOf('characters', p.characterIds, dramaId), props: assetsOf('props', p.propIds, dramaId) }
+      referenceManifest: (await resolvePanelGridReferences(p, dramaId)),
+      characters: await assetsOf('characters', p.characterIds, dramaId), props: await assetsOf('props', p.propIds, dramaId) }
   }
   const panels = []
   for (const panelId of panelIds) {
     const panel = timeline.panels.find(item => item.id === panelId)
     if (!panel) { panels.push({ panelId, error: 'Panel not found in this version' }); continue }
     const scene = panel.sceneId
-      ? db.select().from(schema.scenes).where(eq(schema.scenes.id, panel.sceneId)).get()
+      ? (await db.select().from(schema.scenes).where(eq(schema.scenes.id, panel.sceneId)).get())
       : null
     const frames = orderedFrames(panel).map(frame => ({
       id: frame.id, shotId: frame.shotId, title: frame.title, offsetMs: frame.offsetMs, type: frame.type, url: frame.url, source: frame.source,
@@ -83,8 +83,8 @@ export async function readFramePlanningContext(versionId: number, panelIds: numb
       productionPlan: panel.productionPlan, visualShots: parseShotDescription(panel.description),
       videoPrompt: panel.videoPrompt, imagePrompt: panel.imagePrompt, atmosphere: panel.atmosphere,
       referenceImages: panel.referenceImages, referenceLabels: panel.referenceLabels,
-      referenceManifest: resolvePanelGridReferences(panel, dramaId, { timeline, versionId }),
-      previousPanel: neighbor(panelId, -1), nextPanel: neighbor(panelId, 1),
+      referenceManifest: (await resolvePanelGridReferences(panel, dramaId, { timeline, versionId })),
+      previousPanel: (await neighbor(panelId, -1)), nextPanel: (await neighbor(panelId, 1)),
       durationSeconds: Number(((panel.durationMs || 0) / 1000).toFixed(1)), durationMs: panel.durationMs,
       shotType: panel.shotType, angle: panel.angle, movement: panel.movement,
       continuityConstraints: panel.continuityConstraints,
@@ -93,8 +93,8 @@ export async function readFramePlanningContext(versionId: number, panelIds: numb
         prompt: scene.prompt, lighting: scene.lighting, finalPrompt: scene.finalPrompt,
         imageUrl: scene.imageUrl, ready: Boolean(scene.imageUrl?.trim()),
       } : { id: panel.sceneId, name: panel.scene, imageUrl: null, ready: false },
-      characters: assetsOf('characters', panel.characterIds, dramaId),
-      props: assetsOf('props', panel.propIds, dramaId),
+      characters: await assetsOf('characters', panel.characterIds, dramaId),
+      props: await assetsOf('props', panel.propIds, dramaId),
       existingFrameCount: panel.frames.length,
       orderedFrames: frames,
       existingFrames: frames,
@@ -113,7 +113,7 @@ const readPrevisContext = createTool({
   execute: async (input, context) => {
     const ids = requireIds(context)
     if ('error' in ids) return ids
-    return readFramePlanningContext(input.versionId, input.panelIds, ids.episodeId, ids.dramaId)
+    return (await readFramePlanningContext(input.versionId, input.panelIds, ids.episodeId, ids.dramaId))
   },
 })
 
