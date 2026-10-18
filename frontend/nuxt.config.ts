@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 // 分流后两者可同时运行，不再需要「停 dev → 移走 .nuxt → 再 build」。
 // prepare（postinstall）仍写 .nuxt，供 tsconfig.json 的 extends 取类型。
 const command = process.argv[2] || ''
+const useLocalGateway = command === 'dev' && process.env.HUOBAO_DEV_GATEWAY === '1'
 const buildDir = process.env.NUXT_BUILD_DIR
   || (command === 'dev' ? '.nuxt-dev' : command === 'build' || command === 'generate' ? '.nuxt-build' : '.nuxt')
 
@@ -53,18 +54,35 @@ export default defineNuxtConfig({
   vite: {
     server: {
       proxy: {
-        '/api': { target: 'http://localhost:5679', changeOrigin: true },
-        '/static': { target: 'http://localhost:5679', changeOrigin: true },
+        '/api': {
+          target: useLocalGateway ? 'http://127.0.0.1:18080' : 'http://localhost:5679',
+          changeOrigin: true,
+          rewrite: useLocalGateway
+            ? (path: string) => path.replace(/^\/api\/v1(?=\/|\?|$)/, '/web/huobao/v1')
+            : undefined,
+        },
+        '/static': {
+          target: useLocalGateway ? 'http://127.0.0.1:18080' : 'http://localhost:5679',
+          changeOrigin: true,
+          rewrite: useLocalGateway
+            ? (path: string) => path.replace(/^\/static(?=\/|\?|$)/, '/web/huobao-static/v1')
+            : undefined,
+        },
       },
     },
   },
   // 生产构建（nuxt build）的 /api 转发：dev 用上面的 vite proxy，生产用 Nitro routeRules。
   // 注意 nitro proxy 的 ** 只替换通配部分（不含前缀），需保留 /api、/static 前缀
   nitro: {
-    routeRules: {
-      '/api/**': { proxy: 'http://localhost:5679/api/**' },
-      '/static/**': { proxy: 'http://localhost:5679/static/**' },
-    },
+    routeRules: useLocalGateway
+      ? {
+          '/api/v1/**': { proxy: 'http://127.0.0.1:18080/web/huobao/v1/**' },
+          '/static/**': { proxy: 'http://127.0.0.1:18080/web/huobao-static/v1/**' },
+        }
+      : {
+          '/api/**': { proxy: 'http://localhost:5679/api/**' },
+          '/static/**': { proxy: 'http://localhost:5679/static/**' },
+        },
   },
   compatibilityDate: '2025-05-15',
 })
