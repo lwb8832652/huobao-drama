@@ -24,6 +24,10 @@ function resolveDialect(): DbDialect {
   if (configured && configured !== 'sqlite' && configured !== 'mysql') {
     throw new Error(`Unsupported DB_DIALECT "${process.env.DB_DIALECT}". Expected sqlite or mysql.`)
   }
+  // 测试隔离：node --test 的子进程里强制 sqlite。否则 .env 配了远端 MySQL 时，
+  // 单测里的 DELETE/INSERT 会直接改写真实库。确需端到端测 MySQL 时显式设
+  // DB_DIALECT_ALLOW_REMOTE=1。
+  if (process.env.NODE_TEST_CONTEXT && !process.env.DB_DIALECT_ALLOW_REMOTE) return 'sqlite'
   if (configured) return configured as DbDialect
   return process.env.DATABASE_URL?.startsWith('mysql://') || process.env.MYSQL_HOST ? 'mysql' : 'sqlite'
 }

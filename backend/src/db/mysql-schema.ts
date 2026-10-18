@@ -26,14 +26,20 @@ function convertColumn(column: any) {
   const isUnique = !!column?.isUnique
 
   let converted: any
-  if (dataType.includes('boolean') || dataType === 'integer' && isBoolLike(column)) converted = tinyint(name)
-  else if (dataType.includes('int')) converted = int(name)
+  // dataType 是 drizzle 归一化后的类型（number/string/boolean/buffer），columnType 形如 SQLiteInteger。
+  // 用 dataType 判定更稳：integer → int，boolean → tinyint，其余文本 → text。
+  if (dataType === 'boolean') converted = tinyint(name)
+  else if (dataType === 'number') converted = int(name)
   else converted = mysqlText(name)
   if (notNull) converted = converted.notNull()
+  // drizzle mysql 的 autoincrement() 只在普通列 builder 上存在，必须在 primaryKey() 之前调用，
+  // 否则会退化成 MySqlColumnBuilderWithAutoIncrement 之外的 builder 而报 "autoincrement is not a function"。
+  if (autoIncrement) converted = converted.autoincrement()
   if (isUnique) converted = converted.unique()
   if (isPrimary) converted = converted.primaryKey()
-  if (autoIncrement) converted = converted.autoincrement()
-  if (hasDefault && defaultValue !== undefined) {
+  // MySQL 的 TEXT/BLOB 列不接受字面量默认值（只支持 8.0.13+ 表达式默认值 DEFAULT (...)）。
+  // 建表 DDL 已用表达式默认值保留语义，这里不再下发 default，避免生成非法 INSERT 片段。
+  if (hasDefault && defaultValue !== undefined && dataType !== 'string') {
     const fallback = typeof defaultValue === 'function' ? defaultValue() : defaultValue
     converted = converted.default(fallback as any)
   }
